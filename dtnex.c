@@ -15,21 +15,63 @@
 
 // Global variables
 volatile int running = 1;
-volatile int ionConnected = 0;  // Global ION connection status
+/* 
+    variabile di flag che tiene in vita il loop, volatile per evitare problemi di ottimizzazione con il signal handler,
+    infatti viene modificata dal signal hadler quando arriva un segnale (SIGINT/SIGTERM) e la setta a 0, così il
+    loop principale termina ordinatamante 
+*/
+volatile int ionConnected = 0;  // Global ION connection status, volatile perché può cambiare in modo asincrono (es. se ION si riavvia mentre DTNEX è in esecuzione)
 volatile int ionRestartDetected = 0;  // Flag to trigger complete restart
+/* 
+    Se viene settatto a 1, dtnex non esce semplicemente dal loop, ma invoca restartDtnex() che fa un execv del
+    processo su se stesso, non crea processi figli, sostituisce semplicemente l'immagine
+*/
 static char **original_argv = NULL;  // Store original argv for restart
 static int original_argc = 0;        // Store original argc for restart
+/* Variabili con cui lanciare l'execv, vengono salvate all'inizio del main()*/
 BpSAP sap;
+/*
+    Bundle Protocol Service Access Point (SAP) handle principale verso il layer BP di ION. come una socket, ma per
+    bundle DTN, si ottiene con bp_open() e si usa per inviare e ricevere bundle. 
+    Viene usato in tutto il codice per tutte le operazioni BP,
+*/
 Sdr sdr;
+/*
+    handle per la accedere alla memoria persistente di ION condivisa di ION, non usa malloc standard
+*/
+
+// Cache per duplicazione dei messaggi
 HashCache hashCache[MAX_HASH_CACHE];
 int hashCacheCount = 0;
-NodeMetadata nodeMetadataList[MAX_PLANS];
-int nodeMetadataCount = 0;
+/* 
+    Serve per la deduplicazione dei messaggi processati, ogni messaggio ricevuto viene hashato e confrontato con
+    gli hash già salvati, se viene trovato un hash uguale, significa che è un messaggio duplicato e viene scartato.
+ */
 NonceCache nonceCache[MAX_HASH_CACHE]; // For CBOR replay protection
 int nonceCacheCount = 0;
+/* 
+    Stessa cosa però per i nonce, serve per evitare il replay dei messaggi, la cache tiene traccia di (nonce, origin), 
+    se un attaccante ad esempio intercetta e reinvia un messaggio già processato viene scartato 
+*/
+
+NodeMetadata nodeMetadataList[MAX_PLANS];
+int nodeMetadataCount = 0;
+/*  
+    "rubrica locale", nodeId + metadata. Quando arriva un messaggio di tipo metadata, viene aggiornato con 
+    updateNodeMetadata(), poi consultato per in getContacts().
+*/
+
 BpechoState bpechoState;   // Bpecho service state
-BundleReceptionState bundleReceptionState;  // Bundle reception service state
 pthread_t bpechoThread;    // Thread for bpecho service
+/* 
+    Gestione del servizio di echo, BpechoState è una struttua che tiene lo stato, un sap e un attendant.
+*/
+
+BundleReceptionState bundleReceptionState;  // Bundle reception service state
+/* 
+    Gestione del thread di ricezione dei bundle, BundleReceptionState è una struttura che tiene lo stato,
+    la config e l'identificatore del thread.
+*/
 
 /**
  * Logging helper function with color support
@@ -60,7 +102,7 @@ void debug_log(DtnexConfig *config, const char *format, ...) {
     if (!config || !config->debugMode) {
         return;
     }
-    
+
     va_list args;
     va_start(args, format);
     printf("\033[90m[DEBUG] ");  // Dark gray color
@@ -68,6 +110,28 @@ void debug_log(DtnexConfig *config, const char *format, ...) {
     printf("\033[0m\n");  // Reset color
     va_end(args);
     fflush(stdout);
+}
+
+static void dtnex_dbg(const char *fmt, ...) {
+    static FILE *_dbgf = NULL;
+    if (_dbgf == NULL) {
+        _dbgf = fopen("dtnex_debug.log", "a");
+        if (_dbgf == NULL) return;
+        fprintf(_dbgf, "\n=== DTNEX DEBUG SESSION START ===\n");
+        fflush(_dbgf);
+    }
+    struct timespec _ts;
+    clock_gettime(CLOCK_REALTIME, &_ts);
+    struct tm *_tm = localtime(&_ts.tv_sec);
+    char _tbuf[32];
+    strftime(_tbuf, sizeof(_tbuf), "%H:%M:%S", _tm);
+    fprintf(_dbgf, "[%s.%03ld] ", _tbuf, _ts.tv_nsec / 1000000);
+    va_list _ap;
+    va_start(_ap, fmt);
+    vfprintf(_dbgf, fmt, _ap);
+    va_end(_ap);
+    fprintf(_dbgf, "\n");
+    fflush(_dbgf);
 }
 
 /**
@@ -138,14 +202,14 @@ void log_contact_update(DtnexConfig *config, int contactCount) {
  */
 void loadConfig(DtnexConfig *config) {
     // Set defaults
-    config->updateInterval = DEFAULT_UPDATE_INTERVAL;
-    config->contactLifetime = DEFAULT_CONTACT_LIFETIME;
+    config->updateInterval = DEFAULT_UPDATE_INTERVAL; // 600, 10 minuti tra un update e l'altro
+    config->contactLifetime = DEFAULT_CONTACT_LIFETIME; // 3600, 1 ora di validità dei contatti
     config->contactTimeTolerance = DEFAULT_CONTACT_TIME_TOLERANCE;
-    config->bundleTTL = DEFAULT_BUNDLE_TTL;
+    config->bundleTTL = DEFAULT_BUNDLE_TTL; // 1800, 30 minuti di TTL per i bundle (3x update interval)
     strcpy(config->presSharedNetworkKey, DEFAULT_PRESHARED_KEY);
     sprintf(config->serviceNr, "%d", DEFAULT_SERVICE_NR);
     sprintf(config->bpechoServiceNr, "%d", DEFAULT_BPECHO_SERVICE_NR);
-    config->nodeId = 0;
+    config->nodeId = 0; // viene settato a 0 perché il nodo non conosce ancora il proprio ID finché non si connette a ION, poi viene aggiornato in tryConnectToIon(
     memset(config->nodemetadata, 0, MAX_METADATA_LENGTH);
     config->createGraph = 0;
     strcpy(config->graphFile, "contactGraph.png");
@@ -159,6 +223,7 @@ void loadConfig(DtnexConfig *config) {
     // Try to read from config file
     FILE *configFile = fopen("dtnex.conf", "r");
     if (configFile) {
+        
         // Config file exists, disable the no-metadata-exchange flag
         config->noMetadataExchange = 0;
         
@@ -258,13 +323,25 @@ void loadConfig(DtnexConfig *config) {
  * Try to connect to ION - returns 0 on success, -1 on failure
  * This function handles all ION connection logic cleanly
  */
+
+/**
+ * Questa funzione è il ponte tra DTNEX e ION. Si compone di 5 fasi sequenziali, dove ogni fallimento causa un
+ * rollback pulito e ritorna -1, al contrario ritorna 0 e lascia DTNEX pronto a usare ION, ritorna 0.
+ */
 int tryConnectToIon(DtnexConfig *config) {
     char endpointId[MAX_EID_LENGTH];
     
     // Try to attach to ION BP system
+    /**
+     * Aggancia il processo all'istanza di ION già in esecuzione
+     */
     if (bp_attach() < 0) {
         return -1;
     }
+
+    /**
+     * Lettura del Node ID da ION,
+     */
     
     // Get the node ID from ION configuration
     Sdr ionsdr = getIonsdr();
@@ -281,7 +358,7 @@ int tryConnectToIon(DtnexConfig *config) {
     
     // Get the node number from ION configuration
     IonDB iondb;
-    Object iondbObject = getIonDbObject();
+    Object iondbObject = getIonDbObject(); //è il puntatore all'oggetto iondb nella SDR di ION
     if (iondbObject == 0) {
         sdr_exit_xn(ionsdr);
         bp_detach();
@@ -290,9 +367,21 @@ int tryConnectToIon(DtnexConfig *config) {
     
     // Read the iondb object to get the node number
     sdr_read(ionsdr, (char *) &iondb, iondbObject, sizeof(IonDB));
+    /**
+     * Legge i dati dell'oggetto iondb dalla SDR di ION e li copia nella struttura iondb locale,
+     * da cui poi si ricava il nodeId. sdr_read legge direttamente dalla memoria sdr, non usa malloc.
+     * iondbObject è un puntatore alla memoria sdr.
+     */
     config->nodeId = iondb.ownNodeNbr;
     sdr_exit_xn(ionsdr);
-    
+
+    /* ---- DEBUG: dump IonDB fields ---- */
+    dtnex_dbg("[tryConnectToIon] IonDB dump after sdr_read:");
+    dtnex_dbg("  ownNodeNbr = %lu", (unsigned long)iondb.ownNodeNbr);
+    dtnex_dbg("  ranges     = 0x%lx", (unsigned long)iondb.ranges);
+    dtnex_dbg("  contacts   = 0x%lx", (unsigned long)iondb.contacts);
+    /* ---- END DEBUG ---- */
+
     if (config->nodeId == 0) {
         bp_detach();
         return -1;
@@ -305,16 +394,28 @@ int tryConnectToIon(DtnexConfig *config) {
     dtnex_log("Using endpoint: %s", endpointId);
     
     // Get the SDR
-    sdr = bp_get_sdr();
+    sdr = bp_get_sdr(); //sdr ottenuto non come getIonsdr() ma tramite bp_get_sdr() che è la funzione corretta per ottenere l'sdr da usare con BP
     if (sdr == NULL) {
         bp_detach();
         return -1;
     }
     
     // First try to add/register the endpoint in ION's routing database
+
+    /**
+     * addEndpoint() è una api di ION che aggiunge l'EID al database di routing. Dice ad ION che se arriva un bundle a
+     * questo EID, deve essere messo in coda qui, non discardBundle. Se fallisce, non fatale, perché vuole dire che
+     * l'endpoint era già registrato da avvii precedenti.
+     */
+
     if (addEndpoint(endpointId, EnqueueBundle, NULL) < 0) {
         debug_log(config, "Warning: Could not register endpoint %s in routing database", endpointId);
     }
+
+    /**
+     * A questo punto registrato l'endpoint, ottengo il sap relativo a quell'EID, 
+     * da cui potrò ricevere ed inviare messaggi -> lo mette nella variabile globale sap
+     */
     
     // Try to open the endpoint for receiving messages
     if (bp_open(endpointId, &sap) < 0) {
@@ -333,6 +434,12 @@ int tryConnectToIon(DtnexConfig *config) {
         parseNodeMetadata(config->nodemetadata, &metadata);
         
         // Create metadata string with GPS if available, otherwise use location field
+
+        /**
+         * Aggiunge i propri metadati, presi dal file di configurazione, alla lista di metadata locali,
+         * dalla quale poi li prenderà per inserirli nei messaggi di metadata che invia ai vicini.
+         */
+
         if (config->hasGpsCoordinates) {
             snprintf(ownMetadata, sizeof(ownMetadata), "%s,%s,%.6f,%.6f", 
                     metadata.name, metadata.contact, 
@@ -383,8 +490,17 @@ int init(DtnexConfig *config) {
  * Get the list of plans (neighbor nodes) directly from ION using ION API
  * Based on ipnadmin's listPlans function
  */
+
+/**
+ * A cosa serve questa funzione? -> serve per sapere quali nodi vicini conosce ION in questo momento.
+ * Interroga direttamente le STRUTTURE INTERNE di ION per ottenere la lista dei nodi vicini (plans).
+ */
 void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     time_t currentTime;
+
+    // Variabili statiche per caching dei piani, persistono tra una chiamata e l'altra per evitare troppe interrogazioni
+    // ad ION. Se abbiamo aggiornato i piani recentemente (meno di 20 secondi fa), usiamo quelli in cache.
+    //essendo variabili static l'inizializzazione viene fatta solo una volta.
     static Plan cachedPlans[MAX_PLANS];
     static int cachedPlanCount = 0;
     static time_t lastPlanUpdate = 0;
@@ -416,6 +532,12 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     
     // Get the SDR database
     sdr = getIonsdr();
+
+    /**
+     * Il TTL della cache è scaduto, ma non riesco comunque ad ottenere l'SDR da ION,
+     * se ho qualcosa in cache la uso lo stesso.
+     */
+
     if (sdr == NULL) {
         dtnex_log("Error: can't get ION SDR");
         
@@ -430,6 +552,8 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
         return;
     }
     
+    // Parte ION-Specific di interrogazione di ION per ottenere la lista dei plans
+
     // Start a transaction
     if (sdr_begin_xn(sdr) < 0) {
         dtnex_log("Error: can't begin SDR transaction");
@@ -437,7 +561,7 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     }
     
     // Get the BP constants
-    bpConstants = getBpConstants();
+    bpConstants = getBpConstants(); // Ottengo il puntatore all'oggetto database che risiede nell'SDR
     if (bpConstants == NULL) {
         dtnex_log("Error: can't get BP constants");
         sdr_exit_xn(sdr);
@@ -445,40 +569,52 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     }
     
     // Get the list of plans and iterate through it with safe access
+
+    /**
+     * bpConstants->plans è una lista di plans gestita da SDR, non una lista c. 
+     * Deve essere iterata tramite le opportune api 
+     */
+
     Object planElt = 0;
     for (planElt = sdr_list_first(sdr, bpConstants->plans); 
          planElt && planElt != 0; 
          planElt = sdr_list_next(sdr, planElt)) {
         
         // Get the plan data with careful error checking
-        Object planData = sdr_list_data(sdr, planElt);
+        Object planData = sdr_list_data(sdr, planElt); // è un offset relativo alla base della memoria condivisa, non un puntatore effettivo
         if (planData == 0) {
             dtnex_log("Warning: Null plan data, skipping");
             continue;
         }
         
         // Get the plan object - cast to BpPlan* with proper error checking
-        BpPlan *plan = (BpPlan*) sdr_pointer(sdr, planData);
+        BpPlan *plan = (BpPlan*) sdr_pointer(sdr, planData); //trasforma l'object in un puntatore leggibile e refernziabile, puntatore alla shared memory non una copia
         if (plan == NULL) {
             dtnex_log("Warning: Null plan pointer, skipping");
             continue;
         }
-        
+        dtnex_dbg("[getplanlist] BpPlan raw read: neighborNodeNbr=%lu planData_obj=0x%lx",
+            (unsigned long)plan->neighborNodeNbr,
+            (unsigned long)planData);
+
         // Only include plans with a valid neighbor node number (CBHE-compliant)
         if (plan->neighborNodeNbr == 0) {
             continue;
         }
-        
+
         // Skip our own node
-        if (plan->neighborNodeNbr == config->nodeId) {
+        if (plan->neighborNodeNbr == config->nodeId) { // per evitare che il nodo si spedisca piani a se stessa
             continue;
         }
-        
+
         // No verbose output for each plan found
-        
+
         // Add this plan to our lists (both the output and the cache)
         if (*planCount < MAX_PLANS) {
-            plans[*planCount].planId = plan->neighborNodeNbr;
+            plans[*planCount].planId = plan->neighborNodeNbr; // Salvo il neighborNodeNbr come planId, è l'informazione più importante che mi serve per identificare il vicino, lo userò poi per costruire l'EID -> IPN:neighborNodeNbr.serviceNr
+            dtnex_dbg("[getplanlist] Added to plan list: index=%d planId=%lu",
+                *planCount,
+                (unsigned long)plans[*planCount].planId);
             time(&plans[*planCount].timestamp);
             
             // Also update the cache
@@ -494,7 +630,15 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     
     // End the transaction
     sdr_exit_xn(sdr);
-    
+
+    dtnex_dbg("[getplanlist] FINAL RESULT: planCount=%d nodeId=%lu",
+        *planCount,
+        (unsigned long)config->nodeId);
+    for (int _i = 0; _i < *planCount; _i++) {
+        dtnex_dbg("[getplanlist]   plan[%d] = neighborId %lu",
+            _i, (unsigned long)plans[_i].planId);
+    }
+
     // Update the cached plan count
     cachedPlanCount = *planCount;
     
@@ -521,12 +665,23 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
  * Exchange CBOR-encoded contact and metadata messages with neighbor nodes
  * Pure CBOR implementation - no string format support
  */
+
+/**
+ * Funzione che decide se, cosa e a chi inviare le informazioni, poi delega la costruzione e l'invio del bundle
+ * alle funzioni CBOR. Ha 3 fasi: gate temporale, loop di invio dei contatti, loop di invio dei metadata. 
+ */
+
 void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
     int i, j;
     time_t currentTime, expireTime;
     char destEid[MAX_EID_LENGTH];
     unsigned char cborBuffer[MAX_CBOR_BUFFER];
     int messageSize;
+
+    /**
+     *  Variabili statiche, memoria tra chiamate. Servono per capire quando è necessario fare lo scambio di informazioni.
+     *  Se sono passati 30 minuti o se è cambiata la lista dei piani
+     */
     static time_t lastExchangeTime = 0;
     static int lastPlanCount = 0;
     static unsigned long lastPlanList[MAX_PLANS];
@@ -578,11 +733,11 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
         // Send CBOR contact information to all neighbors
         for (i = 0; i < planCount; i++) {
             for (j = 0; j < planCount; j++) {
-                unsigned long targetPlan = plans[i].planId;
-                unsigned long neighborId = plans[j].planId;
+                unsigned long targetPlan = plans[i].planId; // di chi sto inviando le informazioni
+                unsigned long neighborId = plans[j].planId; // a chi sto inviando le informazioni
                 
                 // Skip local loopback plan
-                if (neighborId == config->nodeId) {
+                if (neighborId == config->nodeId) { //il plan locale di loopback viene skippato
                     continue;
                 }
                 
@@ -591,12 +746,23 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
                 contact.nodeA = config->nodeId;
                 contact.nodeB = targetPlan;
                 contact.duration = config->contactLifetime / 60; // Convert seconds to minutes
-                
+                dtnex_dbg("[exchangeWithNeighbors] ContactInfo built: "
+                    "NodoDtnex=%lu nodeB=%lu duration=%u min | "
+                    "will send to neighborId=%lu",
+                    (unsigned long)contact.nodeA,
+                    (unsigned long)contact.nodeB,
+                    (unsigned)contact.duration,
+                    (unsigned long)neighborId);
+
                 // Encode contact message to CBOR
+                // mette i dati dentro cborBuffer e ritorna la dimensione del messaggio
                 messageSize = encodeCborContactMessage(config, &contact, cborBuffer, MAX_CBOR_BUFFER);
+
                 if (messageSize > 0) {
                     sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
-                    
+                    dtnex_dbg("[exchangeWithNeighbors] Sending to: destEid=%s cborSize=%d bytes",
+                        destEid, messageSize);
+
                     // Send CBOR bundle
                     sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
                     
@@ -609,8 +775,24 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
                 }
             }
         }
+
+        /**
+         * Cosa succede in questi 2 loop, il ciclo esterno itera sui nodi vicini, a cui invio le informazioni,
+         * il ciclo interno invece itera sempre sui nodi vicini, ma per costruire le informazioni di contatto.
+         * Immaginando il nodo A con 3 vicini: B, C, D.
+         * Al primo giro, targetPlan è B e invia i contatti A-B, A-C, A-D a B.
+         * Al secondo giro, targetPlan è C e invia i contatti A-B, A-C, A-D a C.
+         * Al terzo giro, targetPlan è D e invia i contatti A-B, A-C, A-D a D.
+         * 
+         * Per permettere il flooding della rete poi chi riceverà il messaggio lo propagherà
+         * usando forwardCborContactMessage()
+         */
         
         // Send CBOR metadata to neighbors (if enabled)
+        /**
+         * Se lo scambio di metadata è abilitato, il nodo scambia i SUOI metadata, prendendoli dal file di configurazione
+         * e li invia a tutti i vicini
+         */
         if (!config->noMetadataExchange && strlen(config->nodemetadata) > 0) {
             dtnex_log("📤 Exchanging CBOR metadata with neighbors...");
             
@@ -637,6 +819,7 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
                 }
                 
                 // Encode metadata message to CBOR
+                // Scrive i dati di metadata dentro cborBuffer e ritorna la dimensione del messaggio
                 messageSize = encodeCborMetadataMessage(config, &metadata, cborBuffer, MAX_CBOR_BUFFER);
                 if (messageSize > 0) {
                     sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
@@ -946,7 +1129,16 @@ void getContacts(DtnexConfig *config) {
         if (contact == NULL) {
             continue;  // Skip NULL contacts
         }
-        
+        dtnex_dbg("[getContacts] IonCXref entry: "
+            "fromNode=%lu toNode=%lu fromTime=%ld toTime=%ld "
+            "xmitRate=%lu confidence=%.2f",
+            (unsigned long)contact->fromNode,
+            (unsigned long)contact->toNode,
+            (long)contact->fromTime,
+            (long)contact->toTime,
+            (unsigned long)contact->xmitRate,
+            (double)contact->confidence);
+
         // Calculate time remaining and format duration in a readable way
         time_t timediff = contact->toTime - currentTime;
         char durationStr[20];
@@ -990,10 +1182,12 @@ void getContacts(DtnexConfig *config) {
         
         contactCount++;
     }
-    
+
     // End the transaction
     sdr_exit_xn(sdr);
-    
+
+    dtnex_dbg("[getContacts] TOTAL contacts in ION RBT: %d", contactCount);
+
     // Check if ION might have been restarted (no contacts found)
     if (contactCount == 0) {
         dtnex_log("⚠️  No contacts found - ION may have been restarted");
@@ -1118,6 +1312,11 @@ void createGraph(DtnexConfig *config) {
     debug_log(config, "Extracting contacts using ionadmin command...");
     
     FILE *ionadmin_pipe = popen("echo 'l contact' | ionadmin 2>/dev/null | grep -o -P '(?<=From).*?(?=is)'", "r");
+    /** Come prende i contatti pr graficare gli archi tra i nodi:
+     * Invia l contact allo stdin di ionadmin
+     * cattura l'output
+     * lo filtra con grep per estrarre solo le linee che contengono i contatti
+     */
     if (ionadmin_pipe) {
         char line[1024];
         while (fgets(line, sizeof(line), ionadmin_pipe) != NULL) {
@@ -1417,6 +1616,17 @@ int initBundleReception(DtnexConfig *config, BundleReceptionState *state) {
 }
 
 /**
+ *  Pipeline di recezione
+ * runBundleReception()          ← thread dedicato, legge bundle da ION
+    └── processCborMessage()  ← entry point, validazione minima
+            └── decodeCborMessage()   ← parsing CBOR + autenticazione
+                    ├── processCborContactMessage()   ← tipo "c"
+                    │       └── forwardCborContactMessage()
+                    └── processCborMetadataMessage()  ← tipo "m"
+                            └── forwardCborMetadataMessage()
+ */
+
+/**
  * Bundle reception thread - handles incoming DTNEX CBOR messages
  * Uses blocking reception pattern like bpsink
  */
@@ -1471,9 +1681,9 @@ void *runBundleReception(void *arg) {
             
             if (contentLength > 0 && contentLength < MAX_LINE_LENGTH) {
                 // Read the bundle content
-                zco_start_receiving(dlv.adu, &reader);
+                zco_start_receiving(dlv.adu, &reader); // Inizializza lo zco reader per leggere il payload del bundle, analogo a una open
                 CHKZERO(sdr_begin_xn(sdr));
-                int len = zco_receive_source(sdr, &reader, contentLength, buffer);
+                int len = zco_receive_source(sdr, &reader, contentLength, buffer); // copia il payload nel buffer
                 if (sdr_end_xn(sdr) < 0 || len < 0) {
                     dtnex_log("❌ Error reading bundle content");
                     bp_release_delivery(&dlv, 1);
@@ -1481,6 +1691,7 @@ void *runBundleReception(void *arg) {
                 }
                 
                 // Build source info string
+                // Source info mai usata per ora ma potrebbe essere utile per logging e debugging futuri
                 char sourceInfo[128];
                 if (dlv.bundleSourceEid && strlen(dlv.bundleSourceEid) > 0) {
                     snprintf(sourceInfo, sizeof(sourceInfo), "%s", dlv.bundleSourceEid);
@@ -1493,6 +1704,7 @@ void *runBundleReception(void *arg) {
                 // Bundle received - will be logged in message processing
                 
                 // Process the CBOR message
+                // Il payload del bundle è ora in buffer con lunghezza contentLength -> viene procesato
                 processCborMessage(config, (unsigned char*)buffer, contentLength);
             } else {
                 dtnex_log("⚠️ Bundle content invalid size (%d bytes), skipping", contentLength);
@@ -1601,7 +1813,17 @@ int main(int argc, char **argv) {
     int planCount = 0;
     
     dtnex_log("🚀 Performing startup contact broadcast to all neighbors...");
+    dtnex_dbg("[main] About to call getplanlist for startup contact broadcast to all neighbors");
     getplanlist(&config, plans, &planCount);
+    dtnex_dbg("[main] getplanlist returned planCount=%d", planCount);
+    for (int _i = 0; _i < planCount; _i++) {
+        char _ts_str[32] = "N/A";
+        if (plans[_i].timestamp > 0) {
+            struct tm *_tm = gmtime(&plans[_i].timestamp);
+            strftime(_ts_str, sizeof(_ts_str), "%Y-%m-%dT%H:%M:%SZ", _tm);
+        }
+        dtnex_dbg("[main] plans[%d]: planId=%lu timestamp=%s", _i, plans[_i].planId, _ts_str);
+    }
     if (planCount > 0) {
         exchangeWithNeighbors(&config, plans, planCount);
         dtnex_log("✅ Startup contact broadcast completed to %d neighbors", planCount);
@@ -1985,7 +2207,7 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Allocate memory for the CBOR data
-    extent = sdr_malloc(sdr, dataSize);
+    extent = sdr_malloc(sdr, dataSize); // alloca spazio nell'sdr
     if (!extent) {
         dtnex_log("Failed to allocate memory for CBOR data");
         sdr_cancel_xn(sdr);
@@ -2002,6 +2224,7 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Create ZCO from the extent
+    // Adessp crea un bundle di tipo ZeroCopyObject partendo direttamente dai dati in SDR
     bundleZco = ionCreateZco(ZcoSdrSource, extent, 0, dataSize, 
                             BP_STD_PRIORITY, 0, ZcoOutbound, NULL);
     
@@ -2011,6 +2234,16 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Send the bundle using direct ION API - no source EID for CBOR messages
+    dtnex_dbg("[sendCborBundle] bp_send: destEid=%s dataSize=%d ttl=%d",
+        destEid, dataSize, ttl);
+    {
+        char _hexbuf[256] = {0};
+        int _hlen = dataSize < 64 ? dataSize : 64;
+        for (int _b = 0; _b < _hlen; _b++) {
+            snprintf(_hexbuf + _b * 3, 4, "%02x ", ((unsigned char*)cborData)[_b]);
+        }
+        dtnex_dbg("[sendCborBundle] CBOR payload (first %d bytes): %s", _hlen, _hexbuf);
+    }
     sendResult = bp_send(NULL, destEid, NULL, ttl, BP_STD_PRIORITY,
                         NoCustodyRequested, 0, 0, NULL, bundleZco, &newBundle);
     
@@ -2031,6 +2264,11 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
  * Event-driven main loop - sleeps until next scheduled event
  * Avoids continuous polling and reduces CPU usage
  */
+
+ /**
+  * while loop a stati con due timeline parallele: una per gli update programmati (updateInterval)
+  * e una per i retry di connessione a ION.
+  */
 void eventDrivenLoop(DtnexConfig *config) {
     Plan plans[MAX_PLANS];
     int planCount = 0;
@@ -2288,7 +2526,7 @@ IonStatus checkIonStatus(DtnexConfig *config) {
  * Process received CBOR message - main entry point for CBOR message handling
  */
 void processCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize) {
-    if (!buffer || bufferSize <= 0) {
+    if (!buffer || bufferSize <= 0) { // fa solo validazione del puntatore del buffer e della dimensione
         debug_log(config, "❌ Invalid CBOR buffer (null or zero size)");
         return;
     }
@@ -2306,7 +2544,7 @@ void processCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSi
     }
     
     // Decode the CBOR message
-    int result = decodeCborMessage(config, buffer, bufferSize);
+    int result = decodeCborMessage(config, buffer, bufferSize); // secondo passaggio
     if (result < 0) {
         log_message_error(config, "Failed to decode CBOR message - unknown bundle format");
         return;
@@ -2507,6 +2745,9 @@ int skipCborElement(unsigned char **cursor, unsigned int *bytesBuffered) {
 
 /**
  * Decode and process CBOR message format
+ */
+/**
+ * Viene fatto il parsing di CBOR e poi processato in base al tipo di messaggio (contact o metadata).
  */
 int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize) {
     unsigned char *cursor = buffer;
@@ -2945,6 +3186,8 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
 /**
  * Process CBOR contact message
  */
+
+// Scrittura in ION dei contatti
 int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime, 
                              unsigned long origin, unsigned long from, ContactInfo *contact) {
     log_message_received(config, origin, from, "contact", contact->nodeA, contact->nodeB, NULL);
@@ -2964,6 +3207,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
     struct tm *startTm = gmtime(&startTime);
     struct tm *endTm = gmtime(&endTime);
     
+    // Costruita la stringa di comando, ma usata solo per logging
     snprintf(contactCmd, sizeof(contactCmd),
         "a contact +%04d/%02d/%02d-%02d:%02d:%02d +%04d/%02d/%02d-%02d:%02d:%02d %lu %lu 100000",
         startTm->tm_year + 1900, startTm->tm_mon + 1, startTm->tm_mday,
@@ -3152,7 +3396,7 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         bytesWritten += cbor_encode_integer(timestamp, &cursor);
         bytesWritten += cbor_encode_integer(expireTime, &cursor);
         bytesWritten += cbor_encode_integer(origin, &cursor);  // Keep original origin
-        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node
+        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node, CAMBIA SOLO IL FROM CON IL NODE ID DI QUESTO NODO
         bytesWritten += cbor_encode_byte_string(originalNonce, DTNEX_NONCE_SIZE, &cursor);
         
         // Contact data
