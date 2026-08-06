@@ -220,7 +220,7 @@ DTNEX uses CBOR (Compact Binary Object Representation) for efficient, authentica
 
 ### Protocol Overview
 
-- **Protocol Version**: 2
+- **Protocol Version**: 3
 - **Message Format**: CBOR arrays with HMAC authentication
 - **Authentication**: HMAC-SHA256 (truncated to 64 bits for efficiency)
 - **Replay Protection**: 3-byte nonce with origin node tracking
@@ -238,7 +238,7 @@ All DTNEX messages follow this general CBOR array format:
 
 | Field | Type | Description | Size |
 |-------|------|-------------|------|
-| `version` | Integer | Protocol version (currently 2) | 1 byte |
+| `version` | Integer | Protocol version (currently 3) | 1 byte |
 | `type` | Integer | Message type (1=contact, 2=metadata) | 1 byte |
 | `timestamp` | Integer | Unix timestamp when message was created | 4 bytes |
 | `expireTime` | Integer | Unix timestamp when message expires | 4 bytes |
@@ -252,40 +252,46 @@ All DTNEX messages follow this general CBOR array format:
 
 Contact messages distribute network connectivity information between DTN nodes.
 
+Messages are directional: a node only announces contacts where it is the `fromNode` (§4 of the design spec).
+
 #### CBOR Structure
 ```
-[2, 1, timestamp, expireTime, origin, from, nonce, [nodeA, nodeB, duration, datarate, reliability], hmac]
+[3, 1, timestamp, expireTime, origin, from, nonce, [fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt], hmac]
 ```
 
 #### Message Data Array
 ```cbor
-[nodeA, nodeB, duration, datarate, reliability]
+[fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt]
 ```
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
-| `nodeA` | Integer | First node ID in the contact pair | 268484800 |
-| `nodeB` | Integer | Second node ID in the contact pair | 268484801 |
-| `duration` | Integer | Contact duration in minutes (0-65535) | 1440 |
-| `datarate` | Integer | Data rate in bytes per second | 100000 |
-| `reliability` | Integer | Reliability factor (typically 1-100) | 100 |
+| `fromNode` | Integer | Node ID that owns/announces this contact; must equal the message `origin` | 268484800 |
+| `toNode` | Integer | Node ID at the other end of the contact | 268484801 |
+| `fromTime` | Integer | Absolute Unix epoch when the contact window opens | 1694885400 |
+| `toTime` | Integer | Absolute Unix epoch when the contact window closes | 1694887200 |
+| `xmitRate` | Integer | Data rate in **bytes** per second (ION's own unit) | 100000 |
+| `confidence` | Integer | Reliability, percentage 0-100 | 100 |
+| `owlt` | Integer | One-way light time in seconds, from the paired ION range | 1 |
 
 #### Example Contact Message
 ```json
 [
-  2,                    // Protocol version
+  3,                    // Protocol version
   1,                    // Contact message type
   1694885400,          // Timestamp (Unix epoch)
-  1694887200,          // Expire time
+  1694887200,          // Expire time (equals the contact's toTime)
   268484800,           // Origin node ID
   268484800,           // From node ID (same as origin if not forwarded)
   h'A1B2C3',           // 3-byte nonce
   [                    // Contact data
-    268484800,         // Node A
-    268484801,         // Node B  
-    1440,              // Duration (24 hours in minutes)
-    100000,            // Data rate (100 KB/s)
-    100                // Reliability (100%)
+    268484800,         // fromNode (must equal origin)
+    268484801,         // toNode
+    1694885400,        // fromTime (absolute epoch)
+    1694887200,        // toTime (absolute epoch)
+    100000,            // xmitRate (100000 bytes/s)
+    100,               // confidence (100%)
+    1                  // owlt (1 second)
   ],
   h'1234567890ABCDEF'  // 8-byte HMAC
 ]
@@ -297,7 +303,7 @@ Metadata messages share node descriptions, GPS coordinates, and operator contact
 
 #### CBOR Structure
 ```
-[2, 2, timestamp, expireTime, origin, from, nonce, metadataMap, hmac]
+[3, 2, timestamp, expireTime, origin, from, nonce, metadataMap, hmac]
 ```
 
 #### Metadata Map Structure
@@ -322,7 +328,7 @@ Metadata messages share node descriptions, GPS coordinates, and operator contact
 #### Example Metadata Message
 ```json
 [
-  2,                    // Protocol version
+  3,                    // Protocol version
   2,                    // Metadata message type
   1694885400,          // Timestamp
   1694887200,          // Expire time
@@ -377,7 +383,7 @@ The CBOR protocol can be extended for custom applications:
 #### Example Custom Message (Type 3)
 ```json
 [
-  2,                    // Protocol version
+  3,                    // Protocol version
   3,                    // Custom message type
   1694885400,          // Timestamp
   1694887200,          // Expire time

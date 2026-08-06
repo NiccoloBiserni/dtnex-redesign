@@ -173,8 +173,14 @@ In ordine, prima di toccare ION. Ogni fallimento: **scarta senza inserire e senz
 | 5 | `fromNode == origin` | solo la sorgente annuncia la propria direzione |
 | 6 | `toTime != 0` | in ION `toTime = 0` significa *contatto scoperto* → `MAX_POSIX_TIME`, cioè permanente (`rfx.h:53-56`) |
 | 7 | `fromTime < toTime` | integrità |
+| 7b | `fromTime <= 0` | in ION `fromTime = 0` significa *contatto ipotetico* |
+| 7c | `fromTime >= MAX_POSIX_TIME` | in ION è il trigger dei *contatti di registrazione* |
+| 7d | `xmitRate == 0` | ION rifiuta il contatto con errore utente 5 |
+| 7e | `confidence > 100` | fuori dal range 0-100: ION rifiuta con errore utente 4 |
 | 8 | `toTime > now` | già scaduto: inutile inserirlo e inondarlo |
 | 9 | `owlt` presente e valido | senza range CGR scarta il contatto |
+
+Un messaggio scartato da questa pipeline restituisce **0**, non -1: lo scarto è una decisione di policy, non un fallimento di decodifica — il messaggio si è decodificato correttamente, si è solo deciso di non applicarlo. Un -1 risalirebbe fino a `decodeCborMessage` e produrrebbe un fuorviante "formato bundle sconosciuto" per un messaggio perfettamente valido.
 
 Il controllo 5 rende superfluo un controllo esplicito su `fromNode == me`: cadrebbe già al 4. È la regola che si rilassa attivando l'escape hatch (§4.4).
 
