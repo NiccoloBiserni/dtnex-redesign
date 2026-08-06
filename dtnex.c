@@ -668,34 +668,109 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
 
 /**
  * Funzione che decide se, cosa e a chi inviare le informazioni, poi delega la costruzione e l'invio del bundle
- * alle funzioni CBOR. Ha 3 fasi: gate temporale, loop di invio dei contatti, loop di invio dei metadata. 
+ * alle funzioni CBOR. Ha 3 fasi: gate temporale, loop di invio dei contatti, loop di invio dei metadata.
  */
+
+/**
+ * Snapshot dei contatti annunciabili (§3.2).
+ *
+ * INVARIANTE DI CORRETTEZZA DELLA CACHE (§7.4): questa cache e' a solo TTL,
+ * senza invalidazione su scrittura, e cio' e' corretto SOLO perche' lo
+ * snapshot contiene esclusivamente contatti con fromNode == nodo locale
+ * (regola di autorita', §4). Nessuna scrittura che dtnex fa in ION puo'
+ * quindi rientrare in questo insieme. Se qualcuno rilassa quel filtro,
+ * questa cache diventa silenziosamente sbagliata.
+ *
+ * Il TTL governa la reattivita' del trigger 3 di §7.1: e' il tempo massimo
+ * fra una modifica a ionrc e la sua scoperta da parte della rete. 60 secondi
+ * e' il compromesso scelto: coincide con il periodo massimo di risveglio del
+ * main loop, quindi non aggiunge accessi a ION rispetto al ritmo del loop.
+ */
+#define MY_CONTACTS_CACHE_TTL 60
+
+static ContactRecord myContacts[IONC_MAX_CONTACTS];
+static int myContactCount = 0;
+static time_t myContactsUpdated = 0;
+
+static int sameContactRecord(const ContactRecord *a, const ContactRecord *b) {
+    return a->fromNode == b->fromNode
+        && a->toNode == b->toNode
+        && a->fromTime == b->fromTime
+        && a->toTime == b->toTime
+        && a->xmitRate == b->xmitRate
+        && a->confidence == b->confidence
+        && a->owlt == b->owlt;
+}
+
+/**
+ * Rinfresca lo snapshot se il TTL e' scaduto. Scrive in *changed 1 se il
+ * nuovo snapshot differisce dal precedente, 0 altrimenti (o se non e' stato
+ * rinfrescato). Ritorna il numero di contatti nello snapshot, -1 su errore
+ * di accesso a ION (nel qual caso lo snapshot precedente resta valido).
+ *
+ * Mono-thread (§7.5): solo il main loop chiama questa funzione.
+ */
+static int refreshMyContacts(DtnexConfig *config, int *changed) {
+    ContactRecord fresh[IONC_MAX_CONTACTS];
+    time_t now = time(NULL);
+    int freshCount;
+    int i;
+
+    *changed = 0;
+
+    if (myContactsUpdated > 0 && (now - myContactsUpdated) < MY_CONTACTS_CACHE_TTL) {
+        return myContactCount;
+    }
+
+    freshCount = ionc_get_own_contacts(config->nodeId, fresh, IONC_MAX_CONTACTS,
+            config->debugMode);
+    if (freshCount < 0) {
+        debug_log(config, "⚠️ Impossibile rileggere i contatti annunciabili da ION");
+        return -1;
+    }
+
+    if (freshCount != myContactCount) {
+        *changed = 1;
+    } else {
+        for (i = 0; i < freshCount; i++) {
+            if (!sameContactRecord(&fresh[i], &myContacts[i])) {
+                *changed = 1;
+                break;
+            }
+        }
+    }
+
+    memcpy(myContacts, fresh, sizeof(ContactRecord) * freshCount);
+    myContactCount = freshCount;
+    myContactsUpdated = now;
+
+    if (*changed) {
+        dtnex_log("🔄 Lo snapshot dei contatti annunciabili e' cambiato (%d contatti)",
+                myContactCount);
+    }
+
+    return myContactCount;
+}
 
 void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
     int i, j;
-    time_t currentTime, expireTime;
+    time_t currentTime;
     char destEid[MAX_EID_LENGTH];
     unsigned char cborBuffer[MAX_CBOR_BUFFER];
     int messageSize;
 
-    /**
-     *  Variabili statiche, memoria tra chiamate. Servono per capire quando è necessario fare lo scambio di informazioni.
-     *  Se sono passati 30 minuti o se è cambiata la lista dei piani
-     */
     static time_t lastExchangeTime = 0;
     static int lastPlanCount = 0;
     static unsigned long lastPlanList[MAX_PLANS];
     int planListChanged = 0;
-    
-    // Get current time
+    int contactsChanged = 0;
+
     time(&currentTime);
-    
-    // Check if we need to perform exchange (using updateInterval instead of hardcoded 1800)
-    // 1. First time (lastExchangeTime == 0)
-    // 2. Update interval has passed
-    // 3. Plan list has changed
-    
-    // Check if plan list has changed
+
+    // Trigger 3 (§7.1): rinfresca lo snapshot e guarda se e' cambiato.
+    refreshMyContacts(config, &contactsChanged);
+
+    // Trigger 2: la lista dei vicini e' cambiata
     if (planCount != lastPlanCount) {
         planListChanged = 1;
     } else {
@@ -713,138 +788,107 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
             }
         }
     }
-    
-    // Determine if we should exchange now (use config updateInterval)
-    if (lastExchangeTime == 0 || (currentTime - lastExchangeTime) >= config->updateInterval || planListChanged) {
-        dtnex_log("📤 Exchanging CBOR contact information with %d neighbors...", planCount);
-        
-        // Update last exchange time
-        lastExchangeTime = currentTime;
-        
-        // Save current plan list for next comparison
-        lastPlanCount = planCount;
-        for (i = 0; i < planCount && i < MAX_PLANS; i++) {
-            lastPlanList[i] = plans[i].planId;
+
+    // Trigger 1: e' passato updateInterval
+    if (!(lastExchangeTime == 0
+            || (currentTime - lastExchangeTime) >= config->updateInterval
+            || planListChanged
+            || contactsChanged)) {
+        int remainingTime = config->updateInterval - (int) (currentTime - lastExchangeTime);
+        debug_log(config, "Skipping neighbor exchange (next in %d seconds)", remainingTime);
+        return;
+    }
+
+    dtnex_log("📤 Annuncio %d contatti a %d vicini...", myContactCount, planCount);
+
+    lastExchangeTime = currentTime;
+    lastPlanCount = planCount;
+    for (i = 0; i < planCount && i < MAX_PLANS; i++) {
+        lastPlanList[i] = plans[i].planId;
+    }
+
+    // Un messaggio per contatto annunciabile, a ogni vicino (§5.4).
+    for (i = 0; i < planCount; i++) {
+        unsigned long neighborId = plans[i].planId;
+
+        if (neighborId == config->nodeId) {
+            continue;  // plan locale di loopback
         }
-        
-        // Calculate expire time
-        expireTime = currentTime + config->contactLifetime + config->contactTimeTolerance;
-        
-        // Send CBOR contact information to all neighbors
+
+        for (j = 0; j < myContactCount; j++) {
+            ContactRecord *contact = &myContacts[j];
+
+            messageSize = encodeCborContactMessage(config, contact, cborBuffer,
+                    MAX_CBOR_BUFFER);
+            if (messageSize <= 0) {
+                dtnex_log("❌ Failed to encode CBOR contact message for %lu→%lu",
+                        contact->fromNode, contact->toNode);
+                continue;
+            }
+
+            snprintf(destEid, sizeof(destEid), "ipn:%lu.%s", neighborId, config->serviceNr);
+            debug_log(config, "[exchange] %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u owlt=%u → %s (%d byte)",
+                    contact->fromNode, contact->toNode,
+                    (long) contact->fromTime, (long) contact->toTime,
+                    contact->xmitRate, contact->confidence, contact->owlt,
+                    destEid, messageSize);
+
+            sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
+            log_message_sent(config, config->nodeId, neighborId, "contact",
+                    contact->fromNode, contact->toNode, NULL);
+        }
+    }
+
+    // Send CBOR metadata to neighbors (if enabled)
+    /**
+     * Se lo scambio di metadata è abilitato, il nodo scambia i SUOI metadata, prendendoli dal file di configurazione
+     * e li invia a tutti i vicini
+     */
+    if (!config->noMetadataExchange && strlen(config->nodemetadata) > 0) {
+        dtnex_log("📤 Exchanging CBOR metadata with neighbors...");
+
         for (i = 0; i < planCount; i++) {
-            for (j = 0; j < planCount; j++) {
-                unsigned long targetPlan = plans[i].planId; // di chi sto inviando le informazioni
-                unsigned long neighborId = plans[j].planId; // a chi sto inviando le informazioni
-                
-                // Skip local loopback plan
-                if (neighborId == config->nodeId) { //il plan locale di loopback viene skippato
-                    continue;
-                }
-                
-                // Create contact info structure
-                ContactInfo contact;
-                contact.nodeA = config->nodeId;
-                contact.nodeB = targetPlan;
-                contact.duration = config->contactLifetime / 60; // Convert seconds to minutes
-                dtnex_dbg("[exchangeWithNeighbors] ContactInfo built: "
-                    "NodoDtnex=%lu nodeB=%lu duration=%u min | "
-                    "will send to neighborId=%lu",
-                    (unsigned long)contact.nodeA,
-                    (unsigned long)contact.nodeB,
-                    (unsigned)contact.duration,
-                    (unsigned long)neighborId);
+            unsigned long neighborId = plans[i].planId;
 
-                // Encode contact message to CBOR
-                // mette i dati dentro cborBuffer e ritorna la dimensione del messaggio
-                messageSize = encodeCborContactMessage(config, &contact, cborBuffer, MAX_CBOR_BUFFER);
+            // Skip local loopback plan
+            if (neighborId == config->nodeId) {
+                continue;
+            }
 
-                if (messageSize > 0) {
-                    sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
-                    dtnex_dbg("[exchangeWithNeighbors] Sending to: destEid=%s cborSize=%d bytes",
-                        destEid, messageSize);
+            // Create metadata structure
+            StructuredMetadata metadata;
+            metadata.nodeId = config->nodeId;
+            parseNodeMetadata(config->nodemetadata, &metadata);
 
-                    // Send CBOR bundle
-                    sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
-                    
-                    // Log optimized sending message
-                    log_message_sent(config, config->nodeId, neighborId, "contact", 
-                                   contact.nodeA, contact.nodeB, NULL);
-                } else {
-                    dtnex_log("❌ Failed to encode CBOR contact message for %lu↔%lu", 
-                        config->nodeId, targetPlan);
-                }
+            // Add GPS coordinates if available
+            if (config->hasGpsCoordinates) {
+                metadata.latitude = (int)(config->gpsLatitude * GPS_PRECISION_FACTOR);
+                metadata.longitude = (int)(config->gpsLongitude * GPS_PRECISION_FACTOR);
+            } else {
+                metadata.latitude = 0;
+                metadata.longitude = 0;
+            }
+
+            // Encode metadata message to CBOR
+            // Scrive i dati di metadata dentro cborBuffer e ritorna la dimensione del messaggio
+            messageSize = encodeCborMetadataMessage(config, &metadata, cborBuffer, MAX_CBOR_BUFFER);
+            if (messageSize > 0) {
+                sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
+
+                // Send CBOR bundle
+                sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
+
+                // Log optimized metadata sending message
+                log_message_sent(config, config->nodeId, neighborId, "metadata",
+                               metadata.nodeId, 0, metadata.name);
+            } else {
+                dtnex_log("❌ Failed to encode CBOR metadata message for node %lu", config->nodeId);
             }
         }
-
-        /**
-         * Cosa succede in questi 2 loop, il ciclo esterno itera sui nodi vicini, a cui invio le informazioni,
-         * il ciclo interno invece itera sempre sui nodi vicini, ma per costruire le informazioni di contatto.
-         * Immaginando il nodo A con 3 vicini: B, C, D.
-         * Al primo giro, targetPlan è B e invia i contatti A-B, A-C, A-D a B.
-         * Al secondo giro, targetPlan è C e invia i contatti A-B, A-C, A-D a C.
-         * Al terzo giro, targetPlan è D e invia i contatti A-B, A-C, A-D a D.
-         * 
-         * Per permettere il flooding della rete poi chi riceverà il messaggio lo propagherà
-         * usando forwardCborContactMessage()
-         */
-        
-        // Send CBOR metadata to neighbors (if enabled)
-        /**
-         * Se lo scambio di metadata è abilitato, il nodo scambia i SUOI metadata, prendendoli dal file di configurazione
-         * e li invia a tutti i vicini
-         */
-        if (!config->noMetadataExchange && strlen(config->nodemetadata) > 0) {
-            dtnex_log("📤 Exchanging CBOR metadata with neighbors...");
-            
-            for (i = 0; i < planCount; i++) {
-                unsigned long neighborId = plans[i].planId;
-                
-                // Skip local loopback plan
-                if (neighborId == config->nodeId) {
-                    continue;
-                }
-                
-                // Create metadata structure
-                StructuredMetadata metadata;
-                metadata.nodeId = config->nodeId;
-                parseNodeMetadata(config->nodemetadata, &metadata);
-                
-                // Add GPS coordinates if available
-                if (config->hasGpsCoordinates) {
-                    metadata.latitude = (int)(config->gpsLatitude * GPS_PRECISION_FACTOR);
-                    metadata.longitude = (int)(config->gpsLongitude * GPS_PRECISION_FACTOR);
-                } else {
-                    metadata.latitude = 0;
-                    metadata.longitude = 0;
-                }
-                
-                // Encode metadata message to CBOR
-                // Scrive i dati di metadata dentro cborBuffer e ritorna la dimensione del messaggio
-                messageSize = encodeCborMetadataMessage(config, &metadata, cborBuffer, MAX_CBOR_BUFFER);
-                if (messageSize > 0) {
-                    sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
-                    
-                    // Send CBOR bundle
-                    sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
-                    
-                    // Log optimized metadata sending message
-                    log_message_sent(config, config->nodeId, neighborId, "metadata", 
-                                   metadata.nodeId, 0, metadata.name);
-                } else {
-                    dtnex_log("❌ Failed to encode CBOR metadata message for node %lu", config->nodeId);
-                }
-            }
-        } else if (config->noMetadataExchange) {
-            if (config->debugMode) {
-                dtnex_log("📤 Metadata exchange disabled in configuration");
-            }
+    } else if (config->noMetadataExchange) {
+        if (config->debugMode) {
+            dtnex_log("📤 Metadata exchange disabled in configuration");
         }
-        
-        // CBOR exchange completed - no file I/O needed
-    } else {
-        // Calculate remaining time until next exchange  
-        int remainingTime = config->updateInterval - (currentTime - lastExchangeTime);
-        dtnex_log("Skipping neighbor exchange (next in %d seconds)", remainingTime);
     }
 }
 
@@ -2015,54 +2059,64 @@ void addNonceToCache(unsigned char *nonce, unsigned long origin) {
 
 /**
  * Encode CBOR contact message
- * Format: [version, type, timestamp, expireTime, origin, from, nonce, [nodeA, nodeB, duration, datarate, reliability], hmac]
+ * Format v3 (§5.2): [version, type, timestamp, expireTime, origin, from, nonce,
+ *                     [fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt], hmac]
  */
-int encodeCborContactMessage(DtnexConfig *config, ContactInfo *contact, unsigned char *buffer, int bufferSize) {
+int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsigned char *buffer, int bufferSize) {
     unsigned char *cursor = buffer;
     unsigned char nonce[DTNEX_NONCE_SIZE];
     int bytesWritten = 0;
-    
+
+    (void) bufferSize;  // il payload v3 e' ~67 byte, MAX_CBOR_BUFFER e' 128
+
     // Generate nonce
     generateNonce(nonce);
-    
+
     time_t currentTime = time(NULL);
-    time_t expireTime = currentTime + config->contactLifetime;
-    
+
+    // §7.2: il messaggio e' utile esattamente finche' e' valido il contatto
+    // che descrive, quindi expireTime E' il toTime del contatto.
+    time_t expireTime = contact->toTime;
+
     // Encode main array with 9 elements [version, type, ts, exp, orig, from, nonce, data, hmac]
     bytesWritten += cbor_encode_array_open(9, &cursor);
-    
+
     // 1. Version
     bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-    
+
     // 2. Message type "c"
     bytesWritten += cbor_encode_text_string("c", 1, &cursor);
-    
-    // 3. Timestamp
+
+    // 3. Timestamp (istante di invio, non ha piu' effetto sulla finestra)
     bytesWritten += cbor_encode_integer(currentTime, &cursor);
-    
+
     // 4. Expire time
     bytesWritten += cbor_encode_integer(expireTime, &cursor);
-    
+
     // 5. Origin node
     bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-    
+
     // 6. From node (same as origin for originating messages)
     bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-    
+
     // 7. Nonce
     bytesWritten += cbor_encode_byte_string(nonce, DTNEX_NONCE_SIZE, &cursor);
-    
-    // 8. Contact data array - ultra-minimal format (3 elements: nodeA, nodeB, duration)
-    bytesWritten += cbor_encode_array_open(3, &cursor);
-    bytesWritten += cbor_encode_integer(contact->nodeA, &cursor);
-    bytesWritten += cbor_encode_integer(contact->nodeB, &cursor);  
-    bytesWritten += cbor_encode_integer(contact->duration, &cursor);
-    
+
+    // 8. Contact data array v3 (§5.2): 7 campi, tempi assoluti
+    bytesWritten += cbor_encode_array_open(7, &cursor);
+    bytesWritten += cbor_encode_integer(contact->fromNode, &cursor);
+    bytesWritten += cbor_encode_integer(contact->toNode, &cursor);
+    bytesWritten += cbor_encode_integer((uvast) contact->fromTime, &cursor);
+    bytesWritten += cbor_encode_integer((uvast) contact->toTime, &cursor);
+    bytesWritten += cbor_encode_integer(contact->xmitRate, &cursor);
+    bytesWritten += cbor_encode_integer(contact->confidence, &cursor);
+    bytesWritten += cbor_encode_integer(contact->owlt, &cursor);
+
     // 9. Calculate HMAC over everything except the HMAC field itself
     unsigned char hmac[DTNEX_HMAC_SIZE];
     calculateHmac(buffer, bytesWritten, config->presSharedNetworkKey, hmac);
     bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
-    
+
     debug_log(config, "[CBOR] Encoded contact message: %d bytes", bytesWritten);
     return bytesWritten;
 }
@@ -2419,8 +2473,11 @@ void eventDrivenLoop(DtnexConfig *config) {
         // Bundle reception is now handled by the dedicated thread
         if (!running) break;
         
-        // Update contact info to ensure we have the latest topology (only if ION connected)
+        // A ogni risveglio (<= 60s): rivaluta i trigger di annuncio (§7.1).
+        // exchangeWithNeighbors decide da sola se c'e' qualcosa da fare.
         if (ionConnected) {
+            getplanlist(config, plans, &planCount);
+            exchangeWithNeighbors(config, plans, planCount);
             getContacts(config);
         }
         
@@ -2870,7 +2927,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
     unsigned char *dataArrayPosition = cursor;
     
     // Variables to store extracted contact/metadata data for later processing
-    ContactInfo extractedContact = {0};
+    ContactRecord extractedContact = {0};
     StructuredMetadata extractedMetadata = {0};
     int hasExtractedData = 0;
     
@@ -2910,38 +2967,52 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
     
     // Extract data elements based on message type and then skip them for HMAC verification
     if (messageType[0] == 'c') {
-        // Contact message: extract 3 elements (nodeA, nodeB, duration)
-        debug_log(config, "🔍 Extracting 3 contact elements manually");
-        
-        // Create a cursor copy for extraction
+        // Contact message v3 (§5.2): 7 campi
+        debug_log(config, "🔍 Extracting 7 contact elements manually");
+
+        if (dataArraySize != 7) {
+            debug_log(config, "❌ Payload contatto con %lu campi (attesi 7)", dataArraySize);
+            return -1;
+        }
+
         unsigned char *extractCursor = cursor;
         unsigned int extractBytesBuffered = bytesBuffered;
-        
-        // Extract nodeA, nodeB, and duration using manual CBOR decoder
-        unsigned long tempNodeA, tempNodeB, tempDuration;
-        if (manualDecodeCborInteger(&tempNodeA, &extractCursor, &extractBytesBuffered) &&
-            manualDecodeCborInteger(&tempNodeB, &extractCursor, &extractBytesBuffered) &&
-            manualDecodeCborInteger(&tempDuration, &extractCursor, &extractBytesBuffered)) {
-            
-            extractedContact.nodeA = (unsigned long)tempNodeA;
-            extractedContact.nodeB = (unsigned long)tempNodeB;
-            extractedContact.duration = (unsigned short)tempDuration;
+
+        unsigned long tFromNode, tToNode, tFromTime, tToTime, tXmitRate, tConfidence, tOwlt;
+        if (manualDecodeCborInteger(&tFromNode, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tToNode, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tFromTime, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tToTime, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tXmitRate, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tConfidence, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tOwlt, &extractCursor, &extractBytesBuffered)) {
+
+            extractedContact.fromNode = tFromNode;
+            extractedContact.toNode = tToNode;
+            extractedContact.fromTime = (time_t) tFromTime;
+            extractedContact.toTime = (time_t) tToTime;
+            extractedContact.xmitRate = tXmitRate;
+            extractedContact.confidence = (unsigned int) tConfidence;
+            extractedContact.owlt = (unsigned int) tOwlt;
             hasExtractedData = 1;
-            debug_log(config, "✅ Extracted contact: %lu↔%lu (duration=%d min)", 
-                      extractedContact.nodeA, extractedContact.nodeB, extractedContact.duration);
+            debug_log(config, "✅ Extracted contact: %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u owlt=%u",
+                      extractedContact.fromNode, extractedContact.toNode,
+                      (long) extractedContact.fromTime, (long) extractedContact.toTime,
+                      extractedContact.xmitRate, extractedContact.confidence,
+                      extractedContact.owlt);
         } else {
             debug_log(config, "❌ Failed to extract contact elements");
         }
-        
+
         // Now skip the elements for HMAC verification
-        for (int i = 0; i < dataArraySize && i < 3; i++) {
+        for (int i = 0; i < dataArraySize && i < 7; i++) {
             if (!skipCborElement(&cursor, &bytesBuffered)) {
                 debug_log(config, "❌ Failed to skip contact element %d", i);
                 return -1;
             }
         }
         debug_log(config, "✅ Successfully skipped contact elements for HMAC");
-        
+
     } else if (messageType[0] == 'm') {
         // Metadata message: extract elements and then skip them
         debug_log(config, "🔍 Extracting %lu metadata elements manually", dataArraySize);
@@ -3184,9 +3255,10 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
             return -1;
         }
         
-        debug_log(config, "🔍 Processing extracted contact data: %lu↔%lu (duration=%d)", 
-                  extractedContact.nodeA, extractedContact.nodeB, extractedContact.duration);
-        
+        debug_log(config, "🔍 Processing extracted contact data: %lu→%lu (from=%ld to=%ld)",
+                  extractedContact.fromNode, extractedContact.toNode,
+                  (long) extractedContact.fromTime, (long) extractedContact.toTime);
+
         return processCborContactMessage(config, nonce, timestamp, expireTime, origin, from, &extractedContact);
     } else if (messageType[0] == 'm') {
         // Use pre-extracted metadata instead of re-decoding
@@ -3210,122 +3282,115 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
  */
 
 // Scrittura in ION dei contatti
-int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime, 
-                             unsigned long origin, unsigned long from, ContactInfo *contact) {
-    log_message_received(config, origin, from, "contact", contact->nodeA, contact->nodeB, NULL);
-    
+int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
+                             unsigned long origin, unsigned long from, ContactRecord *contact) {
+    log_message_received(config, origin, from, "contact", contact->fromNode, contact->toNode, NULL);
+
     // Skip processing our own messages
     if (origin == config->nodeId) {
         debug_log(config, "⏭️ Skipping own contact message");
         return 0;
     }
-    
+
     // Create contact in ION
     char contactCmd[256];
-    time_t startTime = timestamp;
-    time_t endTime = startTime + (contact->duration * 60);  // Convert minutes to seconds
-    
+    time_t startTime = contact->fromTime;
+    time_t endTime = contact->toTime;
+
     // Format times for ION contact command
     struct tm *startTm = gmtime(&startTime);
     struct tm *endTm = gmtime(&endTime);
-    
+
     // Costruita la stringa di comando, ma usata solo per logging
     snprintf(contactCmd, sizeof(contactCmd),
-        "a contact +%04d/%02d/%02d-%02d:%02d:%02d +%04d/%02d/%02d-%02d:%02d:%02d %lu %lu 100000",
+        "a contact +%04d/%02d/%02d-%02d:%02d:%02d +%04d/%02d/%02d-%02d:%02d:%02d %lu %lu %lu",
         startTm->tm_year + 1900, startTm->tm_mon + 1, startTm->tm_mday,
         startTm->tm_hour, startTm->tm_min, startTm->tm_sec,
         endTm->tm_year + 1900, endTm->tm_mon + 1, endTm->tm_mday,
         endTm->tm_hour, endTm->tm_min, endTm->tm_sec,
-        contact->nodeA, contact->nodeB);
-    
+        contact->fromNode, contact->toNode, contact->xmitRate);
+
     debug_log(config, "🔗 Adding contact: %s", contactCmd);
-    
+
     // Add contact directly using ION's internal API instead of system call
     PsmAddress cxaddr = 0;
     uint32_t regionNbr = 1;  // Default region number (same as _regionNbr(NULL) in ionadmin)
-    size_t xmitRate = 100000; // Default transmission rate
-    float confidence = 1.0;   // Default confidence
+    size_t xmitRate = (size_t) contact->xmitRate;
+    float confidence = contact->confidence / 100.0f;
     int announce = 0;         // Don't announce to region
-    
+
     // Remove ALL existing contacts for this node pair first (using NULL scope like ionadmin '*')
     // This prevents overlapping time issues by clearing all previous contacts
-    int removeResult1 = rfx_remove_contact(regionNbr, NULL, 
-                                          (uvast)contact->nodeA, (uvast)contact->nodeB, announce);
+    int removeResult1 = rfx_remove_contact(regionNbr, NULL,
+                                          (uvast)contact->fromNode, (uvast)contact->toNode, announce);
     int removeResult2 = rfx_remove_contact(regionNbr, NULL,
-                                          (uvast)contact->nodeB, (uvast)contact->nodeA, announce);
-    
-    debug_log(config, "🗑️ All contacts removal results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d", 
-              contact->nodeA, contact->nodeB,
-              contact->nodeA, contact->nodeB, removeResult1,
-              contact->nodeB, contact->nodeA, removeResult2);
-    
-    // Always use current time as start to avoid any remaining overlap issues
-    time_t currentTime = time(NULL);
-    debug_log(config, "⏰ Using current time %ld as start time for new contact", currentTime);
-    startTime = currentTime;
-    endTime = currentTime + (contact->duration * 60);  // Recalculate end time
-    
+                                          (uvast)contact->toNode, (uvast)contact->fromNode, announce);
+
+    debug_log(config, "🗑️ All contacts removal results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d",
+              contact->fromNode, contact->toNode,
+              contact->fromNode, contact->toNode, removeResult1,
+              contact->toNode, contact->fromNode, removeResult2);
+
     // Add bidirectional contacts as per user requirement (A->B and B->A)
     PsmAddress cxaddr2 = 0;
-    int result1 = rfx_insert_contact(regionNbr, startTime, endTime, 
-                                     (uvast)contact->nodeA, (uvast)contact->nodeB, 
+    int result1 = rfx_insert_contact(regionNbr, startTime, endTime,
+                                     (uvast)contact->fromNode, (uvast)contact->toNode,
                                      xmitRate, confidence, &cxaddr, announce);
-    
-    int result2 = rfx_insert_contact(regionNbr, startTime, endTime, 
-                                     (uvast)contact->nodeB, (uvast)contact->nodeA, 
+
+    int result2 = rfx_insert_contact(regionNbr, startTime, endTime,
+                                     (uvast)contact->toNode, (uvast)contact->fromNode,
                                      xmitRate, confidence, &cxaddr2, announce);
-    
+
     // Log contact results
     if (result1 == 0 && result2 == 0) {
-        dtnex_log("✅ Bidirectional contacts %lu↔%lu added successfully", contact->nodeA, contact->nodeB);
+        dtnex_log("✅ Bidirectional contacts %lu↔%lu added successfully", contact->fromNode, contact->toNode);
     } else {
-        debug_log(config, "ℹ️ Contact results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d", 
-                 contact->nodeA, contact->nodeB,
-                 contact->nodeA, contact->nodeB, result1,
-                 contact->nodeB, contact->nodeA, result2);
+        debug_log(config, "ℹ️ Contact results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d",
+                 contact->fromNode, contact->toNode,
+                 contact->fromNode, contact->toNode, result1,
+                 contact->toNode, contact->fromNode, result2);
     }
-    
+
     // Always add bidirectional ranges regardless of contact results
-    // Range distance of 1 second OWLT (One-Way Light Time)
     PsmAddress rxaddr1 = 0, rxaddr2 = 0;
-    unsigned int owlt = 1;  // 1 second range distance
+    unsigned int owlt = contact->owlt;
     int announceRange = 0;  // Don't announce to region
-    
+
     // Remove ALL existing ranges for this node pair first (using NULL scope like ionadmin '*')
     // This prevents overlapping time issues by clearing all previous ranges
     int rangeRemoveResult1 = rfx_remove_range(NULL,
-                                             (uvast)contact->nodeA, (uvast)contact->nodeB, announceRange);
+                                             (uvast)contact->fromNode, (uvast)contact->toNode, announceRange);
     int rangeRemoveResult2 = rfx_remove_range(NULL,
-                                             (uvast)contact->nodeB, (uvast)contact->nodeA, announceRange);
-    
-    debug_log(config, "🗑️ All ranges removal results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d", 
-              contact->nodeA, contact->nodeB,
-              contact->nodeA, contact->nodeB, rangeRemoveResult1,
-              contact->nodeB, contact->nodeA, rangeRemoveResult2);
-    
+                                             (uvast)contact->toNode, (uvast)contact->fromNode, announceRange);
+
+    debug_log(config, "🗑️ All ranges removal results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d",
+              contact->fromNode, contact->toNode,
+              contact->fromNode, contact->toNode, rangeRemoveResult1,
+              contact->toNode, contact->fromNode, rangeRemoveResult2);
+
     // Add range A->B
-    int rangeResult1 = rfx_insert_range(startTime, endTime, 
-                                        (uvast)contact->nodeA, (uvast)contact->nodeB, 
+    int rangeResult1 = rfx_insert_range(startTime, endTime,
+                                        (uvast)contact->fromNode, (uvast)contact->toNode,
                                         owlt, &rxaddr1, announceRange);
-    
-    // Add range B->A  
-    int rangeResult2 = rfx_insert_range(startTime, endTime, 
-                                        (uvast)contact->nodeB, (uvast)contact->nodeA, 
+
+    // Add range B->A
+    int rangeResult2 = rfx_insert_range(startTime, endTime,
+                                        (uvast)contact->toNode, (uvast)contact->fromNode,
                                         owlt, &rxaddr2, announceRange);
-    
+
     // Log range results
     if (rangeResult1 == 0 && rangeResult2 == 0) {
-        debug_log(config, "✅ Bidirectional ranges %lu↔%lu added successfully", contact->nodeA, contact->nodeB);
+        debug_log(config, "✅ Bidirectional ranges %lu↔%lu added successfully", contact->fromNode, contact->toNode);
     } else {
-        debug_log(config, "ℹ️ Range results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d", 
-                 contact->nodeA, contact->nodeB,
-                 contact->nodeA, contact->nodeB, rangeResult1,
-                 contact->nodeB, contact->nodeA, rangeResult2);
+        debug_log(config, "ℹ️ Range results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d",
+                 contact->fromNode, contact->toNode,
+                 contact->fromNode, contact->toNode, rangeResult1,
+                 contact->toNode, contact->fromNode, rangeResult2);
     }
-    
+
     // Forward CBOR contact message to all neighbors (except origin and sender)
     forwardCborContactMessage(config, nonce, timestamp, expireTime, origin, from, contact);
-    
+
     return 0;
 }
 
@@ -3377,8 +3442,8 @@ int processCborMetadataMessage(DtnexConfig *config, unsigned char *nonce, time_t
 /**
  * Forward CBOR contact message to all neighbors (except origin and sender)
  */
-void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp, 
-                              time_t expireTime, unsigned long origin, unsigned long from, ContactInfo *contact) {
+void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp,
+                              time_t expireTime, unsigned long origin, unsigned long from, ContactRecord *contact) {
     Plan plans[MAX_PLANS];
     int planCount = 0;
     char destEid[MAX_EID_LENGTH];
@@ -3405,12 +3470,12 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         }
         
         // Create CBOR forwarded message with preserved original nonce, timestamp and expireTime
-        ContactInfo forwardContact = *contact; // Copy contact info
-        
+        ContactRecord forwardContact = *contact; // Copy contact info
+
         // Create modified contact message for forwarding (from=our nodeId)
         unsigned char *cursor = cborBuffer;
         int bytesWritten = 0;
-        
+
         // Encode forwarded CBOR message
         bytesWritten += cbor_encode_array_open(9, &cursor);
         bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
@@ -3420,24 +3485,28 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         bytesWritten += cbor_encode_integer(origin, &cursor);  // Keep original origin
         bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node, CAMBIA SOLO IL FROM CON IL NODE ID DI QUESTO NODO
         bytesWritten += cbor_encode_byte_string(originalNonce, DTNEX_NONCE_SIZE, &cursor);
-        
-        // Contact data
-        bytesWritten += cbor_encode_array_open(3, &cursor);
-        bytesWritten += cbor_encode_integer(forwardContact.nodeA, &cursor);
-        bytesWritten += cbor_encode_integer(forwardContact.nodeB, &cursor);
-        bytesWritten += cbor_encode_integer(forwardContact.duration, &cursor);
-        
+
+        // Contact data v3
+        bytesWritten += cbor_encode_array_open(7, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.fromNode, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.toNode, &cursor);
+        bytesWritten += cbor_encode_integer((uvast) forwardContact.fromTime, &cursor);
+        bytesWritten += cbor_encode_integer((uvast) forwardContact.toTime, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.xmitRate, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.confidence, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.owlt, &cursor);
+
         // Calculate HMAC over everything except HMAC itself
         unsigned char hmac[DTNEX_HMAC_SIZE];
         calculateHmac(cborBuffer, bytesWritten, config->presSharedNetworkKey, hmac);
         bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
-        
+
         // Send forwarded CBOR bundle
         sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
         sendCborBundle(destEid, cborBuffer, bytesWritten, config->bundleTTL);
-        
-        log_message_forwarded(config, origin, from, neighborId, "contact", 
-                             contact->nodeA, contact->nodeB, NULL);
+
+        log_message_forwarded(config, origin, from, neighborId, "contact",
+                             contact->fromNode, contact->toNode, NULL);
     }
 }
 
