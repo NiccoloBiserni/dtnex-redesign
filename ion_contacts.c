@@ -256,6 +256,25 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
     return count;
 }
 
+/**
+ * Riga di log [ion] con lo stato raggiunto fino a quel punto. Chiamata sia
+ * al termine normale di ionc_apply_contact sia sui rami di errore, cosi'
+ * uno stato parziale (es. contatto scritto, range fallito) resta visibile
+ * in debug invece di sparire dietro un return anticipato.
+ */
+static void logApplyOutcome(int debugMode, const ContactRecord *rec,
+        IoncApplyOutcome contactOutcome, IoncApplyOutcome rangeOutcome)
+{
+    if (!debugMode) {
+        return;
+    }
+
+    dtnex_log("[ion] %lu→%lu from=%ld to=%ld: contatto=%s range=%s",
+            rec->fromNode, rec->toNode, (long) rec->fromTime,
+            (long) rec->toTime, ionc_outcome_name(contactOutcome),
+            ionc_outcome_name(rangeOutcome));
+}
+
 IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
 {
     Sdr              sdr;
@@ -314,6 +333,8 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
             dtnex_log("⚠️  Anomalia: rfx_insert_contact %lu→%lu (from %ld) ha "
                     "restituito %d", rec->fromNode, rec->toNode,
                     (long) rec->fromTime, rc);
+            contactOutcome = IONC_ERROR;
+            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         }
         contactOutcome = IONC_INSERTED;
@@ -326,6 +347,8 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
             dtnex_log("⚠️  Anomalia: rfx_remove_contact %lu→%lu (from %ld) ha "
                     "restituito %d", rec->fromNode, rec->toNode,
                     (long) rec->fromTime, rc);
+            contactOutcome = IONC_ERROR;
+            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         }
 
@@ -335,6 +358,8 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         if (rc != 0) {
             dtnex_log("⚠️  Anomalia: rfx_insert_contact (dopo remove) %lu→%lu "
                     "ha restituito %d", rec->fromNode, rec->toNode, rc);
+            contactOutcome = IONC_ERROR;
+            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         }
         contactOutcome = IONC_REPLACED;
@@ -348,6 +373,8 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         if (rc != 0) {
             dtnex_log("⚠️  Anomalia: rfx_revise_contact %lu→%lu ha restituito %d",
                     rec->fromNode, rec->toNode, rc);
+            contactOutcome = IONC_ERROR;
+            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         }
         contactOutcome = IONC_REVISED;
@@ -361,6 +388,8 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         if (rc != 0) {
             dtnex_log("⚠️  Anomalia: rfx_insert_range %lu→%lu ha restituito %d",
                     rec->fromNode, rec->toNode, rc);
+            rangeOutcome = IONC_ERROR;
+            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         }
         rangeOutcome = IONC_INSERTED;
@@ -372,6 +401,8 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         if (rc != 0) {
             dtnex_log("⚠️  Anomalia: rfx_remove_range %lu→%lu ha restituito %d",
                     rec->fromNode, rec->toNode, rc);
+            rangeOutcome = IONC_ERROR;
+            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         }
 
@@ -381,17 +412,14 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         if (rc != 0) {
             dtnex_log("⚠️  Anomalia: rfx_insert_range (dopo remove) %lu→%lu ha "
                     "restituito %d", rec->fromNode, rec->toNode, rc);
+            rangeOutcome = IONC_ERROR;
+            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         }
         rangeOutcome = IONC_REPLACED;
     }
 
-    if (debugMode) {
-        dtnex_log("[ion] %lu→%lu from=%ld to=%ld: contatto=%s range=%s",
-                rec->fromNode, rec->toNode, (long) rec->fromTime,
-                (long) rec->toTime, ionc_outcome_name(contactOutcome),
-                ionc_outcome_name(rangeOutcome));
-    }
+    logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
 
     return (rangeOutcome > contactOutcome) ? rangeOutcome : contactOutcome;
 }

@@ -3295,7 +3295,11 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
 
     /* Pipeline di validazione (§6.1). I controlli 1-3 (versione, HMAC,
      * nonce) sono gia' stati fatti in decodeCborMessage. Ogni fallimento
-     * scarta senza inserire e senza inoltrare. */
+     * scarta senza inserire e senza inoltrare, e restituisce 0: non e' un
+     * errore di decodifica (il messaggio si e' decodificato perfettamente),
+     * e' un rifiuto di policy gia' loggato qui sotto col suo motivo. Un -1
+     * risalirebbe fino a decodeCborMessage e verrebbe stampato come "Failed
+     * to decode CBOR message", diagnostica fuorviante per uno scarto valido. */
 
     // 4. Non processiamo i nostri stessi messaggi
     if (origin == config->nodeId) {
@@ -3307,20 +3311,51 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
     if (contact->fromNode != origin) {
         debug_log(config, "❌ Scartato: fromNode=%lu != origin=%lu",
                 contact->fromNode, origin);
-        return -1;
+        return 0;
     }
 
     // 6. toTime = 0 in ION significa "contatto scoperto" -> MAX_POSIX_TIME
     if (contact->toTime == 0) {
         debug_log(config, "❌ Scartato: toTime = 0 (semantica di contatto permanente)");
-        return -1;
+        return 0;
     }
 
     // 7. Integrita' della finestra
     if (contact->fromTime >= contact->toTime) {
         debug_log(config, "❌ Scartato: fromTime=%ld >= toTime=%ld",
                 (long) contact->fromTime, (long) contact->toTime);
-        return -1;
+        return 0;
+    }
+
+    // 7b. fromTime <= 0 e' la semantica di "contatto ipotetico" per ION
+    // (rfx_insert_contact prende il ramo CHKZERO su ownNodeNbr e puo'
+    // restituire 0 senza aver scritto nulla: falso successo).
+    if (contact->fromTime <= 0) {
+        debug_log(config, "❌ Scartato: fromTime non valido: semantica di "
+                "contatto ipotetico in ION (fromTime=%ld)", (long) contact->fromTime);
+        return 0;
+    }
+
+    // 7c. fromTime == MAX_POSIX_TIME e' il trigger dei contatti di
+    // registrazione in ION, non una finestra di rete reale.
+    if (contact->fromTime >= MAX_POSIX_TIME) {
+        debug_log(config, "❌ Scartato: fromTime = MAX_POSIX_TIME: semantica "
+                "di contatto di registrazione");
+        return 0;
+    }
+
+    // 7d. xmitRate == 0 verrebbe rifiutato da ION stesso (rfx_insert_contact
+    // restituisce 5).
+    if (contact->xmitRate == 0) {
+        debug_log(config, "❌ Scartato: xmitRate nullo: ION rifiuterebbe il contatto");
+        return 0;
+    }
+
+    // 7e. confidence fuori range: ION restituisce 4 per confidence > 1.0.
+    if (contact->confidence > 100) {
+        debug_log(config, "❌ Scartato: confidence fuori range 0-100 (%u)",
+                contact->confidence);
+        return 0;
     }
 
     // 8. Finestra gia' scaduta
@@ -3328,7 +3363,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         debug_log(config, "❌ Scartato: finestra interamente nel passato "
                 "(toTime=%ld, adesso=%ld) — possibile clock skew fra i nodi",
                 (long) contact->toTime, (long) currentTime);
-        return -1;
+        return 0;
     }
 
     // 8b. Finestra troppo nel futuro: sospetto di clock skew (§7.6)
@@ -3336,31 +3371,33 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         debug_log(config, "❌ Scartato: finestra troppo nel futuro "
                 "(fromTime=%ld, adesso=%ld) — possibile clock skew fra i nodi",
                 (long) contact->fromTime, (long) currentTime);
-        return -1;
+        return 0;
     }
 
     // 9. Senza range CGR scarta il contatto: inutile inserirlo
     if (contact->owlt == 0) {
         debug_log(config, "❌ Scartato: owlt assente o nullo per %lu→%lu",
                 contact->fromNode, contact->toNode);
-        return -1;
+        return 0;
     }
 
     /* Si scrive cio' che si impara, si annuncia solo cio' di cui si e'
      * autoritativi (§4.5): anche i contatti con toNode == me si inseriscono. */
     outcome = ionc_apply_contact(contact, config->debugMode);
     if (outcome == IONC_ERROR) {
+        /* IONC_ERROR e' uno stato locale di ION (es. sovrapposizione con un
+         * contatto configurato a mano), non un fallimento di validazione:
+         * il messaggio resta valido e va comunque inoltrato (§6.5), altrimenti
+         * un problema puramente locale partizionerebbe il flooding. */
         dtnex_log("❌ Applicazione in ION fallita per %lu→%lu",
                 contact->fromNode, contact->toNode);
-        return -1;
-    }
-
-    if (outcome != IONC_NOOP) {
+    } else if (outcome != IONC_NOOP) {
         dtnex_log("✅ Contatto %lu→%lu %s in ION",
                 contact->fromNode, contact->toNode, ionc_outcome_name(outcome));
     }
 
-    // Inoltro invariato (§6.5): un messaggio valido si inoltra sempre
+    // Inoltro invariato (§6.5): un messaggio che supera la validazione si
+    // inoltra sempre, indipendentemente dall'esito della scrittura locale in ION.
     forwardCborContactMessage(config, nonce, timestamp, expireTime, origin, from, contact);
 
     return 0;
