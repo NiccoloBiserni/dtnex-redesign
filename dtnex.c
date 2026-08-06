@@ -1208,6 +1208,28 @@ void getContacts(DtnexConfig *config) {
         log_contact_update(config, contactCount);
     }
     
+    // Snapshot dei contatti annunciabili: e' esattamente cio' che verra'
+    // messo sul filo, quindi va confrontato con 'l contact' di ionadmin.
+    if (config->debugMode) {
+        ContactRecord snapshot[IONC_MAX_CONTACTS];
+        int snapshotCount = ionc_get_own_contacts(config->nodeId, snapshot,
+                IONC_MAX_CONTACTS, config->debugMode);
+
+        if (snapshotCount < 0) {
+            dtnex_log("⚠️  Impossibile leggere lo snapshot dei contatti annunciabili");
+        } else {
+            dtnex_log("\033[36mContatti annunciabili (fromNode == %lu): %d\033[0m",
+                    config->nodeId, snapshotCount);
+            for (int s = 0; s < snapshotCount; s++) {
+                dtnex_log("  %lu→%lu  from=%ld to=%ld  xmitRate=%lu B/s  conf=%u%%  owlt=%us",
+                        snapshot[s].fromNode, snapshot[s].toNode,
+                        (long) snapshot[s].fromTime, (long) snapshot[s].toTime,
+                        snapshot[s].xmitRate, snapshot[s].confidence,
+                        snapshot[s].owlt);
+            }
+        }
+    }
+
     // Generate graph after every contact printout as requested
     if (config->createGraph) {
         createGraph(config);

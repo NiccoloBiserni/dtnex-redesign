@@ -11,8 +11,8 @@ INCLUDES = -I$(ION_INCDIR)/bpv7/include -I$(ION_INCDIR)/ici/include
 
 # Target and source files
 TARGET = dtnex
-SOURCES = dtnex.c
-OBJECTS = dtnex.o
+SOURCES = dtnex.c ion_contacts.c
+OBJECTS = dtnex.o ion_contacts.o
 
 # Default target
 all: $(TARGET)
@@ -22,8 +22,11 @@ $(TARGET): $(OBJECTS)
 	$(CC) $(OBJECTS) -o $(TARGET) $(LIBS)
 
 # Compile source files
-dtnex.o: dtnex.c dtnex.h
+dtnex.o: dtnex.c dtnex.h ion_contacts.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c dtnex.c
+
+ion_contacts.o: ion_contacts.c ion_contacts.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c ion_contacts.c
 
 # Clean build artifacts
 clean:

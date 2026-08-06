@@ -21,13 +21,14 @@ rm -f dtnex.o dtnex
 
 # Compile
 gcc -Wall -g -I../ione-code/bpv7/include -I../ione-code/ici/include -c dtnex.c -o dtnex.o
+gcc -Wall -g -I../ione-code/bpv7/include -I../ione-code/ici/include -c ion_contacts.c -o ion_contacts.o
 if [ $? -ne 0 ]; then
     echo "Compilation failed"
     exit 1
 fi
 
 # Link
-gcc dtnex.o -o dtnex -L/usr/local/lib -lbp -lici -lm -lpthread -lcrypto
+gcc dtnex.o ion_contacts.o -o dtnex -L/usr/local/lib -lbp -lici -lm -lpthread -lcrypto
 if [ $? -ne 0 ]; then
     echo "Linking failed"
     exit 1
