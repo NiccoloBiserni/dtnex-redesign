@@ -162,7 +162,7 @@ noMetadataExchange=false
 | \`updateInterval\` | Message exchange frequency (seconds) | 30 | 60 |
 | \`bundleTTL\` | Bundle time-to-live (seconds) | 1800 | 3600 |
 | \`contactLifetime\` | Metadata message validity (seconds); since v3.00 no longer governs announced contact duration, which is read from ION's contact plan | 3600 | 7200 |
-| \`contactTimeTolerance\` | Clock sync tolerance (seconds) | 1800 | 1800 |
+| \`contactTimeTolerance\` | Unused since v3.00: contact windows carry absolute times, clock-skew detection uses a fixed threshold | 1800 | 1800 |
 | \`presSharedNetworkKey\` | HMAC authentication key | "open" | "mynetwork123" |
 | \`nodemetadata\` | Node description string | "" | "Node1,admin@site.com,Location" |
 | \`gpsLatitude\` | GPS latitude (decimal degrees) | - | 59.334591 |
@@ -241,7 +241,7 @@ All DTNEX messages follow this general CBOR array format:
 | Field | Type | Description | Size |
 |-------|------|-------------|------|
 | `version` | Integer | Protocol version (currently 3) | 1 byte |
-| `type` | Text String | Message type ("c"=contact, "m"=metadata) | 1 byte |
+| `type` | Text String | Message type ("c"=contact, "m"=metadata) | 2 bytes (1 header + 1 content) |
 | `timestamp` | Integer | Unix timestamp when message was created | 4 bytes |
 | `expireTime` | Integer | Unix timestamp when message expires | 4 bytes |
 | `origin` | Integer | Node ID that originally created the message | 4-8 bytes |
@@ -250,7 +250,7 @@ All DTNEX messages follow this general CBOR array format:
 | `messageData` | Array/Map | Type-specific message payload | Variable |
 | `hmac` | Byte String | 8-byte HMAC-SHA256 authentication tag | 8 bytes |
 
-### Contact Messages (Type 1)
+### Contact Messages (type `"c"`)
 
 Contact messages distribute network connectivity information between DTN nodes.
 
@@ -258,7 +258,7 @@ Messages are directional: a node only announces contacts where it is the `fromNo
 
 #### CBOR Structure
 ```
-[3, 1, timestamp, expireTime, origin, from, nonce, [fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt], hmac]
+[3, "c", timestamp, expireTime, origin, from, nonce, [fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt], hmac]
 ```
 
 #### Message Data Array
@@ -280,7 +280,7 @@ Messages are directional: a node only announces contacts where it is the `fromNo
 ```json
 [
   3,                    // Protocol version
-  1,                    // Contact message type
+  "c",                  // Contact message type
   1694885400,          // Timestamp (Unix epoch)
   1694887200,          // Expire time (equals the contact's toTime)
   268484800,           // Origin node ID
@@ -299,13 +299,13 @@ Messages are directional: a node only announces contacts where it is the `fromNo
 ]
 ```
 
-### Metadata Messages (Type 2)
+### Metadata Messages (type `"m"`)
 
 Metadata messages share node descriptions, GPS coordinates, and operator contact information.
 
 #### CBOR Structure
 ```
-[3, 2, timestamp, expireTime, origin, from, nonce, metadataMap, hmac]
+[3, "m", timestamp, expireTime, origin, from, nonce, metadataMap, hmac]
 ```
 
 #### Metadata Map Structure
@@ -331,7 +331,7 @@ Metadata messages share node descriptions, GPS coordinates, and operator contact
 ```json
 [
   3,                    // Protocol version
-  2,                    // Metadata message type
+  "m",                  // Metadata message type
   1694885400,          // Timestamp
   1694887200,          // Expire time
   268484800,           // Origin node ID
@@ -377,16 +377,16 @@ DTNEX implements epidemic-style message forwarding:
 The CBOR protocol can be extended for custom applications:
 
 #### Adding New Message Types
-1. **Define Type Number**: Choose unused integer (3, 4, 5, ...)
+1. **Define Type Tag**: Choose an unused one-character text string ("s", "t", ...)
 2. **Design Message Data**: Create CBOR array or map structure
 3. **Implement Handlers**: Add encoding/decoding functions
 4. **Authentication**: Use same HMAC scheme for security
 
-#### Example Custom Message (Type 3)
+#### Example Custom Message (type `"s"`)
 ```json
 [
   3,                    // Protocol version
-  3,                    // Custom message type
+  "s",                  // Custom message type
   1694885400,          // Timestamp
   1694887200,          // Expire time
   268484800,           // Origin node ID

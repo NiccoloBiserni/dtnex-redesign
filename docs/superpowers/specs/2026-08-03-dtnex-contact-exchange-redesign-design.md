@@ -1,7 +1,7 @@
 # DTNEX — Redesign dello scambio di contatti
 
 **Data:** 2026-08-03
-**Stato:** design approvato, pronto per il piano di implementazione
+**Stato:** implementato sul branch `redesign`, con i limiti noti registrati in fondo
 **Versione protocollo risultante:** 3 (da 2)
 
 ---
@@ -82,7 +82,7 @@ Non serve un registro di "cosa ho inserito io". La rimozione mirata per `fromTim
 
 Un contatto senza range locale **non viene annunciato**, con log a livello debug. Motivo: CGR scarta dalla considerazione come next-hop un contatto privo di range, quindi annunciarlo occuperebbe SDR e genererebbe churn senza mai produrre una rotta.
 
-Simmetricamente, in ricezione un messaggio privo di `owlt` valido viene scartato senza inserire nulla.
+In ricezione **non** c'è un filtro simmetrico: il formato v3 porta sempre il campo `owlt` e `0` è un valore legittimo (§6.1). Il filtro vive tutto in origination.
 
 Effetto collaterale voluto: un errore di configurazione (contatto senza range in ionrc) diventa visibile invece di propagarsi silenziosamente.
 
@@ -171,6 +171,7 @@ In ordine, prima di toccare ION. Ogni fallimento: **scarta senza inserire e senz
 | 3 | nonce non duplicato | invariato |
 | 4 | `origin != me` | invariato (`dtnex.c:3196`) |
 | 5 | `fromNode == origin` | solo la sorgente annuncia la propria direzione |
+| 5b | `fromNode != toNode` | un contatto verso se stessi è la semantica dei *contatti di registrazione*, non topologia; l'origination lo filtra già, ma un peer in possesso della chiave potrebbe iniettarlo |
 | 6 | `toTime != 0` | in ION `toTime = 0` significa *contatto scoperto* → `MAX_POSIX_TIME`, cioè permanente (`rfx.h:53-56`) |
 | 7 | `fromTime < toTime` | integrità |
 | 7b | `fromTime <= 0` | in ION `fromTime = 0` significa *contatto ipotetico* |
@@ -178,7 +179,9 @@ In ordine, prima di toccare ION. Ogni fallimento: **scarta senza inserire e senz
 | 7d | `xmitRate == 0` | ION rifiuta il contatto con errore utente 5 |
 | 7e | `confidence > 100` | fuori dal range 0-100: ION rifiuta con errore utente 4 |
 | 8 | `toTime > now` | già scaduto: inutile inserirlo e inondarlo |
-| 9 | `owlt` presente e valido | senza range CGR scarta il contatto |
+| 8b | `fromTime <= now + 30 giorni` | finestra troppo nel futuro: sospetto di clock skew (§7.6) |
+
+**Non c'è un controllo sull'`owlt`.** La prima stesura ne prevedeva uno ("`owlt` presente e valido"), ma `owlt = 0` è un valore legittimo — su una LAN è quello fisicamente corretto, e ION accetta `a range ... 0`. Il controllo contraddiceva l'origination, dove `findOwlt` restituisce 0 come valore valido, e su un testbed locale avrebbe fatto scartare ogni contatto a ogni ricevente. Il formato v3 porta sempre il campo e §3.4 garantisce che si annuncino solo contatti per cui un range esiste davvero: il controllo in ricezione era ridondante.
 
 Un messaggio scartato da questa pipeline restituisce **0**, non -1: lo scarto è una decisione di policy, non un fallimento di decodifica — il messaggio si è decodificato correttamente, si è solo deciso di non applicarlo. Un -1 risalirebbe fino a `decodeCborMessage` e produrrebbe un fuorviante "formato bundle sconosciuto" per un messaggio perfettamente valido.
 
@@ -196,6 +199,7 @@ Identità: `K = (regionNbr locale, fromNode, toNode, fromTime)`.
 | `K` esiste, tutto identico | **no-op** |
 | `K` esiste, cambiano solo `xmitRate` / `confidence` | **`rfx_revise_contact`** — in place |
 | `K` esiste, cambia `toTime` | `rfx_remove_contact(&fromTime)` + `rfx_insert_contact` |
+| `K` non esiste ma la finestra si sovrappone a un altro contatto locale | ION rifiuta con codice 9, si mantiene quello locale, si logga a debug: **non è un fallimento** |
 
 **La riga che risolve il problema 1.3 è una sola: `&fromTime` al posto di `NULL`.** Con `NULL` ION applica lo scope `*` e cancella tutti i contatti della coppia; con il puntatore al `fromTime` esatto colpisce solo quello che si sta davvero aggiornando.
 
@@ -285,7 +289,16 @@ Il precedente testo di questa sezione diceva che la race restava aperta pur esse
 
 ### 7.6 Errori e diagnostica
 
-**Fallimenti di inserimento.** Le `rfx_*` restituiscono `-1` su errore di sistema e `> 0` su errore utente. Con le regole di §6.2 un errore utente non è più atteso: se arriva, lo stato di ION è diverso da quello letto dal controllo di esistenza. **Va loggato come anomalia, non come informazione di routine** (oggi: `dtnex.c:3257-3264`).
+**Fallimenti di inserimento.** Le `rfx_*` restituiscono `-1` su errore di sistema e `> 0` su errore utente. Le due classi vanno tenute separate, perché hanno significato opposto.
+
+Il controllo di esistenza di §6.4 cerca per `fromTime` **esatto**: per costruzione non può rilevare le sovrapposizioni. Un errore utente è quindi non solo possibile ma **atteso in regime stazionario**: in un ionrc bidirezionale convenzionale entrambi i nodi dichiarano entrambe le direzioni con tempi relativi, quindi il contatto `A→B` che B annuncia si sovrappone a quello che B stesso ha già configurato in locale, ma con un `fromTime` assoluto diverso. `rfx_insert_contact` lo rifiuta con il codice 9 ("overlapping contact ignored"), e questo è il comportamento corretto: si mantiene la voce configurata dall'operatore.
+
+Regole:
+
+- **`rc < 0`** è l'unica anomalia: log a livello non-debug, esito `IONC_ERROR`.
+- **`rc > 0`** è una condizione locale attesa: log **a debug** con il *significato* del codice (9 = sovrapposizione con voce locale, 7 = region non corrispondente, 5 = xmitRate nullo, 4 = confidence fuori range, 2 su revise = contatto bersaglio non Scheduled), esito `IONC_NOOP`, **nessun return anticipato**: la scrittura del range prosegue comunque, perché un rifiuto sul contatto non deve impedire a ION di imparare l'OWLT.
+- **`rfx_insert_range` che restituisce 1** non è nemmeno un errore utente: il sorgente di ION lo commenta come *idempotente* (il range c'è già con lo stesso `owlt`). È un successo, esito `IONC_NOOP`.
+- `*cxaddr` / `*rxaddr` valgono come riscontro incrociato del rifiuto (`rfx.h:62-63`), con l'eccezione dei codici emessi dalla scansione dei conflitti (insert contatto 8 e 9, insert range 1 e 2), dove ION lascia di proposito l'indirizzo della voce in conflitto.
 
 **Sfasamento degli orologi.** I tempi assoluti presuppongono nodi sincronizzati. ION lo richiede già per CGR, ma il guasto diventa visibile: un nodo con l'orologio indietro di un'ora vedrebbe tutti i contatti altrui cadere sul controllo 8 e resterebbe isolato senza spiegazione.
 
@@ -368,3 +381,50 @@ Entrambe vanno corrette insieme all'aggiornamento per il nuovo payload.
 | `confidence` come intero 0-100 | Vincolato da `cbor.h`, non da scelta |
 | Nessun flag `owned`, nessun registro locale | Conseguenza dei tempi assoluti |
 | Nessuna revoca esplicita dei contatti | Sì — richiederebbe un nuovo tipo di messaggio |
+
+---
+
+## 12. Limiti noti emersi in implementazione
+
+Tre punti aperti che la review finale del branch ha trovato e che **non** vengono
+corretti nell'ondata di fix pre-merge. Sono registrati qui per non perderli, non
+per essere risolti adesso.
+
+### 12.1 Rilevazione del restart di ION insufficiente
+
+§6.6 prescrive `ownNodeNbr` oppure il fallimento della transazione SDR. Ma un ciclo
+`ionstop && ionstart` **conserva** `ownNodeNbr`: il restart più comune non viene
+rilevato. Serve un marcatore d'istanza — per esempio l'identità della partizione di
+working memory, oppure il `PsmAddress` di `contactIndex` memorizzato all'avvio, che
+una vdb nuova rialloca. Richiede una decisione di design.
+
+### 12.2 Il join simmetrico dei range indebolisce §3.4
+
+`findOwlt` accetta anche il verso opposto, e `ionc_apply_contact` inserisce un range
+`(origin → me)` per ogni contatto accettato: quel range è un candidato valido per il
+contatto locale `(me → origin)`, quindi un contatto locale **privo** di range può
+comunque essere annunciato usando un OWLT imparato da un peer. §3.4 prometteva che un
+errore di configurazione dell'`ionrc` diventasse visibile; qui può venire
+silenziosamente coperto.
+
+La review ha verificato che non produce churn né oscillazione: il valore è
+deterministico e in configurazione simmetrica i due OWLT coincidono. Il costo è la
+diagnostica persa, non l'instabilità.
+
+Mitigazione futura: preferire il verso esatto e ricadere sull'opposto solo in sua
+assenza. Va inoltre annotato che l'invariante della cache scritto in `dtnex.c` vale
+per i campi di identità del contatto ma **non** per `owlt`.
+
+### 12.3 Gli header ION di `include/ion/` non corrispondono alla libreria installata
+
+Sono di una release diversa: `IonRegion`, `IonDB`, `IonNode` e `IonContact`
+divergono, e `MAX_POSIX_TIME` vale 2147397247 nel bundle contro 2147483647
+nell'installato. La review ha verificato che i layout da cui questo branch dipende —
+`IonCXref`, `IonRXref`, `IonVdb`, l'offset di `ownNodeNbr` in `IonDB` — **coincidono**,
+quindi oggi il modulo è salvo; ma il commit `87590d4` di questo stesso branch esiste
+proprio perché una di queste divergenze aveva corrotto silenziosamente le letture RBT.
+
+Mitigazione futura: risincronizzare gli header, oppure aggiungere in `ion_contacts.c`
+un paio di `_Static_assert` su `sizeof(IonCXref)`, `offsetof(IonCXref, fromTime)` e
+`sizeof(IonVdb)`, per trasformare il prossimo disallineamento in un errore di
+compilazione anziché in una corruzione muta.
