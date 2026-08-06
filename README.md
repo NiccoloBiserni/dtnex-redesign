@@ -159,7 +159,7 @@ noMetadataExchange=false
 |-----------|-------------|---------|---------|
 | \`updateInterval\` | Message exchange frequency (seconds) | 30 | 60 |
 | \`bundleTTL\` | Bundle time-to-live (seconds) | 1800 | 3600 |
-| \`contactLifetime\` | Contact validity duration (seconds) | 3600 | 7200 |
+| \`contactLifetime\` | Metadata message validity (seconds); since v3.00 no longer governs announced contact duration, which is read from ION's contact plan | 3600 | 7200 |
 | \`contactTimeTolerance\` | Clock sync tolerance (seconds) | 1800 | 1800 |
 | \`presSharedNetworkKey\` | HMAC authentication key | "open" | "mynetwork123" |
 | \`nodemetadata\` | Node description string | "" | "Node1,admin@site.com,Location" |
@@ -239,7 +239,7 @@ All DTNEX messages follow this general CBOR array format:
 | Field | Type | Description | Size |
 |-------|------|-------------|------|
 | `version` | Integer | Protocol version (currently 3) | 1 byte |
-| `type` | Integer | Message type (1=contact, 2=metadata) | 1 byte |
+| `type` | Text String | Message type ("c"=contact, "m"=metadata) | 1 byte |
 | `timestamp` | Integer | Unix timestamp when message was created | 4 bytes |
 | `expireTime` | Integer | Unix timestamp when message expires | 4 bytes |
 | `origin` | Integer | Node ID that originally created the message | 4-8 bytes |
