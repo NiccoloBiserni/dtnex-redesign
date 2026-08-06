@@ -122,10 +122,12 @@ updateInterval=30
 # Bundle time-to-live should be longer than update interval for reliability  
 bundleTTL=1800      # 30 minutes
 
-# Contact lifetime - how long contact information remains valid
+# Contact lifetime - since v3.00 only sets metadata message validity;
+# announced contact duration is read from ION's own contact plan (ionrc)
 contactLifetime=3600  # 1 hour
 
-# Contact time tolerance for clock synchronization issues
+# Contact time tolerance - unused since v3.00 (contact windows carry
+# absolute times; clock-skew detection uses a fixed threshold instead)
 contactTimeTolerance=1800  # 30 minutes
 
 # Pre-shared network key for message authentication
@@ -412,6 +414,6 @@ The CBOR protocol can be extended for custom applications:
 
 - **Pre-shared Keys**: Use strong, randomly generated network keys
 - **Key Distribution**: Secure key distribution required for network access
-- **Message Expiry**: Configure appropriate `contactLifetime` values
+- **Message Expiry**: Contact messages expire at the contact's own `toTime`; metadata messages expire after `contactLifetime` — both bound how long a captured message stays replayable
 - **Nonce Entropy**: Ensure good randomness for nonce generation
 - **Replay Window**: Balance cache size with replay protection needs
