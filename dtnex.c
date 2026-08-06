@@ -112,8 +112,14 @@ void debug_log(DtnexConfig *config, const char *format, ...) {
     fflush(stdout);
 }
 
+/* Strumentazione di analisi su file. Resta spenta finche' loadConfig non
+ * accerta debugMode: senza debug non deve esistere nessun dtnex_debug.log,
+ * altrimenti in --service il file cresce senza fine. */
+static int dtnexDbgToFile = 0;
+
 static void dtnex_dbg(const char *fmt, ...) {
     static FILE *_dbgf = NULL;
+    if (!dtnexDbgToFile) return;
     if (_dbgf == NULL) {
         _dbgf = fopen("dtnex_debug.log", "a");
         if (_dbgf == NULL) return;
@@ -314,6 +320,11 @@ void loadConfig(DtnexConfig *config) {
     } else {
         dtnex_log("No dtnex.conf found, using f settings (no metadata exchange)");
     }
+
+    /* dtnex_dbg e' static e non vede DtnexConfig: gli passiamo qui l'unico
+     * dato che gli serve. Prima di questo punto la strumentazione su file e'
+     * spenta, quindi nessun dtnex_debug.log viene creato senza debugMode. */
+    dtnexDbgToFile = config->debugMode;
 }
 
 
@@ -379,7 +390,9 @@ int tryConnectToIon(DtnexConfig *config) {
     dtnex_dbg("[tryConnectToIon] IonDB dump after sdr_read:");
     dtnex_dbg("  ownNodeNbr = %lu", (unsigned long)iondb.ownNodeNbr);
     dtnex_dbg("  ranges     = 0x%lx", (unsigned long)iondb.ranges);
-    dtnex_dbg("  contacts   = 0x%lx", (unsigned long)iondb.contacts);
+    /* Niente dump di iondb.contacts: quel campo non esiste nell'IonDB della
+     * libreria ION installata, a quell'offset c'e' 'ranges'. La riga stampava
+     * lo stesso valore della precedente sotto un altro nome. */
     /* ---- END DEBUG ---- */
 
     if (config->nodeId == 0) {
@@ -3163,6 +3176,16 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         return 0;
     }
 
+    // 5b. Un contatto verso se stessi non e' topologia: in ION e' la semantica
+    // dei contatti di registrazione. ionc_get_own_contacts lo filtra in
+    // origination, ma un peer in possesso della chiave HMAC potrebbe comunque
+    // iniettarlo, quindi il filtro serve anche in ricezione.
+    if (contact->fromNode == contact->toNode) {
+        debug_log(config, "❌ Scartato: fromNode == toNode (%lu): contatto di "
+                "registrazione, non topologia", contact->fromNode);
+        return 0;
+    }
+
     // 6. toTime = 0 in ION significa "contatto scoperto" -> MAX_POSIX_TIME
     if (contact->toTime == 0) {
         debug_log(config, "❌ Scartato: toTime = 0 (semantica di contatto permanente)");
@@ -3223,12 +3246,12 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         return 0;
     }
 
-    // 9. Senza range CGR scarta il contatto: inutile inserirlo
-    if (contact->owlt == 0) {
-        debug_log(config, "❌ Scartato: owlt assente o nullo per %lu→%lu",
-                contact->fromNode, contact->toNode);
-        return 0;
-    }
+    /* Non c'e' un controllo 9 sull'owlt: 0 e' un OWLT legittimo (su una LAN e'
+     * il valore fisicamente corretto, e ION accetta "a range ... 0"). Scartarlo
+     * qui contraddiceva l'origination, dove findOwlt restituisce 0 come valore
+     * valido, e su un testbed locale faceva scartare tutto a ogni ricevente.
+     * Il formato v3 porta sempre il campo e ionc_get_own_contacts annuncia solo
+     * contatti per cui un range esiste davvero: il controllo era ridondante. */
 
     /* Si scrive cio' che si impara, si annuncia solo cio' di cui si e'
      * autoritativi (§4.5): anche i contatti con toNode == me si inseriscono. */
