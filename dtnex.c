@@ -1047,213 +1047,50 @@ void signalHandler(int sig) {
 }
 
 /**
- * Display the current contact graph by accessing ION's contact plan directly
- * Based EXACTLY on the ionadmin's listContacts function but with prettier formatting
+ * Wrapper sottile attorno al modulo ion_contacts: stampa la tabella
+ * diagnostica, verifica esplicitamente che ION sia vivo e coerente
+ * (§6.6), poi genera lo snapshot dei contatti annunciabili e il grafo.
  */
 void getContacts(DtnexConfig *config) {
-    Sdr sdr;
-    IonVdb *ionvdb;
-    PsmPartition ionwm;
-    PsmAddress elt;    // For traversing the red-black tree
-    PsmAddress addr;
-    time_t currentTime;
-    IonCXref *contact;
-    int contactCount = 0;
-    
-    // Only show detailed table in debug mode
-    if (config->debugMode) {
-        // Header for contact plan table
-        dtnex_log("\033[36m%-12s %-12s %-20s %-20s %-15s %-12s\033[0m",
-                "FROM NODE", "TO NODE", "START TIME", "END TIME", "DURATION", "STATUS");
-        dtnex_log("\033[36m-----------------------------------------------------------------------\033[0m");
-    }
-    
-    // Get the SDR database
-    sdr = getIonsdr();
-    if (sdr == NULL) {
-        dtnex_log("⚠️  Cannot access ION SDR - ION may have been restarted");
-        dtnex_log("🔄 Attempting to reinitialize ION connection...");
-        
-        // Close current SAP if it exists
+    int contactCount;
+    int alive;
+
+    contactCount = ionc_print_contact_table(config->debugMode);
+
+    if (contactCount < 0) {
+        // ION non accessibile: puo' essere un restart o una disconnessione.
+        dtnex_log("⚠️  Cannot access ION contact database - ION may have been restarted");
+
         if (sap != NULL) {
             bp_close(sap);
             sap = NULL;
         }
-        
-        // Mark as disconnected
         ionConnected = 0;
-        
-        // ION restart detected - completely restart DTNEX
         restartDtnex(config);
         return;
     }
-    
-    // Get current time
-    time(&currentTime);
-    
-    // Start transaction for memory safety
-    if (sdr_begin_xn(sdr) < 0) {
-        dtnex_log("⚠️  Cannot start SDR transaction - ION may have been restarted");
-        dtnex_log("🔄 Attempting to reinitialize ION connection...");
-        
-        // Close current SAP if it exists
+
+    // Rilevazione esplicita del restart (§6.6): "zero contatti" NON e' un
+    // indizio di restart, un nodo appena avviato ne ha legittimamente zero.
+    alive = ionc_check_alive(config->nodeId);
+    if (alive != 1) {
+        dtnex_log("⚠️  ION restart rilevato (ownNodeNbr non piu' %lu)", config->nodeId);
+
         if (sap != NULL) {
             bp_close(sap);
             sap = NULL;
         }
-        
-        // Mark as disconnected
         ionConnected = 0;
-        
-        // ION restart detected - completely restart DTNEX
         restartDtnex(config);
         return;
     }
-    
-    // Get ion volatile database
-    ionvdb = getIonVdb();
-    if (ionvdb == NULL) {
-        dtnex_log("⚠️  Cannot access ION volatile database - ION may have been restarted");
-        sdr_exit_xn(sdr);
-        
-        // Close current SAP if it exists
-        if (sap != NULL) {
-            bp_close(sap);
-            sap = NULL;
-        }
-        
-        // Mark as disconnected
-        ionConnected = 0;
-        
-        // ION restart detected - completely restart DTNEX
-        restartDtnex(config);
-        return;
-    }
-    
-    // Get the working memory
-    ionwm = getIonwm();
-    if (ionwm == NULL) {
-        dtnex_log("⚠️  Cannot access ION working memory - ION may have been restarted");
-        sdr_exit_xn(sdr);
-        
-        // Close current SAP if it exists
-        if (sap != NULL) {
-            bp_close(sap);
-            sap = NULL;
-        }
-        
-        // Mark as disconnected
-        ionConnected = 0;
-        
-        // ION restart detected - completely restart DTNEX
-        restartDtnex(config);
-        return;
-    }
-    
-    // Check if contact index is initialized
-    if (ionvdb->contactIndex == 0) {
-        dtnex_log("Contact index not initialized");
-        sdr_exit_xn(sdr);
-        return;
-    }
 
-    /* 
-     * This is the EXACT pattern from ionadmin.c for traversing contacts
-     * using the red-black tree in ION's contact database.
-     */
-    for (elt = sm_rbt_first(ionwm, ionvdb->contactIndex); 
-         elt; 
-         elt = sm_rbt_next(ionwm, elt)) {
-        addr = sm_rbt_data(ionwm, elt);
-        if (addr == 0) {
-            continue;  // Skip invalid addresses
-        }
-        
-        contact = (IonCXref *) psp(ionwm, addr);
-        if (contact == NULL) {
-            continue;  // Skip NULL contacts
-        }
-        dtnex_dbg("[getContacts] IonCXref entry: "
-            "fromNode=%lu toNode=%lu fromTime=%ld toTime=%ld "
-            "xmitRate=%lu confidence=%.2f",
-            (unsigned long)contact->fromNode,
-            (unsigned long)contact->toNode,
-            (long)contact->fromTime,
-            (long)contact->toTime,
-            (unsigned long)contact->xmitRate,
-            (double)contact->confidence);
-
-        // Calculate time remaining and format duration in a readable way
-        time_t timediff = contact->toTime - currentTime;
-        char durationStr[20];
-        
-        // Format duration based on size for better readability
-        if (timediff > 86400) { // More than a day
-            snprintf(durationStr, sizeof(durationStr), "%.1f days", timediff / 86400.0);
-        } else if (timediff > 3600) { // More than an hour
-            snprintf(durationStr, sizeof(durationStr), "%.1f hours", timediff / 3600.0);
-        } else if (timediff > 60) { // More than a minute
-            snprintf(durationStr, sizeof(durationStr), "%.1f minutes", timediff / 60.0);
-        } else {
-            snprintf(durationStr, sizeof(durationStr), "%ld seconds", timediff);
-        }
-        
-        // Convert UNIX timestamps to human readable format
-        char startTimeStr[25], endTimeStr[25];
-        struct tm *timeinfo;
-        
-        timeinfo = localtime(&contact->fromTime);
-        strftime(startTimeStr, sizeof(startTimeStr), "%Y-%m-%d %H:%M:%S", timeinfo);
-        
-        timeinfo = localtime(&contact->toTime);
-        strftime(endTimeStr, sizeof(endTimeStr), "%Y-%m-%d %H:%M:%S", timeinfo);
-        
-        // Determine if contact is active now
-        const char* status = (contact->fromTime <= currentTime && currentTime <= contact->toTime) ? 
-                             "\033[32mACTIVE\033[0m" : "\033[33mFUTURE\033[0m";
-        
-        // Only show detailed contact info in debug mode
-        if (config->debugMode) {
-            // Format and output the contact information in a table row
-            dtnex_log("%-12lu %-12lu %-20s %-20s %-15s %s",
-                    (unsigned long)contact->fromNode, 
-                    (unsigned long)contact->toNode,
-                    startTimeStr,
-                    endTimeStr,
-                    durationStr,
-                    status);
-        }
-        
-        contactCount++;
-    }
-
-    // End the transaction
-    sdr_exit_xn(sdr);
-
-    dtnex_dbg("[getContacts] TOTAL contacts in ION RBT: %d", contactCount);
-
-    // Check if ION might have been restarted (no contacts found)
-    if (contactCount == 0) {
-        dtnex_log("⚠️  No contacts found - ION may have been restarted");
-        // ION restart detected - completely restart DTNEX
-        restartDtnex(config);
-    }
-    
-    if (config->debugMode) {
-        // Show detailed summary in debug mode
-        if (contactCount == 0) {
-            dtnex_log("No contacts found in ION database");
-        } else {
-            dtnex_log("\033[36m-----------------------------------------------------------------------\033[0m");
-            dtnex_log("Total contacts: %d", contactCount);
-        }
-    } else {
-        // Show simple update in normal mode
+    if (!config->debugMode) {
         log_contact_update(config, contactCount);
     }
-    
-    // Snapshot dei contatti annunciabili: e' esattamente cio' che verra'
-    // messo sul filo, quindi va confrontato con 'l contact' di ionadmin.
+
+    // Snapshot dei contatti annunciabili: e' esattamente cio' che finisce
+    // sul filo, quindi va confrontato con 'l contact' di ionadmin.
     if (config->debugMode) {
         ContactRecord snapshot[IONC_MAX_CONTACTS];
         int snapshotCount = ionc_get_own_contacts(config->nodeId, snapshot,
@@ -1274,7 +1111,6 @@ void getContacts(DtnexConfig *config) {
         }
     }
 
-    // Generate graph after every contact printout as requested
     if (config->createGraph) {
         createGraph(config);
     }

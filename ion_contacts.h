@@ -81,4 +81,23 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode);
 /* Nome leggibile dell'esito, per i log. */
 const char *ionc_outcome_name(IoncApplyOutcome outcome);
 
+/**
+ * Stampa la tabella diagnostica dei contatti presenti in ION (tutti, non
+ * solo i nostri). Ritorna il numero di contatti, -1 se ION non e'
+ * accessibile. La stampa dettagliata avviene solo con debugMode != 0.
+ */
+int ionc_print_contact_table(int debugMode);
+
+/**
+ * Verifica che ION sia vivo e che sia ancora la stessa istanza: legge
+ * ownNodeNbr dall'IonDB e lo confronta con quello atteso.
+ *
+ * Ritorna 1 se ION e' vivo e coerente, 0 se e' ripartito o riconfigurato
+ * con un altro node number, -1 se non e' accessibile (§6.6).
+ *
+ * NON usare "zero contatti" come indizio di restart: un nodo appena
+ * avviato o di bordo ha legittimamente zero contatti.
+ */
+int ionc_check_alive(unsigned long expectedNodeId);
+
 #endif /* ION_CONTACTS_H */

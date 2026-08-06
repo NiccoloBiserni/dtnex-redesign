@@ -423,3 +423,140 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
 
     return (rangeOutcome > contactOutcome) ? rangeOutcome : contactOutcome;
 }
+
+int ionc_print_contact_table(int debugMode)
+{
+    Sdr           sdr;
+    IonVdb       *ionvdb;
+    PsmPartition  ionwm;
+    PsmAddress    elt;
+    PsmAddress    addr;
+    IonCXref     *contact;
+    time_t        now;
+    int           count = 0;
+
+    sdr = getIonsdr();
+    if (sdr == NULL) {
+        return -1;
+    }
+
+    if (sdr_begin_xn(sdr) < 0) {
+        return -1;
+    }
+
+    ionvdb = getIonVdb();
+    ionwm = getIonwm();
+    if (ionvdb == NULL || ionwm == NULL) {
+        sdr_exit_xn(sdr);
+        return -1;
+    }
+
+    if (ionvdb->contactIndex == 0) {
+        sdr_exit_xn(sdr);
+        return 0;
+    }
+
+    now = time(NULL);
+
+    if (debugMode) {
+        dtnex_log("\033[36m%-12s %-12s %-20s %-20s %-15s %-12s\033[0m",
+                "FROM NODE", "TO NODE", "START TIME", "END TIME",
+                "DURATION", "STATUS");
+        dtnex_log("\033[36m--------------------------------------------------"
+                "---------------------\033[0m");
+    }
+
+    for (elt = sm_rbt_first(ionwm, ionvdb->contactIndex); elt;
+            elt = sm_rbt_next(ionwm, elt)) {
+        addr = sm_rbt_data(ionwm, elt);
+        if (addr == 0) {
+            continue;
+        }
+
+        contact = (IonCXref *) psp(ionwm, addr);
+        if (contact == NULL) {
+            continue;
+        }
+
+        count++;
+
+        if (debugMode) {
+            time_t      timediff = contact->toTime - now;
+            char        durationStr[24];
+            char        startTimeStr[25];
+            char        endTimeStr[25];
+            struct tm  *timeinfo;
+            const char *status;
+
+            if (timediff > 86400) {
+                snprintf(durationStr, sizeof(durationStr), "%.1f days",
+                        timediff / 86400.0);
+            } else if (timediff > 3600) {
+                snprintf(durationStr, sizeof(durationStr), "%.1f hours",
+                        timediff / 3600.0);
+            } else if (timediff > 60) {
+                snprintf(durationStr, sizeof(durationStr), "%.1f minutes",
+                        timediff / 60.0);
+            } else {
+                snprintf(durationStr, sizeof(durationStr), "%ld seconds",
+                        (long) timediff);
+            }
+
+            timeinfo = localtime(&contact->fromTime);
+            strftime(startTimeStr, sizeof(startTimeStr), "%Y-%m-%d %H:%M:%S",
+                    timeinfo);
+            timeinfo = localtime(&contact->toTime);
+            strftime(endTimeStr, sizeof(endTimeStr), "%Y-%m-%d %H:%M:%S",
+                    timeinfo);
+
+            status = (contact->fromTime <= now && now <= contact->toTime)
+                    ? "\033[32mACTIVE\033[0m" : "\033[33mFUTURE\033[0m";
+
+            dtnex_log("%-12lu %-12lu %-20s %-20s %-15s %s",
+                    (unsigned long) contact->fromNode,
+                    (unsigned long) contact->toNode,
+                    startTimeStr, endTimeStr, durationStr, status);
+        }
+    }
+
+    sdr_exit_xn(sdr);
+
+    if (debugMode) {
+        dtnex_log("\033[36m--------------------------------------------------"
+                "---------------------\033[0m");
+        dtnex_log("Total contacts: %d", count);
+    }
+
+    return count;
+}
+
+int ionc_check_alive(unsigned long expectedNodeId)
+{
+    Sdr      sdr;
+    Object   iondbObject;
+    IonDB    iondb;
+
+    sdr = getIonsdr();
+    if (sdr == NULL) {
+        return -1;
+    }
+
+    if (sdr_begin_xn(sdr) < 0) {
+        return -1;
+    }
+
+    iondbObject = getIonDbObject();
+    if (iondbObject == 0) {
+        sdr_exit_xn(sdr);
+        return -1;
+    }
+
+    sdr_read(sdr, (char *) &iondb, iondbObject, sizeof(IonDB));
+    sdr_exit_xn(sdr);
+
+    if (iondb.ownNodeNbr == 0) {
+        return 0;
+    }
+
+    return ((unsigned long) iondb.ownNodeNbr == expectedNodeId) ? 1 : 0;
+}
