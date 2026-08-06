@@ -273,7 +273,9 @@ Il valore del TTL non è una micro-ottimizzazione: governa la reattività del tr
 
 **`myContacts` è mono-thread.** Lo tocca solo il main loop, in origination. Il thread di ricezione fa le proprie camminate RBT per il controllo di esistenza, su una primitiva separata che non scrive nell'array. **Nessun mutex nuovo**; la protezione sulle letture concorrenti di ION la fornisce già la transazione SDR.
 
-**`plans` ha invece una race che esiste già oggi.** `getplanlist()` scrive nelle statiche `cachedPlans[]` / `cachedPlanCount` ed è chiamata sia dal main loop sia dal thread di ricezione via `forwardCborContactMessage` (`dtnex.c:3358`). Non è introdotta dal redesign, ma il redesign non la risolve. **Inclusa in scope**: è un mutex su una funzione sola.
+**`plans` ha invece una race che esiste già oggi.** `getplanlist()` scrive nelle statiche `cachedPlans[]` / `cachedPlanCount` ed è chiamata sia dal main loop sia dal thread di ricezione via `forwardCborContactMessage` (`dtnex.c:3358`). Non è introdotta dal redesign, **ma il redesign la risolve**: è un mutex su una funzione sola, con l'unlock su tutti i cammini di uscita.
+
+Il precedente testo di questa sezione diceva che la race restava aperta pur essendo "inclusa in scope" — due affermazioni incompatibili. Vale la seconda: si corregge.
 
 ### 7.6 Errori e diagnostica
 
