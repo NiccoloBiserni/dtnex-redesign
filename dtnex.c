@@ -3281,114 +3281,86 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
  * Process CBOR contact message
  */
 
-// Scrittura in ION dei contatti
+/* Oltre questa distanza nel futuro una finestra e' sospetta di clock skew
+ * anziche' legittima: si scarta e lo si dice (§7.6). */
+#define CLOCK_SKEW_FUTURE_LIMIT (30 * 24 * 3600)
+
 int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
                              unsigned long origin, unsigned long from, ContactRecord *contact) {
-    log_message_received(config, origin, from, "contact", contact->fromNode, contact->toNode, NULL);
+    time_t currentTime = time(NULL);
+    IoncApplyOutcome outcome;
 
-    // Skip processing our own messages
+    log_message_received(config, origin, from, "contact",
+            contact->fromNode, contact->toNode, NULL);
+
+    /* Pipeline di validazione (§6.1). I controlli 1-3 (versione, HMAC,
+     * nonce) sono gia' stati fatti in decodeCborMessage. Ogni fallimento
+     * scarta senza inserire e senza inoltrare. */
+
+    // 4. Non processiamo i nostri stessi messaggi
     if (origin == config->nodeId) {
         debug_log(config, "⏭️ Skipping own contact message");
         return 0;
     }
 
-    // Create contact in ION
-    char contactCmd[256];
-    time_t startTime = contact->fromTime;
-    time_t endTime = contact->toTime;
-
-    // Format times for ION contact command
-    struct tm *startTm = gmtime(&startTime);
-    struct tm *endTm = gmtime(&endTime);
-
-    // Costruita la stringa di comando, ma usata solo per logging
-    snprintf(contactCmd, sizeof(contactCmd),
-        "a contact +%04d/%02d/%02d-%02d:%02d:%02d +%04d/%02d/%02d-%02d:%02d:%02d %lu %lu %lu",
-        startTm->tm_year + 1900, startTm->tm_mon + 1, startTm->tm_mday,
-        startTm->tm_hour, startTm->tm_min, startTm->tm_sec,
-        endTm->tm_year + 1900, endTm->tm_mon + 1, endTm->tm_mday,
-        endTm->tm_hour, endTm->tm_min, endTm->tm_sec,
-        contact->fromNode, contact->toNode, contact->xmitRate);
-
-    debug_log(config, "🔗 Adding contact: %s", contactCmd);
-
-    // Add contact directly using ION's internal API instead of system call
-    PsmAddress cxaddr = 0;
-    uint32_t regionNbr = 1;  // Default region number (same as _regionNbr(NULL) in ionadmin)
-    size_t xmitRate = (size_t) contact->xmitRate;
-    float confidence = contact->confidence / 100.0f;
-    int announce = 0;         // Don't announce to region
-
-    // Remove ALL existing contacts for this node pair first (using NULL scope like ionadmin '*')
-    // This prevents overlapping time issues by clearing all previous contacts
-    int removeResult1 = rfx_remove_contact(regionNbr, NULL,
-                                          (uvast)contact->fromNode, (uvast)contact->toNode, announce);
-    int removeResult2 = rfx_remove_contact(regionNbr, NULL,
-                                          (uvast)contact->toNode, (uvast)contact->fromNode, announce);
-
-    debug_log(config, "🗑️ All contacts removal results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d",
-              contact->fromNode, contact->toNode,
-              contact->fromNode, contact->toNode, removeResult1,
-              contact->toNode, contact->fromNode, removeResult2);
-
-    // Add bidirectional contacts as per user requirement (A->B and B->A)
-    PsmAddress cxaddr2 = 0;
-    int result1 = rfx_insert_contact(regionNbr, startTime, endTime,
-                                     (uvast)contact->fromNode, (uvast)contact->toNode,
-                                     xmitRate, confidence, &cxaddr, announce);
-
-    int result2 = rfx_insert_contact(regionNbr, startTime, endTime,
-                                     (uvast)contact->toNode, (uvast)contact->fromNode,
-                                     xmitRate, confidence, &cxaddr2, announce);
-
-    // Log contact results
-    if (result1 == 0 && result2 == 0) {
-        dtnex_log("✅ Bidirectional contacts %lu↔%lu added successfully", contact->fromNode, contact->toNode);
-    } else {
-        debug_log(config, "ℹ️ Contact results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d",
-                 contact->fromNode, contact->toNode,
-                 contact->fromNode, contact->toNode, result1,
-                 contact->toNode, contact->fromNode, result2);
+    // 5. Solo la sorgente annuncia la propria direzione (§4)
+    if (contact->fromNode != origin) {
+        debug_log(config, "❌ Scartato: fromNode=%lu != origin=%lu",
+                contact->fromNode, origin);
+        return -1;
     }
 
-    // Always add bidirectional ranges regardless of contact results
-    PsmAddress rxaddr1 = 0, rxaddr2 = 0;
-    unsigned int owlt = contact->owlt;
-    int announceRange = 0;  // Don't announce to region
-
-    // Remove ALL existing ranges for this node pair first (using NULL scope like ionadmin '*')
-    // This prevents overlapping time issues by clearing all previous ranges
-    int rangeRemoveResult1 = rfx_remove_range(NULL,
-                                             (uvast)contact->fromNode, (uvast)contact->toNode, announceRange);
-    int rangeRemoveResult2 = rfx_remove_range(NULL,
-                                             (uvast)contact->toNode, (uvast)contact->fromNode, announceRange);
-
-    debug_log(config, "🗑️ All ranges removal results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d",
-              contact->fromNode, contact->toNode,
-              contact->fromNode, contact->toNode, rangeRemoveResult1,
-              contact->toNode, contact->fromNode, rangeRemoveResult2);
-
-    // Add range A->B
-    int rangeResult1 = rfx_insert_range(startTime, endTime,
-                                        (uvast)contact->fromNode, (uvast)contact->toNode,
-                                        owlt, &rxaddr1, announceRange);
-
-    // Add range B->A
-    int rangeResult2 = rfx_insert_range(startTime, endTime,
-                                        (uvast)contact->toNode, (uvast)contact->fromNode,
-                                        owlt, &rxaddr2, announceRange);
-
-    // Log range results
-    if (rangeResult1 == 0 && rangeResult2 == 0) {
-        debug_log(config, "✅ Bidirectional ranges %lu↔%lu added successfully", contact->fromNode, contact->toNode);
-    } else {
-        debug_log(config, "ℹ️ Range results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d",
-                 contact->fromNode, contact->toNode,
-                 contact->fromNode, contact->toNode, rangeResult1,
-                 contact->toNode, contact->fromNode, rangeResult2);
+    // 6. toTime = 0 in ION significa "contatto scoperto" -> MAX_POSIX_TIME
+    if (contact->toTime == 0) {
+        debug_log(config, "❌ Scartato: toTime = 0 (semantica di contatto permanente)");
+        return -1;
     }
 
-    // Forward CBOR contact message to all neighbors (except origin and sender)
+    // 7. Integrita' della finestra
+    if (contact->fromTime >= contact->toTime) {
+        debug_log(config, "❌ Scartato: fromTime=%ld >= toTime=%ld",
+                (long) contact->fromTime, (long) contact->toTime);
+        return -1;
+    }
+
+    // 8. Finestra gia' scaduta
+    if (contact->toTime <= currentTime) {
+        debug_log(config, "❌ Scartato: finestra interamente nel passato "
+                "(toTime=%ld, adesso=%ld) — possibile clock skew fra i nodi",
+                (long) contact->toTime, (long) currentTime);
+        return -1;
+    }
+
+    // 8b. Finestra troppo nel futuro: sospetto di clock skew (§7.6)
+    if (contact->fromTime > currentTime + CLOCK_SKEW_FUTURE_LIMIT) {
+        debug_log(config, "❌ Scartato: finestra troppo nel futuro "
+                "(fromTime=%ld, adesso=%ld) — possibile clock skew fra i nodi",
+                (long) contact->fromTime, (long) currentTime);
+        return -1;
+    }
+
+    // 9. Senza range CGR scarta il contatto: inutile inserirlo
+    if (contact->owlt == 0) {
+        debug_log(config, "❌ Scartato: owlt assente o nullo per %lu→%lu",
+                contact->fromNode, contact->toNode);
+        return -1;
+    }
+
+    /* Si scrive cio' che si impara, si annuncia solo cio' di cui si e'
+     * autoritativi (§4.5): anche i contatti con toNode == me si inseriscono. */
+    outcome = ionc_apply_contact(contact, config->debugMode);
+    if (outcome == IONC_ERROR) {
+        dtnex_log("❌ Applicazione in ION fallita per %lu→%lu",
+                contact->fromNode, contact->toNode);
+        return -1;
+    }
+
+    if (outcome != IONC_NOOP) {
+        dtnex_log("✅ Contatto %lu→%lu %s in ION",
+                contact->fromNode, contact->toNode, ionc_outcome_name(outcome));
+    }
+
+    // Inoltro invariato (§6.5): un messaggio valido si inoltra sempre
     forwardCborContactMessage(config, nonce, timestamp, expireTime, origin, from, contact);
 
     return 0;

@@ -65,6 +65,92 @@ static int findOwlt(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
     return 0;
 }
 
+/**
+ * Cerca il contatto con chiave esatta (fromNode, toNode, fromTime).
+ * Va chiamata con una transazione SDR gia' aperta.
+ * Ritorna 1 e copia il contatto in *copy, oppure 0 se non esiste.
+ */
+static int findContact(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
+        uvast toNode, time_t fromTime, IonCXref *copy)
+{
+    PsmAddress   elt;
+    PsmAddress   addr;
+    IonCXref    *contact;
+
+    if (ionvdb->contactIndex == 0) {
+        return 0;
+    }
+
+    for (elt = sm_rbt_first(ionwm, ionvdb->contactIndex); elt;
+            elt = sm_rbt_next(ionwm, elt)) {
+        addr = sm_rbt_data(ionwm, elt);
+        if (addr == 0) {
+            continue;
+        }
+
+        contact = (IonCXref *) psp(ionwm, addr);
+        if (contact == NULL) {
+            continue;
+        }
+
+        if (contact->fromNode == fromNode && contact->toNode == toNode
+                && contact->fromTime == fromTime) {
+            memcpy(copy, contact, sizeof(IonCXref));
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Cerca il range con chiave esatta (fromNode, toNode, fromTime).
+ * Va chiamata con una transazione SDR gia' aperta.
+ */
+static int findRange(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
+        uvast toNode, time_t fromTime, IonRXref *copy)
+{
+    PsmAddress   elt;
+    PsmAddress   addr;
+    IonRXref    *range;
+
+    if (ionvdb->rangeIndex == 0) {
+        return 0;
+    }
+
+    for (elt = sm_rbt_first(ionwm, ionvdb->rangeIndex); elt;
+            elt = sm_rbt_next(ionwm, elt)) {
+        addr = sm_rbt_data(ionwm, elt);
+        if (addr == 0) {
+            continue;
+        }
+
+        range = (IonRXref *) psp(ionwm, addr);
+        if (range == NULL) {
+            continue;
+        }
+
+        if (range->fromNode == fromNode && range->toNode == toNode
+                && range->fromTime == fromTime) {
+            memcpy(copy, range, sizeof(IonRXref));
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+const char *ionc_outcome_name(IoncApplyOutcome outcome)
+{
+    switch (outcome) {
+    case IONC_NOOP:     return "no-op";
+    case IONC_REVISED:  return "revised";
+    case IONC_INSERTED: return "inserted";
+    case IONC_REPLACED: return "replaced";
+    default:            return "error";
+    }
+}
+
 int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
         int maxRecords, int debugMode)
 {
@@ -168,4 +254,144 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
 
     sdr_exit_xn(sdr);
     return count;
+}
+
+IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
+{
+    Sdr              sdr;
+    IonVdb          *ionvdb;
+    PsmPartition     ionwm;
+    IonCXref         existingContact;
+    IonRXref         existingRange;
+    int              haveContact;
+    int              haveRange;
+    PsmAddress       cxaddr = 0;
+    PsmAddress       rxaddr = 0;
+    time_t           key;
+    float            confidence;
+    int              rc;
+    IoncApplyOutcome contactOutcome = IONC_NOOP;
+    IoncApplyOutcome rangeOutcome = IONC_NOOP;
+
+    if (rec == NULL) {
+        return IONC_ERROR;
+    }
+
+    confidence = rec->confidence / 100.0f;
+
+    sdr = getIonsdr();
+    if (sdr == NULL) {
+        return IONC_ERROR;
+    }
+
+    /* Fase 1: controllo di esistenza, sotto transazione (§6.4). */
+    if (sdr_begin_xn(sdr) < 0) {
+        return IONC_ERROR;
+    }
+
+    ionvdb = getIonVdb();
+    ionwm = getIonwm();
+    if (ionvdb == NULL || ionwm == NULL) {
+        sdr_exit_xn(sdr);
+        return IONC_ERROR;
+    }
+
+    haveContact = findContact(ionwm, ionvdb, (uvast) rec->fromNode,
+            (uvast) rec->toNode, rec->fromTime, &existingContact);
+    haveRange = findRange(ionwm, ionvdb, (uvast) rec->fromNode,
+            (uvast) rec->toNode, rec->fromTime, &existingRange);
+
+    sdr_exit_xn(sdr);
+
+    /* Fase 2: scritture. Le rfx_* aprono la propria transazione, quindi
+     * vanno chiamate a transazione chiusa. */
+
+    if (!haveContact) {
+        rc = rfx_insert_contact(IONC_DEFAULT_REGION, rec->fromTime, rec->toTime,
+                (uvast) rec->fromNode, (uvast) rec->toNode,
+                (size_t) rec->xmitRate, confidence, &cxaddr, 0);
+        if (rc != 0) {
+            dtnex_log("⚠️  Anomalia: rfx_insert_contact %lu→%lu (from %ld) ha "
+                    "restituito %d", rec->fromNode, rec->toNode,
+                    (long) rec->fromTime, rc);
+            return IONC_ERROR;
+        }
+        contactOutcome = IONC_INSERTED;
+    } else if (existingContact.toTime != rec->toTime) {
+        /* Finestra cambiata: rimozione MIRATA per fromTime esatto. */
+        key = rec->fromTime;
+        rc = rfx_remove_contact(IONC_DEFAULT_REGION, &key,
+                (uvast) rec->fromNode, (uvast) rec->toNode, 0);
+        if (rc != 0) {
+            dtnex_log("⚠️  Anomalia: rfx_remove_contact %lu→%lu (from %ld) ha "
+                    "restituito %d", rec->fromNode, rec->toNode,
+                    (long) rec->fromTime, rc);
+            return IONC_ERROR;
+        }
+
+        rc = rfx_insert_contact(IONC_DEFAULT_REGION, rec->fromTime, rec->toTime,
+                (uvast) rec->fromNode, (uvast) rec->toNode,
+                (size_t) rec->xmitRate, confidence, &cxaddr, 0);
+        if (rc != 0) {
+            dtnex_log("⚠️  Anomalia: rfx_insert_contact (dopo remove) %lu→%lu "
+                    "ha restituito %d", rec->fromNode, rec->toNode, rc);
+            return IONC_ERROR;
+        }
+        contactOutcome = IONC_REPLACED;
+    } else if ((unsigned long) existingContact.xmitRate != rec->xmitRate
+            || existingContact.confidence < confidence - 0.005f
+            || existingContact.confidence > confidence + 0.005f) {
+        /* Solo xmitRate/confidence: revisione in place. */
+        rc = rfx_revise_contact(IONC_DEFAULT_REGION, rec->fromTime,
+                (uvast) rec->fromNode, (uvast) rec->toNode,
+                (size_t) rec->xmitRate, confidence, 0);
+        if (rc != 0) {
+            dtnex_log("⚠️  Anomalia: rfx_revise_contact %lu→%lu ha restituito %d",
+                    rec->fromNode, rec->toNode, rc);
+            return IONC_ERROR;
+        }
+        contactOutcome = IONC_REVISED;
+    }
+
+    /* Range: stessa struttura, ma rfx_revise_range non esiste (§6.3). */
+    if (!haveRange) {
+        rc = rfx_insert_range(rec->fromTime, rec->toTime,
+                (uvast) rec->fromNode, (uvast) rec->toNode, rec->owlt,
+                &rxaddr, 0);
+        if (rc != 0) {
+            dtnex_log("⚠️  Anomalia: rfx_insert_range %lu→%lu ha restituito %d",
+                    rec->fromNode, rec->toNode, rc);
+            return IONC_ERROR;
+        }
+        rangeOutcome = IONC_INSERTED;
+    } else if (existingRange.owlt != rec->owlt
+            || existingRange.toTime != rec->toTime) {
+        key = rec->fromTime;
+        rc = rfx_remove_range(&key, (uvast) rec->fromNode,
+                (uvast) rec->toNode, 0);
+        if (rc != 0) {
+            dtnex_log("⚠️  Anomalia: rfx_remove_range %lu→%lu ha restituito %d",
+                    rec->fromNode, rec->toNode, rc);
+            return IONC_ERROR;
+        }
+
+        rc = rfx_insert_range(rec->fromTime, rec->toTime,
+                (uvast) rec->fromNode, (uvast) rec->toNode, rec->owlt,
+                &rxaddr, 0);
+        if (rc != 0) {
+            dtnex_log("⚠️  Anomalia: rfx_insert_range (dopo remove) %lu→%lu ha "
+                    "restituito %d", rec->fromNode, rec->toNode, rc);
+            return IONC_ERROR;
+        }
+        rangeOutcome = IONC_REPLACED;
+    }
+
+    if (debugMode) {
+        dtnex_log("[ion] %lu→%lu from=%ld to=%ld: contatto=%s range=%s",
+                rec->fromNode, rec->toNode, (long) rec->fromTime,
+                (long) rec->toTime, ionc_outcome_name(contactOutcome),
+                ionc_outcome_name(rangeOutcome));
+    }
+
+    return (rangeOutcome > contactOutcome) ? rangeOutcome : contactOutcome;
 }
