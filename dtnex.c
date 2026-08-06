@@ -495,6 +495,12 @@ int init(DtnexConfig *config) {
  * A cosa serve questa funzione? -> serve per sapere quali nodi vicini conosce ION in questo momento.
  * Interroga direttamente le STRUTTURE INTERNE di ION per ottenere la lista dei nodi vicini (plans).
  */
+
+/* getplanlist e' chiamata sia dal main loop sia dal thread di ricezione
+ * (via forwardCborContactMessage) e scrive nella propria cache statica:
+ * l'accesso va serializzato (§7.5). */
+static pthread_mutex_t planListMutex = PTHREAD_MUTEX_INITIALIZER;
+
 void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     time_t currentTime;
 
@@ -511,10 +517,12 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     
     // Initialize the plan count to 0
     *planCount = 0;
-    
+
     // Get current time
     time(&currentTime);
-    
+
+    pthread_mutex_lock(&planListMutex);
+
     // Check if we've updated plans recently - if so, use cached results to avoid 
     // constant calls to ION API which can be expensive
     if (lastPlanUpdate > 0 && (currentTime - lastPlanUpdate) < 20) {
@@ -523,8 +531,9 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
             plans[i] = cachedPlans[i];
         }
         *planCount = cachedPlanCount;
-        
+
         dtnex_log("Using cached plan list (age: %ld seconds)", currentTime - lastPlanUpdate);
+        pthread_mutex_unlock(&planListMutex);
         return;
     }
     
@@ -540,7 +549,7 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
 
     if (sdr == NULL) {
         dtnex_log("Error: can't get ION SDR");
-        
+
         // Fallback: use previously cached plans if available
         if (cachedPlanCount > 0) {
             for (int i = 0; i < cachedPlanCount; i++) {
@@ -549,6 +558,7 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
             *planCount = cachedPlanCount;
             dtnex_log("Using %d plans from cache (fallback)", *planCount);
         }
+        pthread_mutex_unlock(&planListMutex);
         return;
     }
     
@@ -557,6 +567,7 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     // Start a transaction
     if (sdr_begin_xn(sdr) < 0) {
         dtnex_log("Error: can't begin SDR transaction");
+        pthread_mutex_unlock(&planListMutex);
         return;
     }
     
@@ -565,6 +576,7 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     if (bpConstants == NULL) {
         dtnex_log("Error: can't get BP constants");
         sdr_exit_xn(sdr);
+        pthread_mutex_unlock(&planListMutex);
         return;
     }
     
@@ -649,8 +661,9 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     for (int i = 0; i < *planCount; i++) {
         dtnex_log(">%lu", plans[i].planId);
     }
-    
+
     dtnex_log("%d neighbors found in ION configuration", *planCount);
+    pthread_mutex_unlock(&planListMutex);
 }
 
 /**
