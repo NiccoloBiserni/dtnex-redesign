@@ -6,7 +6,6 @@ dtnex
 
 # Configuration and runtime files
 *.log
-dtnex_debug.log
 *.txt
 debug_prompt.txt
 *.gv

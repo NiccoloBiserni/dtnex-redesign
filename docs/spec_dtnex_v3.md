@@ -628,3 +628,32 @@ section.
 node, and skews every subsequent measurement. It must be launched only where no timeout
 can interrupt it. Several measurements from that day were invalidated in exactly this
 way.
+
+---
+
+## Marginal note — command-line flags
+
+**Added on 2026-08-08**, while removing a debugging helper. Like §13, it was not
+part of the contact-exchange redesign: it surfaced while cleaning up after it.
+
+`main` never parsed `argv`. It only stored it for the re-exec on ION restart, so
+every argument was ignored in silence: `dtnex --debug` behaved exactly like
+`dtnex`, while `README.md` documented `--debug` and `--service` as working flags
+and `--debug` is the validation method this whole document relies on (§9). What
+actually enabled the debug output was `debugMode=true` in `dtnex.conf`, and
+nothing else.
+
+The gap went unnoticed because during development `dtnex.conf` carried
+`debugMode=true`, which made the flag look effective. It became visible only
+when the shipped configuration was reset to example values.
+
+`main` now walks `argv` **after** `loadConfig`, so an explicit flag wins over the
+configuration file, and reports unrecognised arguments instead of dropping them
+silently. The flags survive an ION-restart re-exec at no cost, since `execv`
+replays the same `argv`.
+
+Worth recording for what it says about the rest: a claim in the documentation
+had never been checked against the code. §10 corrected three such claims in
+`CLAUDE.md`, and preparing the public repository turned up several more in
+`README.md`. The lesson is not about flags — it is that documentation asserting
+runtime behaviour needs the same verification as the behaviour itself.

@@ -134,33 +134,6 @@ void debug_log(DtnexConfig *config, const char *format, ...) {
     fflush(stdout);
 }
 
-/* File-based analysis instrumentation. It stays off until loadConfig has
- * established debugMode: with debug disabled no dtnex_debug.log must exist at
- * all, otherwise under --service the file would grow without bound. */
-static int dtnexDbgToFile = 0;
-
-static void dtnex_dbg(const char *fmt, ...) {
-    static FILE *_dbgf = NULL;
-    if (!dtnexDbgToFile) return;
-    if (_dbgf == NULL) {
-        _dbgf = fopen("dtnex_debug.log", "a");
-        if (_dbgf == NULL) return;
-        fprintf(_dbgf, "\n=== DTNEX DEBUG SESSION START ===\n");
-        fflush(_dbgf);
-    }
-    struct timespec _ts;
-    clock_gettime(CLOCK_REALTIME, &_ts);
-    struct tm *_tm = localtime(&_ts.tv_sec);
-    char _tbuf[32];
-    strftime(_tbuf, sizeof(_tbuf), "%H:%M:%S", _tm);
-    fprintf(_dbgf, "[%s.%03ld] ", _tbuf, _ts.tv_nsec / 1000000);
-    va_list _ap;
-    va_start(_ap, fmt);
-    vfprintf(_dbgf, fmt, _ap);
-    va_end(_ap);
-    fprintf(_dbgf, "\n");
-    fflush(_dbgf);
-}
 
 /**
  * Optimized message logging functions
@@ -339,12 +312,6 @@ void loadConfig(DtnexConfig *config) {
     } else {
         dtnex_log("No dtnex.conf found, using f settings (no metadata exchange)");
     }
-
-    /* dtnex_dbg is static and cannot see DtnexConfig: the single piece of
-     * information it needs is handed to it here. Before this point the
-     * file instrumentation is off, so no dtnex_debug.log is ever created
-     * without debugMode. */
-    dtnexDbgToFile = config->debugMode;
 }
 
 
@@ -406,14 +373,10 @@ int tryConnectToIon(DtnexConfig *config) {
     config->nodeId = ownNodeNbr;
     sdr_exit_xn(ionsdr);
 
-    /* ---- DEBUG: dump IonDB fields ---- */
-    dtnex_dbg("[tryConnectToIon] IonDB dump after sdr_read:");
-    dtnex_dbg("  ownNodeNbr = %lu", (unsigned long)ownNodeNbr);
-    /* No other IonDB field is printed: the struct offsets in the bundled
-     * headers (include/ion/ion.h) do not match those of the installed ION
-     * library, so a value read at such an offset would not be the field it
-     * is named after (risk §12.3 of the design spec). */
-    /* ---- END DEBUG ---- */
+    /* Only ownNodeNbr is ever taken from the IonDB: the struct offsets in the
+     * bundled headers (include/ion/ion.h) do not match those of the installed
+     * ION library, so a value read at any other offset would not be the field
+     * it is named after (risk §12.3 of the design spec). */
 
     if (config->nodeId == 0) {
         bp_detach();
@@ -645,9 +608,6 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
             dtnex_log("Warning: Null plan pointer, skipping");
             continue;
         }
-        dtnex_dbg("[getplanlist] BpPlan raw read: neighborNodeNbr=%lu planData_obj=0x%lx",
-            (unsigned long)plan->neighborNodeNbr,
-            (unsigned long)planData);
 
         // Only include plans with a valid neighbor node number (CBHE-compliant)
         if (plan->neighborNodeNbr == 0) {
@@ -664,9 +624,6 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
         // Add this plan to our lists (both the output and the cache)
         if (*planCount < MAX_PLANS) {
             plans[*planCount].planId = plan->neighborNodeNbr; // neighborNodeNbr is stored as planId: it is the key piece of information identifying the neighbour, and is used later to build the EID -> ipn:neighborNodeNbr.serviceNr
-            dtnex_dbg("[getplanlist] Added to plan list: index=%d planId=%lu",
-                *planCount,
-                (unsigned long)plans[*planCount].planId);
             time(&plans[*planCount].timestamp);
             
             // Also update the cache
@@ -682,14 +639,6 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     
     // End the transaction
     sdr_exit_xn(sdr);
-
-    dtnex_dbg("[getplanlist] FINAL RESULT: planCount=%d nodeId=%lu",
-        *planCount,
-        (unsigned long)config->nodeId);
-    for (int _i = 0; _i < *planCount; _i++) {
-        dtnex_dbg("[getplanlist]   plan[%d] = neighborId %lu",
-            _i, (unsigned long)plans[_i].planId);
-    }
 
     // Update the cached plan count
     cachedPlanCount = *planCount;
@@ -1736,7 +1685,25 @@ int main(int argc, char **argv) {
 
     // Load configuration
     loadConfig(&config);
-    
+
+    /* Command-line flags, applied AFTER loadConfig so that an explicit flag
+     * wins over dtnex.conf. Until now argv was only kept for the re-exec and
+     * every argument was ignored in silence, so `dtnex --debug` behaved
+     * exactly like `dtnex` while the documentation promised otherwise.
+     *
+     * The flags survive an ION-restart re-exec for free: execv replays this
+     * same argv (see restartDtnex). */
+    for (int argIndex = 1; argIndex < argc; argIndex++) {
+        if (strcmp(argv[argIndex], "--debug") == 0) {
+            config.debugMode = 1;
+        } else if (strcmp(argv[argIndex], "--service") == 0) {
+            config.serviceMode = 1;
+        } else {
+            dtnex_log("⚠️  Unknown argument '%s' — supported: --debug, --service",
+                    argv[argIndex]);
+        }
+    }
+
     // Initialize - now returns an error code if it fails
     if (init(&config) < 0) {
         dtnex_log("Initialization failed, exiting");
@@ -1789,17 +1756,7 @@ int main(int argc, char **argv) {
     int planCount = 0;
     
     dtnex_log("🚀 Performing startup contact broadcast to all neighbors...");
-    dtnex_dbg("[main] About to call getplanlist for startup contact broadcast to all neighbors");
     getplanlist(&config, plans, &planCount);
-    dtnex_dbg("[main] getplanlist returned planCount=%d", planCount);
-    for (int _i = 0; _i < planCount; _i++) {
-        char _ts_str[32] = "N/A";
-        if (plans[_i].timestamp > 0) {
-            struct tm *_tm = gmtime(&plans[_i].timestamp);
-            strftime(_ts_str, sizeof(_ts_str), "%Y-%m-%dT%H:%M:%SZ", _tm);
-        }
-        dtnex_dbg("[main] plans[%d]: planId=%lu timestamp=%s", _i, plans[_i].planId, _ts_str);
-    }
     if (planCount > 0) {
         exchangeWithNeighbors(&config, plans, planCount);
         dtnex_log("✅ Startup contact broadcast completed to %d neighbors", planCount);
@@ -2222,16 +2179,6 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Send the bundle using direct ION API - no source EID for CBOR messages
-    dtnex_dbg("[sendCborBundle] bp_send: destEid=%s dataSize=%d ttl=%d",
-        destEid, dataSize, ttl);
-    {
-        char _hexbuf[256] = {0};
-        int _hlen = dataSize < 64 ? dataSize : 64;
-        for (int _b = 0; _b < _hlen; _b++) {
-            snprintf(_hexbuf + _b * 3, 4, "%02x ", ((unsigned char*)cborData)[_b]);
-        }
-        dtnex_dbg("[sendCborBundle] CBOR payload (first %d bytes): %s", _hlen, _hexbuf);
-    }
     sendResult = bp_send(NULL, destEid, NULL, ttl, BP_STD_PRIORITY,
                         NoCustodyRequested, 0, 0, NULL, bundleZco, &newBundle);
     

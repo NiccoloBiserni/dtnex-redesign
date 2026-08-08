@@ -185,8 +185,8 @@ noMetadataExchange=false
 | `gpsLongitude` | GPS longitude (decimal degrees) | - | 18.063240 |
 | `createGraph` | Write the GraphViz topology file on each update | false | true |
 | `graphFile` | Output path for the graph. The file written is **GraphViz source** (`digraph { … }`), not an image, so a `.gv` name is the sensible one; render it with `dot -Tpng contactGraph.gv -o contactGraph.png`. The built-in default is the misleading `contactGraph.png`, which the shipped configuration overrides | contactGraph.png | contactGraph.gv |
-| `serviceMode` | Background daemon mode | false | true |
-| `debugMode` | Verbose debug output | false | true |
+| `serviceMode` | Background daemon mode. The `--service` flag overrides this | false | true |
+| `debugMode` | Verbose debug output. The `--debug` flag overrides this | false | true |
 | `noMetadataExchange` | Disable metadata sharing. Defaults to `true` when no configuration file is found, so a node without a `dtnex.conf` never advertises itself | true | false |
 
 ## Usage
@@ -203,6 +203,10 @@ noMetadataExchange=false
 # Background service mode
 ./dtnex --service
 ```
+
+Both flags override the corresponding key in `dtnex.conf`, so `--debug` turns the
+verbose output on even when the file says `debugMode=false`. Any other argument is
+reported and ignored.
 
 ### Service Integration
 
