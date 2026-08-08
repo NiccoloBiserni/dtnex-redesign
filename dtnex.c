@@ -3257,11 +3257,23 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
      * autoritativi (§4.5): anche i contatti con toNode == me si inseriscono. */
     outcome = ionc_apply_contact(contact, config->debugMode);
     if (outcome == IONC_ERROR) {
-        /* IONC_ERROR e' uno stato locale di ION (es. sovrapposizione con un
-         * contatto configurato a mano), non un fallimento di validazione:
-         * il messaggio resta valido e va comunque inoltrato (§6.5), altrimenti
-         * un problema puramente locale partizionerebbe il flooding. */
+        /* IONC_ERROR e' un errore di sistema di una rfx_* (rc < 0) o ION
+         * irraggiungibile: dopo il fix precedente una sovrapposizione con un
+         * contatto configurato a mano e' un errore utente atteso e non
+         * arriva piu' qui. Il messaggio resta comunque valido e va inoltrato
+         * (§6.5), altrimenti un problema puramente locale partizionerebbe
+         * il flooding. */
         dtnex_log("❌ Applicazione in ION fallita per %lu→%lu",
+                contact->fromNode, contact->toNode);
+    } else if (outcome == IONC_LOST) {
+        /* La voce precedente e' stata rimossa da ION ma la insert che
+         * doveva rimpiazzarla e' stata rifiutata: a differenza degli altri
+         * esiti, qui ION e' peggiorato rispetto a prima, non solo invariato.
+         * Il dettaglio (codice ION, significato) e' gia' stato loggato da
+         * ion_contacts.c; qui si segnala solo che non e' un successo, cosi'
+         * la perdita non resta invisibile al livello di log predefinito. */
+        dtnex_log("⚠️  Contatto %lu→%lu perso in ION dopo una remove riuscita "
+                "(insert successiva rifiutata)",
                 contact->fromNode, contact->toNode);
     } else if (outcome != IONC_NOOP) {
         dtnex_log("✅ Contatto %lu→%lu %s in ION",

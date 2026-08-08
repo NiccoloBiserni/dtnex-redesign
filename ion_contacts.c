@@ -154,6 +154,7 @@ const char *ionc_outcome_name(IoncApplyOutcome outcome)
     case IONC_REVISED:  return "revised";
     case IONC_INSERTED: return "inserted";
     case IONC_REPLACED: return "replaced";
+    case IONC_LOST:     return "perso";
     default:            return "error";
     }
 }
@@ -498,10 +499,20 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
                 logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
                 return IONC_ERROR;
             } else if (rc > 0) {
-                noteUserError(debugMode, "rfx_insert_contact (dopo remove)",
-                        rec, rc, insertContactUserError(rc));
+                /* La remove e' andata a buon fine ma la insert e' stata
+                 * rifiutata: la voce vecchia e' sparita da ION e non e'
+                 * stata rimpiazzata. A differenza di una insert rifiutata a
+                 * secco, qui ION e' peggiorato: va loggato sempre, non solo
+                 * in debug. */
+                dtnex_log("⚠️  Anomalia: rfx_insert_contact (dopo remove) "
+                        "%lu→%lu (from %ld) rifiutato con codice %d — %s: "
+                        "il contatto precedente e' stato rimosso e non "
+                        "sostituito",
+                        rec->fromNode, rec->toNode, (long) rec->fromTime, rc,
+                        insertContactUserError(rc));
                 checkRejectAddr(debugMode, "rfx_insert_contact (dopo remove)",
                         rc, cxaddr, (rc == 8 || rc == 9));
+                contactOutcome = IONC_LOST;
             } else {
                 contactOutcome = IONC_REPLACED;
             }
@@ -579,10 +590,18 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
             } else if (rc == 1) {
                 rangeOutcome = IONC_NOOP;
             } else if (rc > 0) {
-                noteUserError(debugMode, "rfx_insert_range (dopo remove)", rec,
-                        rc, insertRangeUserError(rc));
+                /* Come sopra per il contatto: la remove e' riuscita, la
+                 * insert no. Il range precedente e' sparito da ION e non e'
+                 * stato rimpiazzato: va loggato sempre, non solo in debug. */
+                dtnex_log("⚠️  Anomalia: rfx_insert_range (dopo remove) "
+                        "%lu→%lu (from %ld) rifiutato con codice %d — %s: "
+                        "il range precedente e' stato rimosso e non "
+                        "sostituito",
+                        rec->fromNode, rec->toNode, (long) rec->fromTime, rc,
+                        insertRangeUserError(rc));
                 checkRejectAddr(debugMode, "rfx_insert_range (dopo remove)", rc,
                         rxaddr, (rc == 1 || rc == 2));
+                rangeOutcome = IONC_LOST;
             } else {
                 rangeOutcome = IONC_REPLACED;
             }

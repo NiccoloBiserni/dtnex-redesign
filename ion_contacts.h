@@ -64,6 +64,10 @@ typedef enum {
     IONC_REVISED,       /* xmitRate/confidence aggiornati in place */
     IONC_INSERTED,      /* contatto e/o range nuovi */
     IONC_REPLACED,      /* finestra cambiata: remove mirato + insert */
+    IONC_LOST,          /* remove riuscita ma la insert successiva e' stata
+                          * rifiutata da ION: la voce vecchia e' sparita e non
+                          * e' stata rimpiazzata, quindi la topologia in ION e'
+                          * peggiorata rispetto a prima della chiamata */
     IONC_ERROR          /* fallimento di una rfx_*: stato di ION inatteso */
 } IoncApplyOutcome;
 
