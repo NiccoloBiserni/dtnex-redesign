@@ -322,7 +322,7 @@ Mitigazione: quando un messaggio viene scartato perché la sua finestra è inter
 | `decodeCborMessage` | nuovo payload + tabella di validazione (§6.1) |
 | `processCborContactMessage` (`dtnex.c:3190`) | riscritta: regole idempotenti, `&fromTime` al posto di `NULL` |
 | `forwardCborContactMessage` (`dtnex.c:3358`) | logica invariata, si adegua ai nuovi campi |
-| `CLAUDE.md` | correzioni (§10) |
+| `CLAUDE.md` | correzioni applicate (§10) |
 
 ### 8.1 Estrazione di `ion_contacts.c`
 
@@ -359,12 +359,11 @@ Non esiste test suite: la validazione è manuale in `--debug`. Ogni prova è map
 
 ## 10. Correzioni alla documentazione
 
-`CLAUDE.md` contiene due imprecisioni verificate:
+`CLAUDE.md` conteneva tre imprecisioni verificate, tutte corrette:
 
-- dichiara il payload di tipo 1 come `[nodeA, nodeB, duration_min, datarate_bps, reliability]`; sul filo i campi sono tre (`[nodeA, nodeB, duration]`), come da `ContactInfo` in `dtnex.h:119-123`
-- dichiara il data rate in **bit** al secondo; `xmitRate` in ION è in **byte** al secondo (`include/ion/ion.h:203`)
-
-Entrambe vanno corrette insieme all'aggiornamento per il nuovo payload.
+- dichiarava il payload di tipo 1 come `[nodeA, nodeB, duration_min, datarate_bps, reliability]`; oggi documenta il payload a 7 campi (`[fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt]`) del nuovo design
+- dichiarava il data rate in **bit** al secondo; oggi dice esplicitamente `xmitRate` in **byte** al secondo, come in ION (`include/ion/ion.h:203`)
+- etichettava i due messaggi come "Type 1" e "Type 2", come se `type` fosse un intero sul filo; oggi le etichette sono "Type \"c\"" e "Type \"m\"", coerenti col valore reale del campo (stringa di testo, vedi `README.md`)
 
 ---
 

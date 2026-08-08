@@ -126,10 +126,6 @@ bundleTTL=1800      # 30 minutes
 # announced contact duration is read from ION's own contact plan (ionrc)
 contactLifetime=3600  # 1 hour
 
-# Contact time tolerance - unused since v3.00 (contact windows carry
-# absolute times; clock-skew detection uses a fixed threshold instead)
-contactTimeTolerance=1800  # 30 minutes
-
 # Pre-shared network key for message authentication
 presSharedNetworkKey=open
 
@@ -162,7 +158,7 @@ noMetadataExchange=false
 | \`updateInterval\` | Message exchange frequency (seconds) | 30 | 60 |
 | \`bundleTTL\` | Bundle time-to-live (seconds) | 1800 | 3600 |
 | \`contactLifetime\` | Metadata message validity (seconds); since v3.00 no longer governs announced contact duration, which is read from ION's contact plan | 3600 | 7200 |
-| \`contactTimeTolerance\` | Unused since v3.00: contact windows carry absolute times, clock-skew detection uses a fixed threshold | 1800 | 1800 |
+| \`contactTimeTolerance\` | Removed in this version. If present in an existing configuration file, the key is silently ignored | - | - |
 | \`presSharedNetworkKey\` | HMAC authentication key | "open" | "mynetwork123" |
 | \`nodemetadata\` | Node description string | "" | "Node1,admin@site.com,Location" |
 | \`gpsLatitude\` | GPS latitude (decimal degrees) | - | 59.334591 |
