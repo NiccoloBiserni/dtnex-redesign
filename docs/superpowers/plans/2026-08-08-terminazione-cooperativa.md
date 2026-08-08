@@ -48,7 +48,9 @@ Il teardown completo esiste già (`dtnex.c:1761-1788`) ma è irraggiungibile, pe
 **La correzione:** distinguere «il thread è stato creato» da «il thread deve continuare a girare», con due flag separati.
 
 **Files:**
-- Modify: `dtnex.c` — zona delle globali (intorno a `dtnex.c:64-70`), creazione dei thread in `main` (intorno a `dtnex.c:1698-1731`), teardown (`dtnex.c:1761-1788`)
+- Modify: `dtnex.c` — zona delle globali (intorno a `dtnex.c:64-70`), creazione dei thread in `main` (intorno a `dtnex.c:1698-1731`), **creazione dei thread nel percorso di riconnessione a ION** (`dtnex.c:2254` e `dtnex.c:2268`), teardown (`dtnex.c:1761-1788`)
+
+> **Correzione al piano, 2026-08-08.** La prima stesura di questo task elencava solo i siti di creazione in `main`. Sono quattro, non due: `eventDrivenLoop` ricrea entrambi i thread quando dtnex si riconnette dopo un restart di ION. Se i flag non vengono alzati anche lì, il difetto resta aperto proprio nello scenario di riconnessione — e se dtnex parte con ION non raggiungibile i thread nascono *solo* lì, quindi i flag resterebbero a zero per tutta la vita del processo e il teardown salterebbe entrambe le join. Lo step 2 copre tutti e quattro i siti.
 
 **Interfaces:**
 - Consumes: niente da task precedenti.
@@ -82,7 +84,9 @@ E nel ramo che logga `"✅ Bundle reception thread started"`, aggiungere prima d
                 bundleReceptionThreadStarted = 1;
 ```
 
-Non spostare né modificare la logica di `pthread_create` esistente: si aggiunge solo l'assegnazione, nel ramo di successo.
+Gli stessi due assegnamenti vanno nei rami di successo delle **altre due** `pthread_create`, quelle del percorso di riconnessione a ION dentro `eventDrivenLoop`: `dtnex.c:2254` (bpecho) e `dtnex.c:2268` (ricezione), entrambe nel ramo `== 0`, prima della rispettiva riga di log di successo.
+
+Non spostare né modificare la logica di `pthread_create` esistente, e non toccare le guardie `if (!bpechoState.running)` / `if (!bundleReceptionState.running)` che decidono se ricreare: si aggiunge solo l'assegnazione, nel ramo di successo. A fine task, `grep -n "pthread_create" dtnex.c` deve mostrare quattro siti, ognuno con il proprio flag alzato.
 
 - [ ] **Step 3: Usare i flag nuovi come guardia delle join**
 
