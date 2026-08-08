@@ -1567,13 +1567,13 @@ int initBundleReception(DtnexConfig *config, BundleReceptionState *state) {
 }
 
 /**
- *  Pipeline di recezione
- * runBundleReception()          ← thread dedicato, legge bundle da ION
-    └── processCborMessage()  ← entry point, validazione minima
-            └── decodeCborMessage()   ← parsing CBOR + autenticazione
-                    ├── processCborContactMessage()   ← tipo "c"
+ *  Reception pipeline
+ * runBundleReception()          ← dedicated thread, reads bundles from ION
+    └── processCborMessage()  ← entry point, minimal validation
+            └── decodeCborMessage()   ← CBOR parsing + authentication
+                    ├── processCborContactMessage()   ← type "c"
                     │       └── forwardCborContactMessage()
-                    └── processCborMetadataMessage()  ← tipo "m"
+                    └── processCborMetadataMessage()  ← type "m"
                             └── forwardCborMetadataMessage()
  */
 
@@ -1996,7 +1996,7 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
     // 7. Nonce
     bytesWritten += cbor_encode_byte_string(nonce, DTNEX_NONCE_SIZE, &cursor);
 
-    // 8. Contact data array v3 (§5.2): 7 campi, tempi assoluti
+    // 8. Contact data array v3 (§5.2): 7 fields, absolute times
     bytesWritten += cbor_encode_array_open(7, &cursor);
     bytesWritten += cbor_encode_integer(contact->fromNode, &cursor);
     bytesWritten += cbor_encode_integer(contact->toNode, &cursor);
@@ -2865,7 +2865,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
     
     // Extract data elements based on message type and then skip them for HMAC verification
     if (messageType[0] == 'c') {
-        // Contact message v3 (§5.2): 7 campi
+        // Contact message v3 (§5.2): 7 fields
         debug_log(config, "🔍 Extracting 7 contact elements manually");
 
         if (dataArraySize != 7) {
@@ -3413,7 +3413,7 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         bytesWritten += cbor_encode_integer(timestamp, &cursor);
         bytesWritten += cbor_encode_integer(expireTime, &cursor);
         bytesWritten += cbor_encode_integer(origin, &cursor);  // Keep original origin
-        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node, CAMBIA SOLO IL FROM CON IL NODE ID DI QUESTO NODO
+        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node: ONLY the "from" field is replaced with this node's ID
         bytesWritten += cbor_encode_byte_string(originalNonce, DTNEX_NONCE_SIZE, &cursor);
 
         // Contact data v3
