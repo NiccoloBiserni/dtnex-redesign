@@ -96,8 +96,8 @@ DTNEX now includes all necessary ION headers and builds without requiring ION so
 
 ```bash
 # Clone the repository
-git clone https://github.com/samograsic/ion-dtn-dtnex
-cd ion-dtn-dtnex
+git clone https://github.com/NiccoloBiserni/dtnex-redesign
+cd dtnex-redesign
 
 # Build using self-contained build script
 ./build_standalone.sh
@@ -108,25 +108,44 @@ sudo make install
 
 The self-contained build only requires ION system libraries (`libbp`, `libici`) to be installed - no ION source code needed!
 
+> **Upstream.** This repository is a fork of
+> [samograsic/ion-dtn-dtnex](https://github.com/samograsic/ion-dtn-dtnex) by
+> Samo Grasic, which remains the original project. This fork carries the v3
+> contact-exchange redesign described in [the design spec](docs/spec_dtnex_v3.md):
+> contacts are read from and written to ION's own contact plan, times travel as
+> absolute epochs, and the protocol version is 3, so it does **not** interoperate
+> with v2 nodes.
+
 ## Configuration
 
 ### Basic Configuration File (dtnex.conf)
 
+The repository ships a `dtnex.conf` with these example values, so a fresh
+checkout runs unattended. Edit it for your own node before joining a real
+network — in particular `presSharedNetworkKey` and `nodemetadata`.
+
 ```bash
 # DTNEX Configuration File
 # DTN Network Information Exchange
+#
+# These are example values, meant to let a freshly cloned checkout run
+# unattended. Edit them for your own node before joining a real network -
+# in particular presSharedNetworkKey and nodemetadata.
 
 # Message exchange interval (seconds) - how often to send contact/metadata updates
-updateInterval=600
+updateInterval=1800
 
-# Bundle time-to-live should be longer than update interval for reliability  
+# Bundle time-to-live should be longer than update interval for reliability
 bundleTTL=1800      # 30 minutes
 
-# Contact lifetime - since v3.00 only sets metadata message validity;
-# announced contact duration is read from ION's own contact plan (ionrc)
-contactLifetime=3600  # 1 hour
+# Contact lifetime - since v3.00 this applies ONLY to metadata messages.
+# The lifetime of the announced contacts is read from ION's contact plan
+# (ionrc), no longer from this parameter.
+contactLifetime=1800  # 30 minutes
 
-# Pre-shared network key for message authentication
+# Pre-shared network key for message authentication.
+# "open" is the default and provides no protection: every node that knows it
+# can inject contacts. Use a unique key per network.
 presSharedNetworkKey=open
 
 # Node metadata shared with other nodes (max 128 characters)
@@ -136,12 +155,12 @@ nodemetadata="DTNEX-Node,admin@example.com,Test-Location"
 
 # GPS coordinates for enhanced metadata (optional)
 # When enabled, CBOR metadata will include GPS coordinates as integers (multiplied by 1000000)
-gpsLatitude=59.334591
-gpsLongitude=18.063240
+#gpsLatitude=59.334591
+#gpsLongitude=18.063240
 
 # Graph visualization settings
 createGraph=true
-graphFile=contactGraph.png
+graphFile=contactGraph.gv
 
 # Service mode operation
 serviceMode=false    # Set to true for background daemon mode
@@ -149,6 +168,7 @@ debugMode=false      # Enable verbose debug output
 
 # Disable metadata exchange if needed
 noMetadataExchange=false
+
 ```
 
 ### Configuration Parameters
@@ -157,14 +177,14 @@ noMetadataExchange=false
 |-----------|-------------|---------|---------|
 | `updateInterval` | Message exchange frequency (seconds) | 600 | 1800 |
 | `bundleTTL` | Bundle time-to-live (seconds) | 1800 | 3600 |
-| `contactLifetime` | Metadata message validity (seconds); since v3.00 no longer governs announced contact duration, which is read from ION's contact plan | 3600 | 7200 |
+| `contactLifetime` | Metadata message validity (seconds); since v3.00 no longer governs announced contact duration, which is read from ION's contact plan | 3600 | 1800 |
 | `contactTimeTolerance` | Removed in this version. If present in an existing configuration file, the key is silently ignored | - | - |
 | `presSharedNetworkKey` | HMAC authentication key | "open" | "mynetwork123" |
 | `nodemetadata` | Node description string | "" | "Node1,admin@site.com,Location" |
 | `gpsLatitude` | GPS latitude (decimal degrees) | - | 59.334591 |
 | `gpsLongitude` | GPS longitude (decimal degrees) | - | 18.063240 |
-| `createGraph` | Enable GraphViz visualization | false | true |
-| `graphFile` | Output graph filename | contactGraph.png | /var/www/graph.png |
+| `createGraph` | Write the GraphViz topology file on each update | false | true |
+| `graphFile` | Output path for the graph. The file written is **GraphViz source** (`digraph { … }`), not an image, so a `.gv` name is the sensible one; render it with `dot -Tpng contactGraph.gv -o contactGraph.png`. The built-in default is the misleading `contactGraph.png`, which the shipped configuration overrides | contactGraph.png | contactGraph.gv |
 | `serviceMode` | Background daemon mode | false | true |
 | `debugMode` | Verbose debug output | false | true |
 | `noMetadataExchange` | Disable metadata sharing. Defaults to `true` when no configuration file is found, so a node without a `dtnex.conf` never advertises itself | true | false |
