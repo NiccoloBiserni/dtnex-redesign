@@ -1,8 +1,9 @@
 # DTNEX — Redesign dello scambio di contatti
 
-**Data:** 2026-08-03 — §13 aggiunta il 2026-08-08
+**Data:** 2026-08-03 — §13 aggiunta e implementata il 2026-08-08
 **Stato:** implementato sul branch `redesign`, con i limiti noti registrati in fondo.
-Il §13 (terminazione) è **progettato ma non ancora implementato**.
+Il §13 (terminazione) è implementato e verificato (§13.8), ma **non risolve il
+sintomo che lo aveva motivato**: vedi §13.9.
 **Versione protocollo risultante:** 3 (da 2)
 
 ---
@@ -568,16 +569,45 @@ Coprirli richiederebbe un recupero all'avvio — dtnex che rileva un lock stanti
 sblocca — che porta con sé il rischio di sbloccare la transazione di un altro processo
 ION legittimo. Fuori ambito per scelta.
 
-### 13.8 Verifica
+### 13.8 Verifica — ESEGUITA il 2026-08-08
 
-Manuale, come il resto: non esiste una suite.
+Manuale, come il resto: non esiste una suite. Implementato nei commit `fa12820`,
+`b9f0ce3`, `3c2b56c`, `b59b059`.
 
-| # | prova | verifica |
+| # | prova | esito |
 |---|---|---|
-| 1 | SIGTERM durante il funzionamento normale | dtnex esce, e `ionadmin` interrogato subito dopo risponde senza attese |
-| 2 | SIGTERM mentre è in corso l'applicazione di un contatto ricevuto | come sopra: nessun blocco di `ionadmin`, nessun `ionunlock` necessario |
-| 3 | doppio Ctrl+C | compare l'avviso di uscita forzata con il suggerimento `ionunlock ion` |
-| 4 | SIGTERM in modalità servizio | uscita pulita, stesso esito della prova 1 |
+| 1 | SIGTERM durante il funzionamento normale | ✅ uscita in 0,51 s dal segnale, teardown completo eseguito (entrambe le join, `bp_close`, `bp_detach`), `DTNEXC terminated normally` — riga finale di `main` che con il vecchio handler non compariva mai. `ionadmin` subito dopo: 7,6 ms |
+| 2 | SIGTERM mentre è in corso l'applicazione di un contatto ricevuto | ✅ ripetuta 4 volte con il segnale a 0,2 / 0,6 / 1,0 / 1,5 s dall'iniezione. In tutte: contatto applicato (`contatto=inserted range=inserted`), uscita ordinata, `ionadmin` fra 7,9 e 9,9 ms |
+| 3 | doppio segnale | ✅ avviso di uscita forzata presente, nomina `ionunlock ion` |
+| 4 | SIGTERM in modalità servizio | ✅ stesso esito della prova 1 |
 
-La prova 2 è quella che discrimina davvero: è l'unica che mette il segnale e la
-transazione nella stessa finestra temporale.
+### 13.9 Il sintomo originale NON è stato risolto
+
+**Il §13.1 attribuiva a questo difetto anche il blocco di `ionadmin` osservato
+mentre dtnex era in esecuzione. Quell'attribuzione è sbagliata, ed è stata smentita
+dalle prove.**
+
+Le quattro prove sopra misurano tutte il *dopo-uscita*. Una prova aggiuntiva, non
+prevista dalla spec, ha misurato il caso originale — `ionadmin` interrogato **mentre
+dtnex gira**, con il binario corretto:
+
+- `ionadmin` bloccato per **2 minuti e 13 secondi**, senza mai completare;
+- sbloccato **1,0 secondi dopo** il SIGTERM a dtnex;
+- nello stesso nodo, negli stessi minuti, le interrogazioni a dtnex fermo tornavano
+  in 8-10 ms.
+
+Durante il blocco il thread principale di dtnex era in `nanosleep` — dormiva, non
+teneva nessuna transazione — il thread `sigwait` era correttamente in
+`do_sigtimedwait`, e i due thread di servizio erano fermi su semafori dentro
+`bp_receive`.
+
+**Conseguenza.** Il difetto corretto dal §13 è reale — un `exit()` asincrono con una
+transazione potenzialmente aperta è scorretto, e la correzione è verificata dalle
+quattro prove. Ma **non era la causa del sintomo che ha fatto partire l'indagine**.
+La causa va cercata altrove, e l'indizio più forte è un thread che resta dentro
+`bp_receive` trattenendo un lock di ION mentre attende un bundle che non arriva:
+spiegherebbe perché il blocco si verifica a dtnex *inattivo* e cessa quando dtnex
+muore.
+
+Da indagare separatamente. Non chiudere la voce corrispondente nel documento di
+stato dandola per risolta.

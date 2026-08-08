@@ -192,12 +192,23 @@ esattamente il comportamento che `c54a8cb` doveva produrre. Prima del fix: silen
 
 ### Due cose emerse durante le prove, da guardare separatamente
 
-- **`ionadmin` si blocca mentre dtnex e' in esecuzione.** Misurato: bloccato da 2
-  minuti, sbloccato 2 secondi dopo l'arresto di dtnex. Nella stessa sessione dtnex ha
-  impiegato piu' volte diversi minuti ad agganciarsi a ION, e una volta non ha
-  risposto a SIGTERM. Le transazioni SDR in `ion_contacts.c` e in `getplanlist` sono
-  bilanciate a lettura del codice, quindi la causa non e' ovvia: **va indagata,
-  non e' spiegata.**
+- **`ionadmin` si blocca mentre dtnex e' in esecuzione. APERTO, e ora circoscritto.**
+  Misurato il 2026-08-08 due volte, la seconda con la terminazione cooperativa gia'
+  implementata (§13 della spec): `ionadmin` bloccato 2 minuti e 13 secondi senza mai
+  completare, sbloccato 1,0 secondi dopo il SIGTERM a dtnex, mentre a dtnex fermo le
+  stesse interrogazioni tornavano in 8-10 ms.
+
+  **Cosa NON e': la terminazione.** Il lavoro sulla terminazione e' stato fatto e
+  verificato, ma non tocca questo sintomo — il blocco avviene a dtnex vivo e
+  inattivo. L'ipotesi del §13.1 della spec, che attribuiva anche questo all'`exit(0)`
+  asincrono, e' smentita.
+
+  **Dove guardare.** Durante il blocco il thread principale di dtnex era in
+  `nanosleep` (non teneva transazioni), il thread `sigwait` in `do_sigtimedwait`, e i
+  due thread di servizio fermi su semafori dentro `bp_receive`. L'indizio piu' forte
+  e' un thread che resta dentro `bp_receive` trattenendo un lock di ION mentre attende
+  un bundle: spiegherebbe perche' il blocco c'e' a dtnex inattivo e cessa quando dtnex
+  muore. Dettagli e misure in §13.9 della spec.
 - **`bpsendfile` con il file del payload cancellato subito dopo l'invio manda ION in
   `Unrecoverable SDR error`** (`Can't compute payload block CRC` → `Can't serialize
   bundle payload`). ION serializza il payload dopo, rileggendo il file. E' un limite
