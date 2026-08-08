@@ -2,7 +2,9 @@
  * dtnex.h
  * DTNEX - DTN Network Information Exchange
  * High-performance C implementation for exchanging DTN contact and metadata information
+ *
  * Author: Samo Grasic (samo@grasic.net)
+ * v3 contact-exchange redesign: Niccolo Biserni (niccolo.biserni@studio.unibo.it)
  */
 
 #ifndef DTNEX_H
@@ -26,6 +28,9 @@
 // CBOR support using ION's implementation
 #include "include/ion/cbor.h"
 
+// Access to ION for contacts and ranges (separate module, see ion_contacts.h)
+#include "ion_contacts.h"
+
 // Added for bpecho service
 #include "include/ion/zco.h"
 #include "include/ion/lyst.h"
@@ -47,14 +52,13 @@ extern int removeEndpoint(char *endpointName);
 char *strptime(const char *s, const char *format, struct tm *tm);
 
 // Version information
-#define DTNEXC_VERSION "2.52"
+#define DTNEXC_VERSION "3.00"
 #define DTNEXC_BUILD_DATE __DATE__
 #define DTNEXC_BUILD_TIME __TIME__
 
 // Configuration constants - event-driven operation
 #define DEFAULT_UPDATE_INTERVAL 600        // 10 minutes between updates
 #define DEFAULT_CONTACT_LIFETIME 3600      // 1 hour contact validity
-#define DEFAULT_CONTACT_TIME_TOLERANCE 1800 // 30 minutes time tolerance
 #define DEFAULT_BUNDLE_TTL 1800            // 30 minutes bundle TTL (3x update interval)
 #define DEFAULT_SERVICE_NR 12160
 #define DEFAULT_BPECHO_SERVICE_NR 12161
@@ -70,7 +74,7 @@ char *strptime(const char *s, const char *format, struct tm *tm);
 #define BPECHO_ADU_LEN 1024
 
 // CBOR message constants
-#define DTNEX_PROTOCOL_VERSION 2
+#define DTNEX_PROTOCOL_VERSION 3
 #define DTNEX_NONCE_SIZE 3        // 3-byte nonce for ultra-minimal size
 #define DTNEX_HMAC_SIZE 8         // 64-bit HMAC for size optimization
 #define MAX_CBOR_BUFFER 128       // Maximum CBOR message size (increased for metadata)
@@ -83,7 +87,6 @@ char *strptime(const char *s, const char *format, struct tm *tm);
 typedef struct {
     int updateInterval;
     int contactLifetime;
-    int contactTimeTolerance;
     int bundleTTL;
     char presSharedNetworkKey[64];
     char serviceNr[16];
@@ -115,14 +118,7 @@ typedef struct {
     char metadata[MAX_METADATA_LENGTH];
 } NodeMetadata;
 
-// Ultra-minimal contact information structure for CBOR messages
-typedef struct {
-    unsigned long nodeA;
-    unsigned long nodeB;
-    unsigned short duration;    // Duration in minutes (0-65535)
-} ContactInfo;
-
-// Ultra-minimal metadata structure for CBOR messages  
+// Ultra-minimal metadata structure for CBOR messages
 typedef struct {
     unsigned long nodeId;
     char name[MAX_NODE_NAME_LENGTH];
@@ -169,10 +165,8 @@ int tryConnectToIon(DtnexConfig *config);
 int init(DtnexConfig *config);
 void getplanlist(DtnexConfig *config, Plan *plans, int *planCount);
 void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount);
-void processReceivedContacts(DtnexConfig *config, Plan *plans, int planCount);
 void getContacts(DtnexConfig *config);
 void createGraph(DtnexConfig *config);
-void signalHandler(int sig);
 void updateNodeMetadata(DtnexConfig *config, unsigned long nodeId, const char *metadata);
 void dtnex_log(const char *format, ...);
 
@@ -187,12 +181,12 @@ void log_message_error(DtnexConfig *config, const char *error_msg);
 void log_contact_update(DtnexConfig *config, int contactCount);
 
 // CBOR message functions (using ION's CBOR implementation)
-int encodeCborContactMessage(DtnexConfig *config, ContactInfo *contact, unsigned char *buffer, int bufferSize);
+int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsigned char *buffer, int bufferSize);
 int encodeCborMetadataMessage(DtnexConfig *config, StructuredMetadata *metadata, unsigned char *buffer, int bufferSize);
 void processCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize);
 int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize);
-int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime, 
-                             unsigned long origin, unsigned long from, ContactInfo *contact);
+int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
+                             unsigned long origin, unsigned long from, ContactRecord *contact);
 int processCborMetadataMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
                               unsigned long origin, unsigned long from, StructuredMetadata *metadata);
 
@@ -208,8 +202,8 @@ int manualDecodeCborInteger(unsigned long *value, unsigned char **cursor, unsign
 int manualDecodeCborString(char *buffer, int maxLen, unsigned char **cursor, unsigned int *bytesBuffered);
 
 // CBOR message forwarding functions
-void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp, 
-                               time_t expireTime, unsigned long origin, unsigned long from, ContactInfo *contact);
+void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp,
+                               time_t expireTime, unsigned long origin, unsigned long from, ContactRecord *contact);
 void forwardCborMetadataMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp,
                                 time_t expireTime, unsigned long origin, unsigned long from, StructuredMetadata *metadata);
 

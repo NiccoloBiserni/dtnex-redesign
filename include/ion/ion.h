@@ -427,6 +427,8 @@ typedef struct
 
 typedef struct
 {
+	uint32_t    regionNbr;
+	uint32_t    _pad;        // padding esplicito per allineamento uvast 64-bit
 	uvast		fromNode;	/*	LTP engineID, a.k.a.	*/
 	uvast		toNode;		/*	... BP CBHE nodeNbr.	*/
 	time_t		fromTime;	/*	As from time(2).	*/

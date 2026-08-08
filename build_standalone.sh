@@ -20,7 +20,7 @@ if [ ! -f "/usr/local/lib/libbp.so" ] && [ ! -f "/usr/lib/libbp.so" ]; then
 fi
 
 # Clean previous build
-rm -f dtnex.o dtnex
+rm -f dtnex.o ion_contacts.o dtnex
 
 # Compile with local headers
 gcc -Wall -g -I. -c dtnex.c -o dtnex.o
@@ -29,8 +29,14 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+gcc -Wall -g -I. -c ion_contacts.c -o ion_contacts.o
+if [ $? -ne 0 ]; then
+    echo "Compilation failed"
+    exit 1
+fi
+
 # Link with system ION libraries
-gcc dtnex.o -o dtnex -L/usr/local/lib -lbp -lici -lm -lpthread -lcrypto
+gcc dtnex.o ion_contacts.o -o dtnex -L/usr/local/lib -lbp -lici -lm -lpthread -lcrypto
 if [ $? -ne 0 ]; then
     echo "Linking failed"
     echo "Make sure ION-DTN libraries are installed in /usr/local/lib or /usr/lib"

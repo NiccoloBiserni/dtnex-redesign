@@ -2,7 +2,9 @@
  * dtnex.c
  * DTNEX - DTN Network Information Exchange
  * High-performance C implementation for exchanging DTN contact and metadata information
+ *
  * Author: Samo Grasic (samo@grasic.net)
+ * v3 contact-exchange redesign: Niccolo Biserni (niccolo.biserni@studio.unibo.it)
  */
 
 #include "dtnex.h"
@@ -15,21 +17,83 @@
 
 // Global variables
 volatile int running = 1;
-volatile int ionConnected = 0;  // Global ION connection status
+/*
+    Flag that keeps the main loop alive. It is volatile because the thread that
+    modifies it, signalWaitThread, is not the one running the loop: it is set to
+    0 when a signal arrives (SIGINT/SIGTERM/SIGTSTP), so that the main loop
+    terminates in an orderly fashion.
+*/
+volatile int ionConnected = 0;  // Global ION connection status; volatile because it can change asynchronously (e.g. if ION restarts while DTNEX is running)
 volatile int ionRestartDetected = 0;  // Flag to trigger complete restart
+/*
+    If set to 1, dtnex does not simply leave the loop: it calls restartDtnex(),
+    which execv()s the process onto itself. No child process is created, the
+    process image is simply replaced.
+*/
 static char **original_argv = NULL;  // Store original argv for restart
 static int original_argc = 0;        // Store original argc for restart
+/* Arguments used to perform the execv; they are saved at the top of main(). */
 BpSAP sap;
+/*
+    Bundle Protocol Service Access Point (SAP): the main handle onto ION's BP
+    layer. It behaves like a socket, but for DTN bundles; it is obtained from
+    bp_open() and used to send and receive bundles. Used throughout the code
+    for every BP operation.
+*/
 Sdr sdr;
+/*
+    Handle used to access ION's shared persistent memory, which does not go
+    through the standard malloc.
+*/
+
+// Message deduplication cache
 HashCache hashCache[MAX_HASH_CACHE];
 int hashCacheCount = 0;
-NodeMetadata nodeMetadataList[MAX_PLANS];
-int nodeMetadataCount = 0;
+/*
+    Used to deduplicate processed messages: every received message is hashed
+    and compared against the hashes already stored. A matching hash means the
+    message is a duplicate, and it is discarded.
+ */
 NonceCache nonceCache[MAX_HASH_CACHE]; // For CBOR replay protection
 int nonceCacheCount = 0;
+/*
+    The same, but for nonces: this guards against message replay. The cache
+    tracks (nonce, origin) pairs, so that a message intercepted and re-sent by
+    an attacker after it has already been processed is discarded.
+*/
+
+NodeMetadata nodeMetadataList[MAX_PLANS];
+int nodeMetadataCount = 0;
+/*
+    A local "address book" of nodeId + metadata. It is updated by
+    updateNodeMetadata() when a metadata message arrives, and then consulted
+    in getContacts().
+*/
+
 BpechoState bpechoState;   // Bpecho service state
-BundleReceptionState bundleReceptionState;  // Bundle reception service state
 pthread_t bpechoThread;    // Thread for bpecho service
+/*
+    Echo service management. BpechoState is a struct holding the state, a sap
+    and an attendant.
+*/
+
+BundleReceptionState bundleReceptionState;  // Bundle reception service state
+/*
+    Bundle reception thread management. BundleReceptionState is a struct
+    holding the state, the config and the thread identifier.
+*/
+
+/* "The thread has been created" is a different fact from "the thread should
+ * keep running": the latter is cleared in order to REQUEST shutdown, so it
+ * cannot guard the join, or the join would be skipped exactly when it is
+ * needed. Each thread can be born at two points: at startup in main(), if ION
+ * is already reachable, or inside eventDrivenLoop() after a later reconnection
+ * to ION. The flag must be raised at both points, otherwise a thread born only
+ * from a reconnection would never be joined. */
+int bpechoThreadStarted = 0;
+int bundleReceptionThreadStarted = 0;
+
+pthread_t signalThread;    /* Thread dedicated to collecting signals via sigwait */
 
 /**
  * Logging helper function with color support
@@ -60,7 +124,7 @@ void debug_log(DtnexConfig *config, const char *format, ...) {
     if (!config || !config->debugMode) {
         return;
     }
-    
+
     va_list args;
     va_start(args, format);
     printf("\033[90m[DEBUG] ");  // Dark gray color
@@ -68,6 +132,34 @@ void debug_log(DtnexConfig *config, const char *format, ...) {
     printf("\033[0m\n");  // Reset color
     va_end(args);
     fflush(stdout);
+}
+
+/* File-based analysis instrumentation. It stays off until loadConfig has
+ * established debugMode: with debug disabled no dtnex_debug.log must exist at
+ * all, otherwise under --service the file would grow without bound. */
+static int dtnexDbgToFile = 0;
+
+static void dtnex_dbg(const char *fmt, ...) {
+    static FILE *_dbgf = NULL;
+    if (!dtnexDbgToFile) return;
+    if (_dbgf == NULL) {
+        _dbgf = fopen("dtnex_debug.log", "a");
+        if (_dbgf == NULL) return;
+        fprintf(_dbgf, "\n=== DTNEX DEBUG SESSION START ===\n");
+        fflush(_dbgf);
+    }
+    struct timespec _ts;
+    clock_gettime(CLOCK_REALTIME, &_ts);
+    struct tm *_tm = localtime(&_ts.tv_sec);
+    char _tbuf[32];
+    strftime(_tbuf, sizeof(_tbuf), "%H:%M:%S", _tm);
+    fprintf(_dbgf, "[%s.%03ld] ", _tbuf, _ts.tv_nsec / 1000000);
+    va_list _ap;
+    va_start(_ap, fmt);
+    vfprintf(_dbgf, fmt, _ap);
+    va_end(_ap);
+    fprintf(_dbgf, "\n");
+    fflush(_dbgf);
 }
 
 /**
@@ -138,17 +230,16 @@ void log_contact_update(DtnexConfig *config, int contactCount) {
  */
 void loadConfig(DtnexConfig *config) {
     // Set defaults
-    config->updateInterval = DEFAULT_UPDATE_INTERVAL;
-    config->contactLifetime = DEFAULT_CONTACT_LIFETIME;
-    config->contactTimeTolerance = DEFAULT_CONTACT_TIME_TOLERANCE;
-    config->bundleTTL = DEFAULT_BUNDLE_TTL;
+    config->updateInterval = DEFAULT_UPDATE_INTERVAL; // 600, i.e. 10 minutes between updates
+    config->contactLifetime = DEFAULT_CONTACT_LIFETIME; // 3600, i.e. 1 hour of contact validity
+    config->bundleTTL = DEFAULT_BUNDLE_TTL; // 1800, i.e. 30 minutes of bundle TTL (3x update interval)
     strcpy(config->presSharedNetworkKey, DEFAULT_PRESHARED_KEY);
     sprintf(config->serviceNr, "%d", DEFAULT_SERVICE_NR);
     sprintf(config->bpechoServiceNr, "%d", DEFAULT_BPECHO_SERVICE_NR);
-    config->nodeId = 0;
+    config->nodeId = 0; // set to 0 because the node does not know its own ID until it connects to ION; it is then updated in tryConnectToIon()
     memset(config->nodemetadata, 0, MAX_METADATA_LENGTH);
     config->createGraph = 0;
-    strcpy(config->graphFile, "contactGraph.png");
+    strcpy(config->graphFile, "contactGraph.gv");  // GraphViz source, not an image
     config->noMetadataExchange = 1; // Default to not exchanging own metadata if no config file
     config->debugMode = 0; // Default to no debug output
     config->serviceMode = 0; // Default to interactive mode
@@ -159,6 +250,7 @@ void loadConfig(DtnexConfig *config) {
     // Try to read from config file
     FILE *configFile = fopen("dtnex.conf", "r");
     if (configFile) {
+        
         // Config file exists, disable the no-metadata-exchange flag
         config->noMetadataExchange = 0;
         
@@ -201,8 +293,6 @@ void loadConfig(DtnexConfig *config) {
                     config->updateInterval = atoi(value);
                 } else if (strcmp(key, "contactLifetime") == 0) {
                     config->contactLifetime = atoi(value);
-                } else if (strcmp(key, "contactTimeTolerance") == 0) {
-                    config->contactTimeTolerance = atoi(value);
                 } else if (strcmp(key, "bundleTTL") == 0) {
                     config->bundleTTL = atoi(value);
                 } else if (strcmp(key, "presSharedNetworkKey") == 0) {
@@ -249,6 +339,12 @@ void loadConfig(DtnexConfig *config) {
     } else {
         dtnex_log("No dtnex.conf found, using f settings (no metadata exchange)");
     }
+
+    /* dtnex_dbg is static and cannot see DtnexConfig: the single piece of
+     * information it needs is handed to it here. Before this point the
+     * file instrumentation is off, so no dtnex_debug.log is ever created
+     * without debugMode. */
+    dtnexDbgToFile = config->debugMode;
 }
 
 
@@ -258,13 +354,26 @@ void loadConfig(DtnexConfig *config) {
  * Try to connect to ION - returns 0 on success, -1 on failure
  * This function handles all ION connection logic cleanly
  */
+
+/**
+ * This function is the bridge between DTNEX and ION. It is made of 5 sequential
+ * phases; any failure performs a clean rollback and returns -1. On success it
+ * returns 0 and leaves DTNEX ready to use ION.
+ */
 int tryConnectToIon(DtnexConfig *config) {
     char endpointId[MAX_EID_LENGTH];
     
     // Try to attach to ION BP system
+    /**
+     * Attaches the process to the already running ION instance.
+     */
     if (bp_attach() < 0) {
         return -1;
     }
+
+    /**
+     * Reading the Node ID from ION.
+     */
     
     // Get the node ID from ION configuration
     Sdr ionsdr = getIonsdr();
@@ -280,19 +389,32 @@ int tryConnectToIon(DtnexConfig *config) {
     }
     
     // Get the node number from ION configuration
-    IonDB iondb;
-    Object iondbObject = getIonDbObject();
+    Object iondbObject = getIonDbObject(); // pointer to the iondb object inside ION's SDR
     if (iondbObject == 0) {
         sdr_exit_xn(ionsdr);
         bp_detach();
         return -1;
     }
-    
-    // Read the iondb object to get the node number
-    sdr_read(ionsdr, (char *) &iondb, iondbObject, sizeof(IonDB));
-    config->nodeId = iondb.ownNodeNbr;
+
+    /* Only the ownNodeNbr field is read, not the whole IonDB: the
+     * sizeof(IonDB) of the bundled headers does not match that of the
+     * installed ION library, so reading the entire struct would over-read
+     * past the end of the object in SDR. ownNodeNbr is the first field of
+     * the struct, so its offset is the same in both layouts. */
+    uvast ownNodeNbr;
+    sdr_read(ionsdr, (char *) &ownNodeNbr, iondbObject + offsetof(IonDB, ownNodeNbr), sizeof(ownNodeNbr));
+    config->nodeId = ownNodeNbr;
     sdr_exit_xn(ionsdr);
-    
+
+    /* ---- DEBUG: dump IonDB fields ---- */
+    dtnex_dbg("[tryConnectToIon] IonDB dump after sdr_read:");
+    dtnex_dbg("  ownNodeNbr = %lu", (unsigned long)ownNodeNbr);
+    /* No other IonDB field is printed: the struct offsets in the bundled
+     * headers (include/ion/ion.h) do not match those of the installed ION
+     * library, so a value read at such an offset would not be the field it
+     * is named after (risk §12.3 of the design spec). */
+    /* ---- END DEBUG ---- */
+
     if (config->nodeId == 0) {
         bp_detach();
         return -1;
@@ -305,16 +427,30 @@ int tryConnectToIon(DtnexConfig *config) {
     dtnex_log("Using endpoint: %s", endpointId);
     
     // Get the SDR
-    sdr = bp_get_sdr();
+    sdr = bp_get_sdr(); // obtained via bp_get_sdr() rather than getIonsdr(): this is the correct call for the SDR to be used with BP
     if (sdr == NULL) {
         bp_detach();
         return -1;
     }
     
     // First try to add/register the endpoint in ION's routing database
+
+    /**
+     * addEndpoint() is an ION API that adds the EID to the routing database. It
+     * tells ION that a bundle arriving for this EID must be enqueued here
+     * rather than discarded. A failure is not fatal: it means the endpoint was
+     * already registered by a previous run.
+     */
+
     if (addEndpoint(endpointId, EnqueueBundle, NULL) < 0) {
         debug_log(config, "Warning: Could not register endpoint %s in routing database", endpointId);
     }
+
+    /**
+     * With the endpoint now registered, we obtain the sap for that EID, which is
+     * what we will receive and send messages through; it is stored in the global
+     * variable sap.
+     */
     
     // Try to open the endpoint for receiving messages
     if (bp_open(endpointId, &sap) < 0) {
@@ -333,6 +469,13 @@ int tryConnectToIon(DtnexConfig *config) {
         parseNodeMetadata(config->nodemetadata, &metadata);
         
         // Create metadata string with GPS if available, otherwise use location field
+
+        /**
+         * Adds our own metadata, taken from the configuration file, to the local
+         * metadata list, from which it will later be pulled to fill the metadata
+         * messages sent to neighbours.
+         */
+
         if (config->hasGpsCoordinates) {
             snprintf(ownMetadata, sizeof(ownMetadata), "%s,%s,%.6f,%.6f", 
                     metadata.name, metadata.contact, 
@@ -357,8 +500,10 @@ int tryConnectToIon(DtnexConfig *config) {
  * Initialize the DTNEX application - Modified to work without requiring ION connection
  */
 int init(DtnexConfig *config) {
-    dtnex_log("Starting DTNEXC v%s (built %s %s), author: Samo Grasic (samo@grasic.net)", 
+    dtnex_log("Starting DTNEXC v%s (built %s %s)", 
               DTNEXC_VERSION, DTNEXC_BUILD_DATE, DTNEXC_BUILD_TIME);
+    dtnex_log("Original author: Samo Grasic (samo@grasic.net) — "
+              "v3 contact-exchange redesign: Niccolo Biserni (niccolo.biserni@studio.unibo.it)");
     
     // Try to connect to ION, but don't fail if unavailable
     if (tryConnectToIon(config) == 0) {
@@ -383,8 +528,25 @@ int init(DtnexConfig *config) {
  * Get the list of plans (neighbor nodes) directly from ION using ION API
  * Based on ipnadmin's listPlans function
  */
+
+/**
+ * What is this function for? It tells us which neighbour nodes ION knows about
+ * right now. It queries ION's INTERNAL STRUCTURES directly to obtain the list
+ * of neighbour nodes (plans).
+ */
+
+/* getplanlist is called both from the main loop and from the reception thread
+ * (via forwardCborContactMessage) and writes into its own static cache:
+ * access must be serialised (§7.5). */
+static pthread_mutex_t planListMutex = PTHREAD_MUTEX_INITIALIZER;
+
 void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     time_t currentTime;
+
+    // Static variables caching the plans; they persist across calls to avoid
+    // querying ION too often. If the plans were refreshed recently (less than
+    // 20 seconds ago), the cached ones are used.
+    // Being static, they are initialised only once.
     static Plan cachedPlans[MAX_PLANS];
     static int cachedPlanCount = 0;
     static time_t lastPlanUpdate = 0;
@@ -395,10 +557,12 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     
     // Initialize the plan count to 0
     *planCount = 0;
-    
+
     // Get current time
     time(&currentTime);
-    
+
+    pthread_mutex_lock(&planListMutex);
+
     // Check if we've updated plans recently - if so, use cached results to avoid 
     // constant calls to ION API which can be expensive
     if (lastPlanUpdate > 0 && (currentTime - lastPlanUpdate) < 20) {
@@ -407,8 +571,9 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
             plans[i] = cachedPlans[i];
         }
         *planCount = cachedPlanCount;
-        
+
         dtnex_log("Using cached plan list (age: %ld seconds)", currentTime - lastPlanUpdate);
+        pthread_mutex_unlock(&planListMutex);
         return;
     }
     
@@ -416,9 +581,15 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     
     // Get the SDR database
     sdr = getIonsdr();
+
+    /**
+     * The cache TTL has expired but the SDR still cannot be obtained from ION;
+     * if anything is left in the cache, it is used anyway.
+     */
+
     if (sdr == NULL) {
         dtnex_log("Error: can't get ION SDR");
-        
+
         // Fallback: use previously cached plans if available
         if (cachedPlanCount > 0) {
             for (int i = 0; i < cachedPlanCount; i++) {
@@ -427,58 +598,75 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
             *planCount = cachedPlanCount;
             dtnex_log("Using %d plans from cache (fallback)", *planCount);
         }
+        pthread_mutex_unlock(&planListMutex);
         return;
     }
     
+    // ION-specific part: querying ION to obtain the list of plans
+
     // Start a transaction
     if (sdr_begin_xn(sdr) < 0) {
         dtnex_log("Error: can't begin SDR transaction");
+        pthread_mutex_unlock(&planListMutex);
         return;
     }
     
     // Get the BP constants
-    bpConstants = getBpConstants();
+    bpConstants = getBpConstants(); // pointer to the database object living in the SDR
     if (bpConstants == NULL) {
         dtnex_log("Error: can't get BP constants");
         sdr_exit_xn(sdr);
+        pthread_mutex_unlock(&planListMutex);
         return;
     }
     
     // Get the list of plans and iterate through it with safe access
+
+    /**
+     * bpConstants->plans is an SDR-managed list of plans, not a C list, so it
+     * must be iterated through the appropriate API.
+     */
+
     Object planElt = 0;
     for (planElt = sdr_list_first(sdr, bpConstants->plans); 
          planElt && planElt != 0; 
          planElt = sdr_list_next(sdr, planElt)) {
         
         // Get the plan data with careful error checking
-        Object planData = sdr_list_data(sdr, planElt);
+        Object planData = sdr_list_data(sdr, planElt); // an offset relative to the base of shared memory, not an actual pointer
         if (planData == 0) {
             dtnex_log("Warning: Null plan data, skipping");
             continue;
         }
         
         // Get the plan object - cast to BpPlan* with proper error checking
-        BpPlan *plan = (BpPlan*) sdr_pointer(sdr, planData);
+        BpPlan *plan = (BpPlan*) sdr_pointer(sdr, planData); // turns the Object into a readable, dereferenceable pointer into shared memory - not a copy
         if (plan == NULL) {
             dtnex_log("Warning: Null plan pointer, skipping");
             continue;
         }
-        
+        dtnex_dbg("[getplanlist] BpPlan raw read: neighborNodeNbr=%lu planData_obj=0x%lx",
+            (unsigned long)plan->neighborNodeNbr,
+            (unsigned long)planData);
+
         // Only include plans with a valid neighbor node number (CBHE-compliant)
         if (plan->neighborNodeNbr == 0) {
             continue;
         }
-        
+
         // Skip our own node
-        if (plan->neighborNodeNbr == config->nodeId) {
+        if (plan->neighborNodeNbr == config->nodeId) { // prevents the node from sending plans to itself
             continue;
         }
-        
+
         // No verbose output for each plan found
-        
+
         // Add this plan to our lists (both the output and the cache)
         if (*planCount < MAX_PLANS) {
-            plans[*planCount].planId = plan->neighborNodeNbr;
+            plans[*planCount].planId = plan->neighborNodeNbr; // neighborNodeNbr is stored as planId: it is the key piece of information identifying the neighbour, and is used later to build the EID -> ipn:neighborNodeNbr.serviceNr
+            dtnex_dbg("[getplanlist] Added to plan list: index=%d planId=%lu",
+                *planCount,
+                (unsigned long)plans[*planCount].planId);
             time(&plans[*planCount].timestamp);
             
             // Also update the cache
@@ -494,7 +682,15 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     
     // End the transaction
     sdr_exit_xn(sdr);
-    
+
+    dtnex_dbg("[getplanlist] FINAL RESULT: planCount=%d nodeId=%lu",
+        *planCount,
+        (unsigned long)config->nodeId);
+    for (int _i = 0; _i < *planCount; _i++) {
+        dtnex_dbg("[getplanlist]   plan[%d] = neighborId %lu",
+            _i, (unsigned long)plans[_i].planId);
+    }
+
     // Update the cached plan count
     cachedPlanCount = *planCount;
     
@@ -505,8 +701,9 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     for (int i = 0; i < *planCount; i++) {
         dtnex_log(">%lu", plans[i].planId);
     }
-    
+
     dtnex_log("%d neighbors found in ION configuration", *planCount);
+    pthread_mutex_unlock(&planListMutex);
 }
 
 /**
@@ -521,26 +718,112 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
  * Exchange CBOR-encoded contact and metadata messages with neighbor nodes
  * Pure CBOR implementation - no string format support
  */
+
+/**
+ * Decides whether, what and to whom information is sent, then delegates the
+ * construction and transmission of the bundle to the CBOR functions. It has
+ * three phases: the time gate, the contact send loop and the metadata send loop.
+ */
+
+/**
+ * Snapshot of the announceable contacts (§3.2).
+ *
+ * CACHE CORRECTNESS INVARIANT (§7.4): this cache is TTL-only, with no
+ * invalidation on write, and that is correct ONLY because the snapshot holds
+ * exclusively contacts whose fromNode is the local node (authority rule, §4).
+ * No write dtnex performs on ION can therefore fall inside this set. If anyone
+ * relaxes that filter, this cache silently becomes wrong.
+ *
+ * The TTL governs the responsiveness of trigger 3 in §7.1: it is the maximum
+ * delay between a change to ionrc and its discovery by the network. 60 seconds
+ * is the chosen compromise: it matches the longest wake-up period of the main
+ * loop, so it adds no ION accesses beyond the pace of the loop itself.
+ */
+#define MY_CONTACTS_CACHE_TTL 60
+
+static ContactRecord myContacts[IONC_MAX_CONTACTS];
+static int myContactCount = 0;
+static time_t myContactsUpdated = 0;
+
+static int sameContactRecord(const ContactRecord *a, const ContactRecord *b) {
+    return a->fromNode == b->fromNode
+        && a->toNode == b->toNode
+        && a->fromTime == b->fromTime
+        && a->toTime == b->toTime
+        && a->xmitRate == b->xmitRate
+        && a->confidence == b->confidence
+        && a->owlt == b->owlt;
+}
+
+/**
+ * Refreshes the snapshot if the TTL has expired. Writes 1 into *changed if the
+ * new snapshot differs from the previous one, 0 otherwise (or if it was not
+ * refreshed). Returns the number of contacts in the snapshot, or -1 on an ION
+ * access error (in which case the previous snapshot stays valid).
+ *
+ * Single-threaded (§7.5): only the main loop calls this function.
+ */
+static int refreshMyContacts(DtnexConfig *config, int *changed) {
+    ContactRecord fresh[IONC_MAX_CONTACTS];
+    time_t now = time(NULL);
+    int freshCount;
+    int i;
+
+    *changed = 0;
+
+    if (myContactsUpdated > 0 && (now - myContactsUpdated) < MY_CONTACTS_CACHE_TTL) {
+        return myContactCount;
+    }
+
+    freshCount = ionc_get_own_contacts(config->nodeId, fresh, IONC_MAX_CONTACTS,
+            config->debugMode);
+    if (freshCount < 0) {
+        debug_log(config, "⚠️ Could not re-read the announceable contacts from ION");
+        return -1;
+    }
+
+    if (freshCount != myContactCount) {
+        *changed = 1;
+    } else {
+        for (i = 0; i < freshCount; i++) {
+            if (!sameContactRecord(&fresh[i], &myContacts[i])) {
+                *changed = 1;
+                break;
+            }
+        }
+    }
+
+    memcpy(myContacts, fresh, sizeof(ContactRecord) * freshCount);
+    myContactCount = freshCount;
+    myContactsUpdated = now;
+
+    if (*changed) {
+        dtnex_log("🔄 The snapshot of announceable contacts changed (%d contacts)",
+                myContactCount);
+    }
+
+    return myContactCount;
+}
+
 void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
     int i, j;
-    time_t currentTime, expireTime;
+    time_t currentTime;
     char destEid[MAX_EID_LENGTH];
     unsigned char cborBuffer[MAX_CBOR_BUFFER];
     int messageSize;
+
     static time_t lastExchangeTime = 0;
     static int lastPlanCount = 0;
     static unsigned long lastPlanList[MAX_PLANS];
     int planListChanged = 0;
-    
-    // Get current time
+    int contactsChanged = 0;
+
     time(&currentTime);
-    
-    // Check if we need to perform exchange (using updateInterval instead of hardcoded 1800)
-    // 1. First time (lastExchangeTime == 0)
-    // 2. Update interval has passed
-    // 3. Plan list has changed
-    
-    // Check if plan list has changed
+
+    // Trigger 3 (§7.1): refresh the snapshot and see whether it changed.
+    refreshMyContacts(config, &contactsChanged);
+
+    // Trigger 2: the neighbour list changed
     if (planCount != lastPlanCount) {
         planListChanged = 1;
     } else {
@@ -558,110 +841,107 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
             }
         }
     }
-    
-    // Determine if we should exchange now (use config updateInterval)
-    if (lastExchangeTime == 0 || (currentTime - lastExchangeTime) >= config->updateInterval || planListChanged) {
-        dtnex_log("📤 Exchanging CBOR contact information with %d neighbors...", planCount);
-        
-        // Update last exchange time
-        lastExchangeTime = currentTime;
-        
-        // Save current plan list for next comparison
-        lastPlanCount = planCount;
-        for (i = 0; i < planCount && i < MAX_PLANS; i++) {
-            lastPlanList[i] = plans[i].planId;
+
+    // Trigger 1: updateInterval has elapsed
+    if (!(lastExchangeTime == 0
+            || (currentTime - lastExchangeTime) >= config->updateInterval
+            || planListChanged
+            || contactsChanged)) {
+        int remainingTime = config->updateInterval - (int) (currentTime - lastExchangeTime);
+        debug_log(config, "Skipping neighbor exchange (next in %d seconds)", remainingTime);
+        return;
+    }
+
+    dtnex_log("📤 Announcing %d contacts to %d neighbours...", myContactCount, planCount);
+
+    lastExchangeTime = currentTime;
+    lastPlanCount = planCount;
+    for (i = 0; i < planCount && i < MAX_PLANS; i++) {
+        lastPlanList[i] = plans[i].planId;
+    }
+
+    // One message per announceable contact, to every neighbour (§5.4).
+    for (i = 0; i < planCount; i++) {
+        unsigned long neighborId = plans[i].planId;
+
+        if (neighborId == config->nodeId) {
+            continue;  // local loopback plan
         }
-        
-        // Calculate expire time
-        expireTime = currentTime + config->contactLifetime + config->contactTimeTolerance;
-        
-        // Send CBOR contact information to all neighbors
+
+        for (j = 0; j < myContactCount; j++) {
+            ContactRecord *contact = &myContacts[j];
+
+            messageSize = encodeCborContactMessage(config, contact, cborBuffer,
+                    MAX_CBOR_BUFFER);
+            if (messageSize <= 0) {
+                dtnex_log("❌ Failed to encode CBOR contact message for %lu→%lu",
+                        contact->fromNode, contact->toNode);
+                continue;
+            }
+
+            snprintf(destEid, sizeof(destEid), "ipn:%lu.%s", neighborId, config->serviceNr);
+            debug_log(config, "[exchange] %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u owlt=%u → %s (%d byte)",
+                    contact->fromNode, contact->toNode,
+                    (long) contact->fromTime, (long) contact->toTime,
+                    contact->xmitRate, contact->confidence, contact->owlt,
+                    destEid, messageSize);
+
+            sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
+            log_message_sent(config, config->nodeId, neighborId, "contact",
+                    contact->fromNode, contact->toNode, NULL);
+        }
+    }
+
+    // Send CBOR metadata to neighbors (if enabled)
+    /**
+     * If metadata exchange is enabled, the node exchanges ITS OWN metadata,
+     * taken from the configuration file, and sends it to every neighbour.
+     */
+    if (!config->noMetadataExchange && strlen(config->nodemetadata) > 0) {
+        dtnex_log("📤 Exchanging CBOR metadata with neighbors...");
+
         for (i = 0; i < planCount; i++) {
-            for (j = 0; j < planCount; j++) {
-                unsigned long targetPlan = plans[i].planId;
-                unsigned long neighborId = plans[j].planId;
-                
-                // Skip local loopback plan
-                if (neighborId == config->nodeId) {
-                    continue;
-                }
-                
-                // Create contact info structure
-                ContactInfo contact;
-                contact.nodeA = config->nodeId;
-                contact.nodeB = targetPlan;
-                contact.duration = config->contactLifetime / 60; // Convert seconds to minutes
-                
-                // Encode contact message to CBOR
-                messageSize = encodeCborContactMessage(config, &contact, cborBuffer, MAX_CBOR_BUFFER);
-                if (messageSize > 0) {
-                    sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
-                    
-                    // Send CBOR bundle
-                    sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
-                    
-                    // Log optimized sending message
-                    log_message_sent(config, config->nodeId, neighborId, "contact", 
-                                   contact.nodeA, contact.nodeB, NULL);
-                } else {
-                    dtnex_log("❌ Failed to encode CBOR contact message for %lu↔%lu", 
-                        config->nodeId, targetPlan);
-                }
+            unsigned long neighborId = plans[i].planId;
+
+            // Skip local loopback plan
+            if (neighborId == config->nodeId) {
+                continue;
+            }
+
+            // Create metadata structure
+            StructuredMetadata metadata;
+            metadata.nodeId = config->nodeId;
+            parseNodeMetadata(config->nodemetadata, &metadata);
+
+            // Add GPS coordinates if available
+            if (config->hasGpsCoordinates) {
+                metadata.latitude = (int)(config->gpsLatitude * GPS_PRECISION_FACTOR);
+                metadata.longitude = (int)(config->gpsLongitude * GPS_PRECISION_FACTOR);
+            } else {
+                metadata.latitude = 0;
+                metadata.longitude = 0;
+            }
+
+            // Encode metadata message to CBOR
+            // Writes the metadata into cborBuffer and returns the message size
+            messageSize = encodeCborMetadataMessage(config, &metadata, cborBuffer, MAX_CBOR_BUFFER);
+            if (messageSize > 0) {
+                sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
+
+                // Send CBOR bundle
+                sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
+
+                // Log optimized metadata sending message
+                log_message_sent(config, config->nodeId, neighborId, "metadata",
+                               metadata.nodeId, 0, metadata.name);
+            } else {
+                dtnex_log("❌ Failed to encode CBOR metadata message for node %lu", config->nodeId);
             }
         }
-        
-        // Send CBOR metadata to neighbors (if enabled)
-        if (!config->noMetadataExchange && strlen(config->nodemetadata) > 0) {
-            dtnex_log("📤 Exchanging CBOR metadata with neighbors...");
-            
-            for (i = 0; i < planCount; i++) {
-                unsigned long neighborId = plans[i].planId;
-                
-                // Skip local loopback plan
-                if (neighborId == config->nodeId) {
-                    continue;
-                }
-                
-                // Create metadata structure
-                StructuredMetadata metadata;
-                metadata.nodeId = config->nodeId;
-                parseNodeMetadata(config->nodemetadata, &metadata);
-                
-                // Add GPS coordinates if available
-                if (config->hasGpsCoordinates) {
-                    metadata.latitude = (int)(config->gpsLatitude * GPS_PRECISION_FACTOR);
-                    metadata.longitude = (int)(config->gpsLongitude * GPS_PRECISION_FACTOR);
-                } else {
-                    metadata.latitude = 0;
-                    metadata.longitude = 0;
-                }
-                
-                // Encode metadata message to CBOR
-                messageSize = encodeCborMetadataMessage(config, &metadata, cborBuffer, MAX_CBOR_BUFFER);
-                if (messageSize > 0) {
-                    sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
-                    
-                    // Send CBOR bundle
-                    sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
-                    
-                    // Log optimized metadata sending message
-                    log_message_sent(config, config->nodeId, neighborId, "metadata", 
-                                   metadata.nodeId, 0, metadata.name);
-                } else {
-                    dtnex_log("❌ Failed to encode CBOR metadata message for node %lu", config->nodeId);
-                }
-            }
-        } else if (config->noMetadataExchange) {
-            if (config->debugMode) {
-                dtnex_log("📤 Metadata exchange disabled in configuration");
-            }
+    } else if (config->noMetadataExchange) {
+        if (config->debugMode) {
+            dtnex_log("📤 Metadata exchange disabled in configuration");
         }
-        
-        // CBOR exchange completed - no file I/O needed
-    } else {
-        // Calculate remaining time until next exchange  
-        int remainingTime = config->updateInterval - (currentTime - lastExchangeTime);
-        dtnex_log("Skipping neighbor exchange (next in %d seconds)", remainingTime);
     }
 }
 
@@ -740,281 +1020,148 @@ void updateNodeMetadata(DtnexConfig *config, unsigned long nodeId, const char *m
  */
 
 /**
- * Signal handler for clean shutdown
- * Based on bpsink's handleQuit pattern
+ * Collection of the termination signals.
+ *
+ * This is NOT a signal handler: the three signals are blocked in every thread
+ * (pthread_sigmask in main) and this thread picks them up with sigwait(). It
+ * therefore runs in ordinary context, where logging and calling the ION API
+ * are legitimate — which they were not in an asynchronous handler: dtnex_log
+ * is printf, and neither pthread_join nor bp_close is async-signal-safe.
+ *
+ * On the first signal it lowers the running flags and wakes up whoever is
+ * parked in bp_receive. It does NOT join, does not close endpoints, does not
+ * detach and does not call exit: cleanup is performed by main when
+ * eventDrivenLoop returns, which is by construction a point outside any SDR
+ * transaction. Exiting from here while another thread is inside a transaction
+ * would leave the lock held in ION's shared memory, blocking every other
+ * client until ionunlock is run.
  */
-void signalHandler(int sig) {
-    // Re-arm signal handlers in case we receive multiple signals
-    isignal(SIGINT, signalHandler);
-    isignal(SIGTERM, signalHandler);
-    isignal(SIGTSTP, signalHandler);
-    
-    // Prevent re-entrancy (in case signal is received again during shutdown)
-    static int inShutdown = 0;
-    if (inShutdown) {
-        dtnex_log("Already in shutdown process, forcing immediate exit...");
-        exit(1);  // Force exit if shutdown takes too long
-    }
-    inShutdown = 1;
-    
-    // Provide feedback based on signal type
-    if (sig == SIGINT) {
-        dtnex_log("Received interrupt signal (Ctrl+C), shutting down gracefully...");
-    } else if (sig == SIGTERM) {
-        dtnex_log("Received termination signal, shutting down gracefully...");
-    } else if (sig == SIGTSTP) {
-        dtnex_log("Received suspend signal (Ctrl+Z), shutting down gracefully instead of suspending...");
-    } else {
-        dtnex_log("Received signal %d, shutting down gracefully...", sig);
-    }
-    
-    // Set global flag to stop the main loop
-    running = 0;
-    
-    // Only perform ION cleanup if we're actually connected to ION
-    if (ionConnected && sap != NULL) {
-        // Interrupt any pending receives if we have an open endpoint
-        dtnex_log("Interrupting BP endpoint");
-        bp_interrupt(sap);
-        
-        // Stop bundle reception service
-        stopBundleReception(&bundleReceptionState);
-        
-        // Stop bpecho service
-        bpechoState.running = 0;
-        if (bpechoState.sap != NULL) {
-            bp_interrupt(bpechoState.sap);
-            ionPauseAttendant(&bpechoState.attendant);
-            
-            // Wait for bpecho thread to terminate before closing its resources
-            dtnex_log("Waiting for bpecho service to terminate...");
-            pthread_join(bpechoThread, NULL);
+static void *signalWaitThread(void *arg)
+{
+    sigset_t waitSet;
+    int      sig;
+    int      signalCount = 0;
+
+    (void) arg;
+
+    sigemptyset(&waitSet);
+    sigaddset(&waitSet, SIGINT);
+    sigaddset(&waitSet, SIGTERM);
+    sigaddset(&waitSet, SIGTSTP);
+
+    while (1) {
+        if (sigwait(&waitSet, &sig) != 0) {
+            continue;
         }
-        
-        // Force cleanup and exit for all signals since main loop might be blocked
-        dtnex_log("Performing cleanup and immediate exit...");
-        
-        // Close endpoints directly
-        dtnex_log("🔌 Closing BP endpoint");
-        bp_close(sap);
-        sap = NULL;
-        
-        // Close bpecho endpoint if it exists (should be closed by thread, but double-check)
-        if (bpechoState.sap != NULL) {
-            bp_close(bpechoState.sap);
-            bpechoState.sap = NULL;
+
+        signalCount++;
+
+        if (signalCount > 1) {
+            dtnex_log("⚠️  Forced exit requested: if a thread is inside an SDR "
+                    "transaction, ION's lock will stay held and will block the "
+                    "other clients. In that case release it with: ionunlock ion");
+            _exit(1);
         }
-        
-        // Detach from BP
-        dtnex_log("🧹 Detaching from ION BP system");
-        bp_detach();
-    } else {
-        dtnex_log("Performing cleanup without ION detachment (not connected)...");
-        // Reset states even if not connected to ION
+
+        if (sig == SIGINT) {
+            dtnex_log("Received SIGINT (Ctrl+C), shutting down...");
+        } else if (sig == SIGTERM) {
+            dtnex_log("Received SIGTERM, shutting down...");
+        } else {
+            dtnex_log("Received SIGTSTP (Ctrl+Z), shutting down instead of "
+                    "suspending...");
+        }
+
+        /* Request shutdown: the main loop checks running between iterations
+         * and sleeps in one-second slices, so it reacts within a second
+         * (dtnex.c, eventDrivenLoop). */
+        running = 0;
         bpechoState.running = 0;
         bundleReceptionState.running = 0;
+
+        /* Wake-ups: without these the service threads would stay parked in the
+         * blocking bp_receive and the join would never return. They are
+         * conditional, because a signal can arrive with ION unreachable. */
+        if (ionConnected) {
+            if (sap != NULL) {
+                bp_interrupt(sap);
+            }
+
+            if (bpechoState.sap != NULL) {
+                bp_interrupt(bpechoState.sap);
+                ionPauseAttendant(&bpechoState.attendant);
+            }
+        }
     }
-    
-    dtnex_log("DTNEXC shutdown complete");
-    exit(0);
+
+    return NULL;
 }
 
 /**
- * Display the current contact graph by accessing ION's contact plan directly
- * Based EXACTLY on the ionadmin's listContacts function but with prettier formatting
+ * A thin wrapper around the ion_contacts module: prints the diagnostic table,
+ * explicitly checks that ION is alive and consistent (§6.6), then produces the
+ * snapshot of announceable contacts and the graph.
  */
 void getContacts(DtnexConfig *config) {
-    Sdr sdr;
-    IonVdb *ionvdb;
-    PsmPartition ionwm;
-    PsmAddress elt;    // For traversing the red-black tree
-    PsmAddress addr;
-    time_t currentTime;
-    IonCXref *contact;
-    int contactCount = 0;
-    
-    // Only show detailed table in debug mode
-    if (config->debugMode) {
-        // Header for contact plan table
-        dtnex_log("\033[36m%-12s %-12s %-20s %-20s %-15s %-12s\033[0m",
-                "FROM NODE", "TO NODE", "START TIME", "END TIME", "DURATION", "STATUS");
-        dtnex_log("\033[36m-----------------------------------------------------------------------\033[0m");
-    }
-    
-    // Get the SDR database
-    sdr = getIonsdr();
-    if (sdr == NULL) {
-        dtnex_log("⚠️  Cannot access ION SDR - ION may have been restarted");
-        dtnex_log("🔄 Attempting to reinitialize ION connection...");
-        
-        // Close current SAP if it exists
+    int contactCount;
+    int alive;
+
+    contactCount = ionc_print_contact_table(config->debugMode);
+
+    if (contactCount < 0) {
+        // ION unreachable: this may be a restart or a disconnection.
+        dtnex_log("⚠️  Cannot access ION contact database - ION may have been restarted");
+
         if (sap != NULL) {
             bp_close(sap);
             sap = NULL;
         }
-        
-        // Mark as disconnected
         ionConnected = 0;
-        
-        // ION restart detected - completely restart DTNEX
         restartDtnex(config);
-        return;
-    }
-    
-    // Get current time
-    time(&currentTime);
-    
-    // Start transaction for memory safety
-    if (sdr_begin_xn(sdr) < 0) {
-        dtnex_log("⚠️  Cannot start SDR transaction - ION may have been restarted");
-        dtnex_log("🔄 Attempting to reinitialize ION connection...");
-        
-        // Close current SAP if it exists
-        if (sap != NULL) {
-            bp_close(sap);
-            sap = NULL;
-        }
-        
-        // Mark as disconnected
-        ionConnected = 0;
-        
-        // ION restart detected - completely restart DTNEX
-        restartDtnex(config);
-        return;
-    }
-    
-    // Get ion volatile database
-    ionvdb = getIonVdb();
-    if (ionvdb == NULL) {
-        dtnex_log("⚠️  Cannot access ION volatile database - ION may have been restarted");
-        sdr_exit_xn(sdr);
-        
-        // Close current SAP if it exists
-        if (sap != NULL) {
-            bp_close(sap);
-            sap = NULL;
-        }
-        
-        // Mark as disconnected
-        ionConnected = 0;
-        
-        // ION restart detected - completely restart DTNEX
-        restartDtnex(config);
-        return;
-    }
-    
-    // Get the working memory
-    ionwm = getIonwm();
-    if (ionwm == NULL) {
-        dtnex_log("⚠️  Cannot access ION working memory - ION may have been restarted");
-        sdr_exit_xn(sdr);
-        
-        // Close current SAP if it exists
-        if (sap != NULL) {
-            bp_close(sap);
-            sap = NULL;
-        }
-        
-        // Mark as disconnected
-        ionConnected = 0;
-        
-        // ION restart detected - completely restart DTNEX
-        restartDtnex(config);
-        return;
-    }
-    
-    // Check if contact index is initialized
-    if (ionvdb->contactIndex == 0) {
-        dtnex_log("Contact index not initialized");
-        sdr_exit_xn(sdr);
         return;
     }
 
-    /* 
-     * This is the EXACT pattern from ionadmin.c for traversing contacts
-     * using the red-black tree in ION's contact database.
-     */
-    for (elt = sm_rbt_first(ionwm, ionvdb->contactIndex); 
-         elt; 
-         elt = sm_rbt_next(ionwm, elt)) {
-        addr = sm_rbt_data(ionwm, elt);
-        if (addr == 0) {
-            continue;  // Skip invalid addresses
+    // Explicit restart detection (§6.6): "zero contacts" is NOT a hint of a
+    // restart, a freshly started node legitimately has zero.
+    alive = ionc_check_alive(config->nodeId);
+    if (alive != 1) {
+        dtnex_log("⚠️  ION restart detected (ownNodeNbr is no longer %lu)", config->nodeId);
+
+        if (sap != NULL) {
+            bp_close(sap);
+            sap = NULL;
         }
-        
-        contact = (IonCXref *) psp(ionwm, addr);
-        if (contact == NULL) {
-            continue;  // Skip NULL contacts
-        }
-        
-        // Calculate time remaining and format duration in a readable way
-        time_t timediff = contact->toTime - currentTime;
-        char durationStr[20];
-        
-        // Format duration based on size for better readability
-        if (timediff > 86400) { // More than a day
-            snprintf(durationStr, sizeof(durationStr), "%.1f days", timediff / 86400.0);
-        } else if (timediff > 3600) { // More than an hour
-            snprintf(durationStr, sizeof(durationStr), "%.1f hours", timediff / 3600.0);
-        } else if (timediff > 60) { // More than a minute
-            snprintf(durationStr, sizeof(durationStr), "%.1f minutes", timediff / 60.0);
-        } else {
-            snprintf(durationStr, sizeof(durationStr), "%ld seconds", timediff);
-        }
-        
-        // Convert UNIX timestamps to human readable format
-        char startTimeStr[25], endTimeStr[25];
-        struct tm *timeinfo;
-        
-        timeinfo = localtime(&contact->fromTime);
-        strftime(startTimeStr, sizeof(startTimeStr), "%Y-%m-%d %H:%M:%S", timeinfo);
-        
-        timeinfo = localtime(&contact->toTime);
-        strftime(endTimeStr, sizeof(endTimeStr), "%Y-%m-%d %H:%M:%S", timeinfo);
-        
-        // Determine if contact is active now
-        const char* status = (contact->fromTime <= currentTime && currentTime <= contact->toTime) ? 
-                             "\033[32mACTIVE\033[0m" : "\033[33mFUTURE\033[0m";
-        
-        // Only show detailed contact info in debug mode
-        if (config->debugMode) {
-            // Format and output the contact information in a table row
-            dtnex_log("%-12lu %-12lu %-20s %-20s %-15s %s",
-                    (unsigned long)contact->fromNode, 
-                    (unsigned long)contact->toNode,
-                    startTimeStr,
-                    endTimeStr,
-                    durationStr,
-                    status);
-        }
-        
-        contactCount++;
-    }
-    
-    // End the transaction
-    sdr_exit_xn(sdr);
-    
-    // Check if ION might have been restarted (no contacts found)
-    if (contactCount == 0) {
-        dtnex_log("⚠️  No contacts found - ION may have been restarted");
-        // ION restart detected - completely restart DTNEX
+        ionConnected = 0;
         restartDtnex(config);
+        return;
     }
-    
-    if (config->debugMode) {
-        // Show detailed summary in debug mode
-        if (contactCount == 0) {
-            dtnex_log("No contacts found in ION database");
-        } else {
-            dtnex_log("\033[36m-----------------------------------------------------------------------\033[0m");
-            dtnex_log("Total contacts: %d", contactCount);
-        }
-    } else {
-        // Show simple update in normal mode
+
+    if (!config->debugMode) {
         log_contact_update(config, contactCount);
     }
-    
-    // Generate graph after every contact printout as requested
+
+    // Snapshot of the announceable contacts: this is exactly what goes on the
+    // wire, so it is what should be compared against ionadmin's 'l contact'.
+    if (config->debugMode) {
+        ContactRecord snapshot[IONC_MAX_CONTACTS];
+        int snapshotCount = ionc_get_own_contacts(config->nodeId, snapshot,
+                IONC_MAX_CONTACTS, config->debugMode);
+
+        if (snapshotCount < 0) {
+            dtnex_log("⚠️  Could not read the snapshot of announceable contacts");
+        } else {
+            dtnex_log("\033[36mAnnounceable contacts (fromNode == %lu): %d\033[0m",
+                    config->nodeId, snapshotCount);
+            for (int s = 0; s < snapshotCount; s++) {
+                dtnex_log("  %lu→%lu  from=%ld to=%ld  xmitRate=%lu B/s  conf=%u%%  owlt=%us",
+                        snapshot[s].fromNode, snapshot[s].toNode,
+                        (long) snapshot[s].fromTime, (long) snapshot[s].toTime,
+                        snapshot[s].xmitRate, snapshot[s].confidence,
+                        snapshot[s].owlt);
+            }
+        }
+    }
+
     if (config->createGraph) {
         createGraph(config);
     }
@@ -1038,7 +1185,21 @@ void createGraph(DtnexConfig *config) {
     char graphvizFile[256];
     strncpy(graphvizFile, config->graphFile, sizeof(graphvizFile) - 1);
     graphvizFile[sizeof(graphvizFile) - 1] = '\0';
-    
+
+    /* The rendered image must not overwrite the GraphViz source: the hint
+     * below used to name the same file as both input and output, so anyone
+     * pasting it destroyed the very file dot was reading. Derive a distinct
+     * name by dropping a trailing .gv, when present, and appending .png. */
+    char imageFile[300];
+    size_t graphvizFileLen = strlen(graphvizFile);
+    if (graphvizFileLen > 3
+            && strcmp(graphvizFile + graphvizFileLen - 3, ".gv") == 0) {
+        snprintf(imageFile, sizeof(imageFile), "%.*s.png",
+                (int) (graphvizFileLen - 3), graphvizFile);
+    } else {
+        snprintf(imageFile, sizeof(imageFile), "%s.png", graphvizFile);
+    }
+
     graphFile = fopen(graphvizFile, "w");
     if (!graphFile) {
         dtnex_log("Failed to open graph file for writing: %s", graphvizFile);
@@ -1048,7 +1209,7 @@ void createGraph(DtnexConfig *config) {
     // Write the comment header with instructions
     fprintf(graphFile, "// DTN Contact Graph generated by DTNEXC\n");
     fprintf(graphFile, "// To generate an image from this file, run:\n");
-    fprintf(graphFile, "// dot -Tpng %s -o %s\n", graphvizFile, config->graphFile);
+    fprintf(graphFile, "// dot -Tpng %s -o %s\n", graphvizFile, imageFile);
     fprintf(graphFile, "// You can also use other formats like: -Tsvg, -Tpdf, -Tjpg\n\n");
     
     // Write the graph header (bash-compatible format)
@@ -1118,6 +1279,11 @@ void createGraph(DtnexConfig *config) {
     debug_log(config, "Extracting contacts using ionadmin command...");
     
     FILE *ionadmin_pipe = popen("echo 'l contact' | ionadmin 2>/dev/null | grep -o -P '(?<=From).*?(?=is)'", "r");
+    /** How the contacts used to draw the edges between nodes are obtained:
+     * send 'l contact' to ionadmin's stdin,
+     * capture the output,
+     * filter it with grep to keep only the lines holding the contacts.
+     */
     if (ionadmin_pipe) {
         char line[1024];
         while (fgets(line, sizeof(line), ionadmin_pipe) != NULL) {
@@ -1285,8 +1451,10 @@ void *runBpechoService(void *arg) {
     int bytesToEcho = 0;
     int result;
     
-    // Don't set separate signal handler for bpecho - use main process handler
-    
+    // The bpecho thread does not touch signals: it inherited them blocked from
+    // the mask set in main. It stops through bpechoState.running plus the
+    // wake-up from bp_interrupt, both driven by signalWaitThread.
+
     sdr = bp_get_sdr();
     dtnex_log("Starting bpecho service thread on service %s", config->bpechoServiceNr);
     
@@ -1417,6 +1585,17 @@ int initBundleReception(DtnexConfig *config, BundleReceptionState *state) {
 }
 
 /**
+ *  Reception pipeline
+ * runBundleReception()          ← dedicated thread, reads bundles from ION
+    └── processCborMessage()  ← entry point, minimal validation
+            └── decodeCborMessage()   ← CBOR parsing + authentication
+                    ├── processCborContactMessage()   ← type "c"
+                    │       └── forwardCborContactMessage()
+                    └── processCborMetadataMessage()  ← type "m"
+                            └── forwardCborMetadataMessage()
+ */
+
+/**
  * Bundle reception thread - handles incoming DTNEX CBOR messages
  * Uses blocking reception pattern like bpsink
  */
@@ -1471,9 +1650,9 @@ void *runBundleReception(void *arg) {
             
             if (contentLength > 0 && contentLength < MAX_LINE_LENGTH) {
                 // Read the bundle content
-                zco_start_receiving(dlv.adu, &reader);
+                zco_start_receiving(dlv.adu, &reader); // initialises the zco reader for the bundle payload, the equivalent of an open
                 CHKZERO(sdr_begin_xn(sdr));
-                int len = zco_receive_source(sdr, &reader, contentLength, buffer);
+                int len = zco_receive_source(sdr, &reader, contentLength, buffer); // copies the payload into the buffer
                 if (sdr_end_xn(sdr) < 0 || len < 0) {
                     dtnex_log("❌ Error reading bundle content");
                     bp_release_delivery(&dlv, 1);
@@ -1481,6 +1660,7 @@ void *runBundleReception(void *arg) {
                 }
                 
                 // Build source info string
+                // Source info is unused for now, but may be useful for future logging and debugging
                 char sourceInfo[128];
                 if (dlv.bundleSourceEid && strlen(dlv.bundleSourceEid) > 0) {
                     snprintf(sourceInfo, sizeof(sourceInfo), "%s", dlv.bundleSourceEid);
@@ -1493,6 +1673,7 @@ void *runBundleReception(void *arg) {
                 // Bundle received - will be logged in message processing
                 
                 // Process the CBOR message
+                // The bundle payload is now in buffer with length contentLength -> it gets processed
                 processCborMessage(config, (unsigned char*)buffer, contentLength);
             } else {
                 dtnex_log("⚠️ Bundle content invalid size (%d bytes), skipping", contentLength);
@@ -1525,29 +1706,34 @@ void stopBundleReception(BundleReceptionState *state) {
  */
 int main(int argc, char **argv) {
     DtnexConfig config;
-    
+
+    /* The termination signals must be blocked BEFORE any thread is born —
+     * including those ION may create inside bp_attach — because the mask is
+     * inherited at creation time. From here on no thread receives them
+     * asynchronously: signalWaitThread collects them with sigwait. */
+    sigset_t terminationSignals;
+
+    sigemptyset(&terminationSignals);
+    sigaddset(&terminationSignals, SIGINT);
+    sigaddset(&terminationSignals, SIGTERM);
+    sigaddset(&terminationSignals, SIGTSTP);
+
+    if (pthread_sigmask(SIG_BLOCK, &terminationSignals, NULL) != 0) {
+        dtnex_log("❌ Cannot block the termination signals: "
+                "shutdown would not be safe for ION, exiting");
+        return 1;
+    }
+
+    if (pthread_create(&signalThread, NULL, signalWaitThread, NULL) != 0) {
+        dtnex_log("❌ Cannot create the signal thread: "
+                "shutdown would not be safe for ION, exiting");
+        return 1;
+    }
+
     // Store original arguments for potential restart
     original_argc = argc;
     original_argv = argv;
-    
-    // Set up signal handlers for clean shutdown with signal masking
-    struct sigaction sa;
-    sigset_t mask;
-    
-    // Block signals during handler execution
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGINT);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGTSTP);
-    
-    sa.sa_handler = signalHandler;
-    sa.sa_mask = mask;
-    sa.sa_flags = SA_RESTART; // Restart interrupted system calls
-    
-    sigaction(SIGINT, &sa, NULL);   // Ctrl+C
-    sigaction(SIGTERM, &sa, NULL);  // kill
-    sigaction(SIGTSTP, &sa, NULL);  // Ctrl+Z
-    
+
     // Load configuration
     loadConfig(&config);
     
@@ -1569,6 +1755,7 @@ int main(int argc, char **argv) {
                 bp_close(bpechoState.sap);
                 ionStopAttendant(&bpechoState.attendant);
             } else {
+                bpechoThreadStarted = 1;
                 dtnex_log("✅ Bpecho service thread started");
             }
         }
@@ -1587,6 +1774,7 @@ int main(int argc, char **argv) {
                 dtnex_log("❌ Failed to create bundle reception thread");
                 return 1;
             } else {
+                bundleReceptionThreadStarted = 1;
                 dtnex_log("✅ Bundle reception thread started");
             }
         }
@@ -1601,7 +1789,17 @@ int main(int argc, char **argv) {
     int planCount = 0;
     
     dtnex_log("🚀 Performing startup contact broadcast to all neighbors...");
+    dtnex_dbg("[main] About to call getplanlist for startup contact broadcast to all neighbors");
     getplanlist(&config, plans, &planCount);
+    dtnex_dbg("[main] getplanlist returned planCount=%d", planCount);
+    for (int _i = 0; _i < planCount; _i++) {
+        char _ts_str[32] = "N/A";
+        if (plans[_i].timestamp > 0) {
+            struct tm *_tm = gmtime(&plans[_i].timestamp);
+            strftime(_ts_str, sizeof(_ts_str), "%Y-%m-%dT%H:%M:%SZ", _tm);
+        }
+        dtnex_dbg("[main] plans[%d]: planId=%lu timestamp=%s", _i, plans[_i].planId, _ts_str);
+    }
     if (planCount > 0) {
         exchangeWithNeighbors(&config, plans, planCount);
         dtnex_log("✅ Startup contact broadcast completed to %d neighbors", planCount);
@@ -1615,17 +1813,19 @@ int main(int argc, char **argv) {
     // Clean up
     dtnex_log("Shutting down...");
     
-    // Wait for bundle reception thread to terminate if it's running
-    if (bundleReceptionState.running) {
+    // Wait for bundle reception thread to terminate if it was ever started
+    if (bundleReceptionThreadStarted) {
         dtnex_log("Waiting for bundle reception thread to terminate...");
         stopBundleReception(&bundleReceptionState);
         pthread_join(bundleReceptionState.thread, NULL);
+        bundleReceptionThreadStarted = 0;
     }
-    
-    // Wait for bpecho thread to terminate if it's running
-    if (bpechoState.running) {
+
+    // Wait for bpecho thread to terminate if it was ever started
+    if (bpechoThreadStarted) {
         dtnex_log("Waiting for bpecho service to terminate...");
         pthread_join(bpechoThread, NULL);
+        bpechoThreadStarted = 0;
     }
     
     // Close the BP endpoint gracefully if we have one
@@ -1771,54 +1971,64 @@ void addNonceToCache(unsigned char *nonce, unsigned long origin) {
 
 /**
  * Encode CBOR contact message
- * Format: [version, type, timestamp, expireTime, origin, from, nonce, [nodeA, nodeB, duration, datarate, reliability], hmac]
+ * Format v3 (§5.2): [version, type, timestamp, expireTime, origin, from, nonce,
+ *                     [fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt], hmac]
  */
-int encodeCborContactMessage(DtnexConfig *config, ContactInfo *contact, unsigned char *buffer, int bufferSize) {
+int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsigned char *buffer, int bufferSize) {
     unsigned char *cursor = buffer;
     unsigned char nonce[DTNEX_NONCE_SIZE];
     int bytesWritten = 0;
-    
+
+    (void) bufferSize;  // the v3 payload is ~67 bytes, MAX_CBOR_BUFFER is 128
+
     // Generate nonce
     generateNonce(nonce);
-    
+
     time_t currentTime = time(NULL);
-    time_t expireTime = currentTime + config->contactLifetime;
-    
+
+    // §7.2: the message is useful exactly as long as the contact it describes
+    // is valid, so expireTime IS the contact's toTime.
+    time_t expireTime = contact->toTime;
+
     // Encode main array with 9 elements [version, type, ts, exp, orig, from, nonce, data, hmac]
     bytesWritten += cbor_encode_array_open(9, &cursor);
-    
+
     // 1. Version
     bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-    
+
     // 2. Message type "c"
     bytesWritten += cbor_encode_text_string("c", 1, &cursor);
-    
-    // 3. Timestamp
+
+    // 3. Timestamp (instant of sending; it no longer affects the window)
     bytesWritten += cbor_encode_integer(currentTime, &cursor);
-    
+
     // 4. Expire time
     bytesWritten += cbor_encode_integer(expireTime, &cursor);
-    
+
     // 5. Origin node
     bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-    
+
     // 6. From node (same as origin for originating messages)
     bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-    
+
     // 7. Nonce
     bytesWritten += cbor_encode_byte_string(nonce, DTNEX_NONCE_SIZE, &cursor);
-    
-    // 8. Contact data array - ultra-minimal format (3 elements: nodeA, nodeB, duration)
-    bytesWritten += cbor_encode_array_open(3, &cursor);
-    bytesWritten += cbor_encode_integer(contact->nodeA, &cursor);
-    bytesWritten += cbor_encode_integer(contact->nodeB, &cursor);  
-    bytesWritten += cbor_encode_integer(contact->duration, &cursor);
-    
+
+    // 8. Contact data array v3 (§5.2): 7 fields, absolute times
+    bytesWritten += cbor_encode_array_open(7, &cursor);
+    bytesWritten += cbor_encode_integer(contact->fromNode, &cursor);
+    bytesWritten += cbor_encode_integer(contact->toNode, &cursor);
+    bytesWritten += cbor_encode_integer((uvast) contact->fromTime, &cursor);
+    bytesWritten += cbor_encode_integer((uvast) contact->toTime, &cursor);
+    bytesWritten += cbor_encode_integer(contact->xmitRate, &cursor);
+    bytesWritten += cbor_encode_integer(contact->confidence, &cursor);
+    bytesWritten += cbor_encode_integer(contact->owlt, &cursor);
+
     // 9. Calculate HMAC over everything except the HMAC field itself
     unsigned char hmac[DTNEX_HMAC_SIZE];
     calculateHmac(buffer, bytesWritten, config->presSharedNetworkKey, hmac);
     bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
-    
+
     debug_log(config, "[CBOR] Encoded contact message: %d bytes", bytesWritten);
     return bytesWritten;
 }
@@ -1985,7 +2195,7 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Allocate memory for the CBOR data
-    extent = sdr_malloc(sdr, dataSize);
+    extent = sdr_malloc(sdr, dataSize); // alloca spazio nell'sdr
     if (!extent) {
         dtnex_log("Failed to allocate memory for CBOR data");
         sdr_cancel_xn(sdr);
@@ -2002,6 +2212,7 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Create ZCO from the extent
+    // Now create a ZeroCopyObject bundle directly from the data held in SDR
     bundleZco = ionCreateZco(ZcoSdrSource, extent, 0, dataSize, 
                             BP_STD_PRIORITY, 0, ZcoOutbound, NULL);
     
@@ -2011,6 +2222,16 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Send the bundle using direct ION API - no source EID for CBOR messages
+    dtnex_dbg("[sendCborBundle] bp_send: destEid=%s dataSize=%d ttl=%d",
+        destEid, dataSize, ttl);
+    {
+        char _hexbuf[256] = {0};
+        int _hlen = dataSize < 64 ? dataSize : 64;
+        for (int _b = 0; _b < _hlen; _b++) {
+            snprintf(_hexbuf + _b * 3, 4, "%02x ", ((unsigned char*)cborData)[_b]);
+        }
+        dtnex_dbg("[sendCborBundle] CBOR payload (first %d bytes): %s", _hlen, _hexbuf);
+    }
     sendResult = bp_send(NULL, destEid, NULL, ttl, BP_STD_PRIORITY,
                         NoCustodyRequested, 0, 0, NULL, bundleZco, &newBundle);
     
@@ -2031,6 +2252,11 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
  * Event-driven main loop - sleeps until next scheduled event
  * Avoids continuous polling and reduces CPU usage
  */
+
+ /**
+  * A stateful while loop with two parallel timelines: one for the scheduled
+  * updates (updateInterval) and one for the ION connection retries.
+  */
 void eventDrivenLoop(DtnexConfig *config) {
     Plan plans[MAX_PLANS];
     int planCount = 0;
@@ -2070,6 +2296,7 @@ void eventDrivenLoop(DtnexConfig *config) {
                     dtnex_log("🚀 Initializing bpecho service after ION reconnection...");
                     if (initBpechoService(config, &bpechoState) == 0) {
                         if (pthread_create(&bpechoThread, NULL, runBpechoService, (void *)config) == 0) {
+                            bpechoThreadStarted = 1;
                             dtnex_log("✅ Bpecho service thread started");
                         } else {
                             dtnex_log("❌ Failed to create bpecho service thread");
@@ -2084,6 +2311,7 @@ void eventDrivenLoop(DtnexConfig *config) {
                     dtnex_log("🚀 Initializing bundle reception service after ION reconnection...");
                     if (initBundleReception(config, &bundleReceptionState) == 0) {
                         if (pthread_create(&bundleReceptionState.thread, NULL, runBundleReception, (void *)&bundleReceptionState) == 0) {
+                            bundleReceptionThreadStarted = 1;
                             dtnex_log("✅ Bundle reception thread started");
                         } else {
                             dtnex_log("❌ Failed to create bundle reception thread");
@@ -2159,8 +2387,12 @@ void eventDrivenLoop(DtnexConfig *config) {
         // Bundle reception is now handled by the dedicated thread
         if (!running) break;
         
-        // Update contact info to ensure we have the latest topology (only if ION connected)
+        // On every wake-up (<= 60s): re-evaluate the announcement triggers
+        // (§7.1). exchangeWithNeighbors decides on its own whether there is
+        // anything to do.
         if (ionConnected) {
+            getplanlist(config, plans, &planCount);
+            exchangeWithNeighbors(config, plans, planCount);
             getContacts(config);
         }
         
@@ -2288,7 +2520,7 @@ IonStatus checkIonStatus(DtnexConfig *config) {
  * Process received CBOR message - main entry point for CBOR message handling
  */
 void processCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize) {
-    if (!buffer || bufferSize <= 0) {
+    if (!buffer || bufferSize <= 0) { // only validates the buffer pointer and its size
         debug_log(config, "❌ Invalid CBOR buffer (null or zero size)");
         return;
     }
@@ -2306,7 +2538,7 @@ void processCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSi
     }
     
     // Decode the CBOR message
-    int result = decodeCborMessage(config, buffer, bufferSize);
+    int result = decodeCborMessage(config, buffer, bufferSize); // secondo passaggio
     if (result < 0) {
         log_message_error(config, "Failed to decode CBOR message - unknown bundle format");
         return;
@@ -2508,6 +2740,10 @@ int skipCborElement(unsigned char **cursor, unsigned int *bytesBuffered) {
 /**
  * Decode and process CBOR message format
  */
+/**
+ * The CBOR is parsed and then processed according to the message type
+ * (contact or metadata).
+ */
 int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize) {
     unsigned char *cursor = buffer;
     unsigned int bytesBuffered = bufferSize;
@@ -2607,7 +2843,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
     unsigned char *dataArrayPosition = cursor;
     
     // Variables to store extracted contact/metadata data for later processing
-    ContactInfo extractedContact = {0};
+    ContactRecord extractedContact = {0};
     StructuredMetadata extractedMetadata = {0};
     int hasExtractedData = 0;
     
@@ -2647,38 +2883,52 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
     
     // Extract data elements based on message type and then skip them for HMAC verification
     if (messageType[0] == 'c') {
-        // Contact message: extract 3 elements (nodeA, nodeB, duration)
-        debug_log(config, "🔍 Extracting 3 contact elements manually");
-        
-        // Create a cursor copy for extraction
+        // Contact message v3 (§5.2): 7 fields
+        debug_log(config, "🔍 Extracting 7 contact elements manually");
+
+        if (dataArraySize != 7) {
+            debug_log(config, "❌ Contact payload with %lu fields (7 expected)", dataArraySize);
+            return -1;
+        }
+
         unsigned char *extractCursor = cursor;
         unsigned int extractBytesBuffered = bytesBuffered;
-        
-        // Extract nodeA, nodeB, and duration using manual CBOR decoder
-        unsigned long tempNodeA, tempNodeB, tempDuration;
-        if (manualDecodeCborInteger(&tempNodeA, &extractCursor, &extractBytesBuffered) &&
-            manualDecodeCborInteger(&tempNodeB, &extractCursor, &extractBytesBuffered) &&
-            manualDecodeCborInteger(&tempDuration, &extractCursor, &extractBytesBuffered)) {
-            
-            extractedContact.nodeA = (unsigned long)tempNodeA;
-            extractedContact.nodeB = (unsigned long)tempNodeB;
-            extractedContact.duration = (unsigned short)tempDuration;
+
+        unsigned long tFromNode, tToNode, tFromTime, tToTime, tXmitRate, tConfidence, tOwlt;
+        if (manualDecodeCborInteger(&tFromNode, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tToNode, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tFromTime, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tToTime, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tXmitRate, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tConfidence, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tOwlt, &extractCursor, &extractBytesBuffered)) {
+
+            extractedContact.fromNode = tFromNode;
+            extractedContact.toNode = tToNode;
+            extractedContact.fromTime = (time_t) tFromTime;
+            extractedContact.toTime = (time_t) tToTime;
+            extractedContact.xmitRate = tXmitRate;
+            extractedContact.confidence = (unsigned int) tConfidence;
+            extractedContact.owlt = (unsigned int) tOwlt;
             hasExtractedData = 1;
-            debug_log(config, "✅ Extracted contact: %lu↔%lu (duration=%d min)", 
-                      extractedContact.nodeA, extractedContact.nodeB, extractedContact.duration);
+            debug_log(config, "✅ Extracted contact: %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u owlt=%u",
+                      extractedContact.fromNode, extractedContact.toNode,
+                      (long) extractedContact.fromTime, (long) extractedContact.toTime,
+                      extractedContact.xmitRate, extractedContact.confidence,
+                      extractedContact.owlt);
         } else {
             debug_log(config, "❌ Failed to extract contact elements");
         }
-        
+
         // Now skip the elements for HMAC verification
-        for (int i = 0; i < dataArraySize && i < 3; i++) {
+        for (int i = 0; i < dataArraySize && i < 7; i++) {
             if (!skipCborElement(&cursor, &bytesBuffered)) {
                 debug_log(config, "❌ Failed to skip contact element %d", i);
                 return -1;
             }
         }
         debug_log(config, "✅ Successfully skipped contact elements for HMAC");
-        
+
     } else if (messageType[0] == 'm') {
         // Metadata message: extract elements and then skip them
         debug_log(config, "🔍 Extracting %lu metadata elements manually", dataArraySize);
@@ -2921,9 +3171,10 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
             return -1;
         }
         
-        debug_log(config, "🔍 Processing extracted contact data: %lu↔%lu (duration=%d)", 
-                  extractedContact.nodeA, extractedContact.nodeB, extractedContact.duration);
-        
+        debug_log(config, "🔍 Processing extracted contact data: %lu→%lu (from=%ld to=%ld)",
+                  extractedContact.fromNode, extractedContact.toNode,
+                  (long) extractedContact.fromTime, (long) extractedContact.toTime);
+
         return processCborContactMessage(config, nonce, timestamp, expireTime, origin, from, &extractedContact);
     } else if (messageType[0] == 'm') {
         // Use pre-extracted metadata instead of re-decoding
@@ -2945,121 +3196,149 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
 /**
  * Process CBOR contact message
  */
-int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime, 
-                             unsigned long origin, unsigned long from, ContactInfo *contact) {
-    log_message_received(config, origin, from, "contact", contact->nodeA, contact->nodeB, NULL);
-    
-    // Skip processing our own messages
+
+/* Beyond this distance into the future, a window looks like clock skew rather
+ * than a legitimate one: it is discarded, and said so (§7.6). */
+#define CLOCK_SKEW_FUTURE_LIMIT (30 * 24 * 3600)
+
+int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
+                             unsigned long origin, unsigned long from, ContactRecord *contact) {
+    time_t currentTime = time(NULL);
+    IoncApplyOutcome outcome;
+
+    log_message_received(config, origin, from, "contact",
+            contact->fromNode, contact->toNode, NULL);
+
+    /* Validation pipeline (§6.1). Checks 1-3 (version, HMAC, nonce) have
+     * already been performed in decodeCborMessage. Every failure discards the
+     * message without inserting and without forwarding, and returns 0: this is
+     * not a decoding error (the message decoded perfectly), it is a policy
+     * rejection, already logged below with its reason. A -1 would travel back
+     * up to decodeCborMessage and be printed as "Failed to decode CBOR
+     * message", which is misleading diagnostics for a legitimate discard. */
+
+    // 4. We do not process our own messages
     if (origin == config->nodeId) {
         debug_log(config, "⏭️ Skipping own contact message");
         return 0;
     }
-    
-    // Create contact in ION
-    char contactCmd[256];
-    time_t startTime = timestamp;
-    time_t endTime = startTime + (contact->duration * 60);  // Convert minutes to seconds
-    
-    // Format times for ION contact command
-    struct tm *startTm = gmtime(&startTime);
-    struct tm *endTm = gmtime(&endTime);
-    
-    snprintf(contactCmd, sizeof(contactCmd),
-        "a contact +%04d/%02d/%02d-%02d:%02d:%02d +%04d/%02d/%02d-%02d:%02d:%02d %lu %lu 100000",
-        startTm->tm_year + 1900, startTm->tm_mon + 1, startTm->tm_mday,
-        startTm->tm_hour, startTm->tm_min, startTm->tm_sec,
-        endTm->tm_year + 1900, endTm->tm_mon + 1, endTm->tm_mday,
-        endTm->tm_hour, endTm->tm_min, endTm->tm_sec,
-        contact->nodeA, contact->nodeB);
-    
-    debug_log(config, "🔗 Adding contact: %s", contactCmd);
-    
-    // Add contact directly using ION's internal API instead of system call
-    PsmAddress cxaddr = 0;
-    uint32_t regionNbr = 1;  // Default region number (same as _regionNbr(NULL) in ionadmin)
-    size_t xmitRate = 100000; // Default transmission rate
-    float confidence = 1.0;   // Default confidence
-    int announce = 0;         // Don't announce to region
-    
-    // Remove ALL existing contacts for this node pair first (using NULL scope like ionadmin '*')
-    // This prevents overlapping time issues by clearing all previous contacts
-    int removeResult1 = rfx_remove_contact(regionNbr, NULL, 
-                                          (uvast)contact->nodeA, (uvast)contact->nodeB, announce);
-    int removeResult2 = rfx_remove_contact(regionNbr, NULL,
-                                          (uvast)contact->nodeB, (uvast)contact->nodeA, announce);
-    
-    debug_log(config, "🗑️ All contacts removal results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d", 
-              contact->nodeA, contact->nodeB,
-              contact->nodeA, contact->nodeB, removeResult1,
-              contact->nodeB, contact->nodeA, removeResult2);
-    
-    // Always use current time as start to avoid any remaining overlap issues
-    time_t currentTime = time(NULL);
-    debug_log(config, "⏰ Using current time %ld as start time for new contact", currentTime);
-    startTime = currentTime;
-    endTime = currentTime + (contact->duration * 60);  // Recalculate end time
-    
-    // Add bidirectional contacts as per user requirement (A->B and B->A)
-    PsmAddress cxaddr2 = 0;
-    int result1 = rfx_insert_contact(regionNbr, startTime, endTime, 
-                                     (uvast)contact->nodeA, (uvast)contact->nodeB, 
-                                     xmitRate, confidence, &cxaddr, announce);
-    
-    int result2 = rfx_insert_contact(regionNbr, startTime, endTime, 
-                                     (uvast)contact->nodeB, (uvast)contact->nodeA, 
-                                     xmitRate, confidence, &cxaddr2, announce);
-    
-    // Log contact results
-    if (result1 == 0 && result2 == 0) {
-        dtnex_log("✅ Bidirectional contacts %lu↔%lu added successfully", contact->nodeA, contact->nodeB);
-    } else {
-        debug_log(config, "ℹ️ Contact results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d", 
-                 contact->nodeA, contact->nodeB,
-                 contact->nodeA, contact->nodeB, result1,
-                 contact->nodeB, contact->nodeA, result2);
+
+    // 5. Only the source announces its own direction (§4)
+    if (contact->fromNode != origin) {
+        debug_log(config, "❌ Discarded: fromNode=%lu != origin=%lu",
+                contact->fromNode, origin);
+        return 0;
     }
-    
-    // Always add bidirectional ranges regardless of contact results
-    // Range distance of 1 second OWLT (One-Way Light Time)
-    PsmAddress rxaddr1 = 0, rxaddr2 = 0;
-    unsigned int owlt = 1;  // 1 second range distance
-    int announceRange = 0;  // Don't announce to region
-    
-    // Remove ALL existing ranges for this node pair first (using NULL scope like ionadmin '*')
-    // This prevents overlapping time issues by clearing all previous ranges
-    int rangeRemoveResult1 = rfx_remove_range(NULL,
-                                             (uvast)contact->nodeA, (uvast)contact->nodeB, announceRange);
-    int rangeRemoveResult2 = rfx_remove_range(NULL,
-                                             (uvast)contact->nodeB, (uvast)contact->nodeA, announceRange);
-    
-    debug_log(config, "🗑️ All ranges removal results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d", 
-              contact->nodeA, contact->nodeB,
-              contact->nodeA, contact->nodeB, rangeRemoveResult1,
-              contact->nodeB, contact->nodeA, rangeRemoveResult2);
-    
-    // Add range A->B
-    int rangeResult1 = rfx_insert_range(startTime, endTime, 
-                                        (uvast)contact->nodeA, (uvast)contact->nodeB, 
-                                        owlt, &rxaddr1, announceRange);
-    
-    // Add range B->A  
-    int rangeResult2 = rfx_insert_range(startTime, endTime, 
-                                        (uvast)contact->nodeB, (uvast)contact->nodeA, 
-                                        owlt, &rxaddr2, announceRange);
-    
-    // Log range results
-    if (rangeResult1 == 0 && rangeResult2 == 0) {
-        debug_log(config, "✅ Bidirectional ranges %lu↔%lu added successfully", contact->nodeA, contact->nodeB);
-    } else {
-        debug_log(config, "ℹ️ Range results %lu↔%lu: %lu→%lu=%d, %lu→%lu=%d", 
-                 contact->nodeA, contact->nodeB,
-                 contact->nodeA, contact->nodeB, rangeResult1,
-                 contact->nodeB, contact->nodeA, rangeResult2);
+
+    // 5b. A contact towards oneself is not topology: in ION that is the
+    // semantics of registration contacts. ionc_get_own_contacts filters it out
+    // at origination, but a peer holding the HMAC key could still inject one,
+    // so the filter is needed on reception too.
+    if (contact->fromNode == contact->toNode) {
+        debug_log(config, "❌ Discarded: fromNode == toNode (%lu): registration "
+                "contact, not topology", contact->fromNode);
+        return 0;
     }
-    
-    // Forward CBOR contact message to all neighbors (except origin and sender)
+
+    // 6. toTime = 0 in ION means "discovered contact" -> MAX_POSIX_TIME
+    if (contact->toTime == 0) {
+        debug_log(config, "❌ Discarded: toTime = 0 (permanent-contact semantics)");
+        return 0;
+    }
+
+    // 7. Window integrity
+    if (contact->fromTime >= contact->toTime) {
+        debug_log(config, "❌ Discarded: fromTime=%ld >= toTime=%ld",
+                (long) contact->fromTime, (long) contact->toTime);
+        return 0;
+    }
+
+    // 7b. fromTime <= 0 carries ION's "hypothetical contact" semantics
+    // (rfx_insert_contact takes the CHKZERO branch on ownNodeNbr and can
+    // return 0 without having written anything: a false success).
+    if (contact->fromTime <= 0) {
+        debug_log(config, "❌ Discarded: invalid fromTime: hypothetical-contact "
+                "semantics in ION (fromTime=%ld)", (long) contact->fromTime);
+        return 0;
+    }
+
+    // 7c. fromTime == MAX_POSIX_TIME is what triggers registration contacts in
+    // ION, not a real network window.
+    if (contact->fromTime >= MAX_POSIX_TIME) {
+        debug_log(config, "❌ Discarded: fromTime = MAX_POSIX_TIME: "
+                "registration-contact semantics");
+        return 0;
+    }
+
+    // 7d. xmitRate == 0 would be refused by ION itself (rfx_insert_contact
+    // returns 5).
+    if (contact->xmitRate == 0) {
+        debug_log(config, "❌ Discarded: zero xmitRate: ION would refuse the contact");
+        return 0;
+    }
+
+    // 7e. Out-of-range confidence: ION returns 4 for confidence > 1.0.
+    if (contact->confidence > 100) {
+        debug_log(config, "❌ Discarded: confidence outside the 0-100 range (%u)",
+                contact->confidence);
+        return 0;
+    }
+
+    // 8. Window already expired
+    if (contact->toTime <= currentTime) {
+        debug_log(config, "❌ Discarded: window entirely in the past "
+                "(toTime=%ld, now=%ld) — possible clock skew between nodes",
+                (long) contact->toTime, (long) currentTime);
+        return 0;
+    }
+
+    // 8b. Window too far in the future: suspected clock skew (§7.6)
+    if (contact->fromTime > currentTime + CLOCK_SKEW_FUTURE_LIMIT) {
+        debug_log(config, "❌ Discarded: window too far in the future "
+                "(fromTime=%ld, now=%ld) — possible clock skew between nodes",
+                (long) contact->fromTime, (long) currentTime);
+        return 0;
+    }
+
+    /* There is no check 9 on the owlt: 0 is a legitimate OWLT (on a LAN it is
+     * the physically correct value, and ION accepts "a range ... 0"). Discarding
+     * it here contradicted origination, where findOwlt returns 0 as a valid
+     * value, and on a local testbed it made every receiver discard everything.
+     * The v3 format always carries the field, and ionc_get_own_contacts only
+     * announces contacts for which a range really exists: the check was
+     * redundant. */
+
+    /* We write what we learn, but announce only what we are authoritative for
+     * (§4.5): contacts with toNode == me are inserted as well. */
+    outcome = ionc_apply_contact(contact, config->debugMode);
+    if (outcome == IONC_ERROR) {
+        /* IONC_ERROR is a system error from an rfx_* call (rc < 0) or ION
+         * being unreachable: after the earlier fix, an overlap with a manually
+         * configured contact is an expected user error and no longer reaches
+         * this point. The message stays valid regardless and must be forwarded
+         * (§6.5), otherwise a purely local problem would partition the
+         * flooding. */
+        dtnex_log("❌ Failed to apply %lu→%lu to ION",
+                contact->fromNode, contact->toNode);
+    } else if (outcome == IONC_LOST) {
+        /* The previous entry was removed from ION but the insert meant to
+         * replace it was refused: unlike the other outcomes, here ION got
+         * worse than before, not merely unchanged. The detail (ION code and
+         * its meaning) has already been logged by ion_contacts.c; here we
+         * only flag that this is not a success, so the loss does not stay
+         * invisible at the default log level. */
+        dtnex_log("⚠️  Contact %lu→%lu lost in ION after a successful remove "
+                "(the following insert was refused)",
+                contact->fromNode, contact->toNode);
+    } else if (outcome != IONC_NOOP) {
+        dtnex_log("✅ Contact %lu→%lu %s in ION",
+                contact->fromNode, contact->toNode, ionc_outcome_name(outcome));
+    }
+
+    // Forwarding is unchanged (§6.5): a message that passes validation is
+    // always forwarded, regardless of the outcome of the local ION write.
     forwardCborContactMessage(config, nonce, timestamp, expireTime, origin, from, contact);
-    
+
     return 0;
 }
 
@@ -3111,8 +3390,8 @@ int processCborMetadataMessage(DtnexConfig *config, unsigned char *nonce, time_t
 /**
  * Forward CBOR contact message to all neighbors (except origin and sender)
  */
-void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp, 
-                              time_t expireTime, unsigned long origin, unsigned long from, ContactInfo *contact) {
+void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp,
+                              time_t expireTime, unsigned long origin, unsigned long from, ContactRecord *contact) {
     Plan plans[MAX_PLANS];
     int planCount = 0;
     char destEid[MAX_EID_LENGTH];
@@ -3139,12 +3418,12 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         }
         
         // Create CBOR forwarded message with preserved original nonce, timestamp and expireTime
-        ContactInfo forwardContact = *contact; // Copy contact info
-        
+        ContactRecord forwardContact = *contact; // Copy contact info
+
         // Create modified contact message for forwarding (from=our nodeId)
         unsigned char *cursor = cborBuffer;
         int bytesWritten = 0;
-        
+
         // Encode forwarded CBOR message
         bytesWritten += cbor_encode_array_open(9, &cursor);
         bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
@@ -3152,26 +3431,30 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         bytesWritten += cbor_encode_integer(timestamp, &cursor);
         bytesWritten += cbor_encode_integer(expireTime, &cursor);
         bytesWritten += cbor_encode_integer(origin, &cursor);  // Keep original origin
-        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node
+        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node: ONLY the "from" field is replaced with this node's ID
         bytesWritten += cbor_encode_byte_string(originalNonce, DTNEX_NONCE_SIZE, &cursor);
-        
-        // Contact data
-        bytesWritten += cbor_encode_array_open(3, &cursor);
-        bytesWritten += cbor_encode_integer(forwardContact.nodeA, &cursor);
-        bytesWritten += cbor_encode_integer(forwardContact.nodeB, &cursor);
-        bytesWritten += cbor_encode_integer(forwardContact.duration, &cursor);
-        
+
+        // Contact data v3
+        bytesWritten += cbor_encode_array_open(7, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.fromNode, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.toNode, &cursor);
+        bytesWritten += cbor_encode_integer((uvast) forwardContact.fromTime, &cursor);
+        bytesWritten += cbor_encode_integer((uvast) forwardContact.toTime, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.xmitRate, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.confidence, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.owlt, &cursor);
+
         // Calculate HMAC over everything except HMAC itself
         unsigned char hmac[DTNEX_HMAC_SIZE];
         calculateHmac(cborBuffer, bytesWritten, config->presSharedNetworkKey, hmac);
         bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
-        
+
         // Send forwarded CBOR bundle
         sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
         sendCborBundle(destEid, cborBuffer, bytesWritten, config->bundleTTL);
-        
-        log_message_forwarded(config, origin, from, neighborId, "contact", 
-                             contact->nodeA, contact->nodeB, NULL);
+
+        log_message_forwarded(config, origin, from, neighborId, "contact",
+                             contact->fromNode, contact->toNode, NULL);
     }
 }
 
