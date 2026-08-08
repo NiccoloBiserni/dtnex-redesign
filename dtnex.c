@@ -73,6 +73,12 @@ BundleReceptionState bundleReceptionState;  // Bundle reception service state
     la config e l'identificatore del thread.
 */
 
+/* "Il thread e' stato creato" e' un fatto diverso da "il thread deve continuare
+ * a girare": il secondo viene azzerato per CHIEDERE l'arresto, quindi non puo'
+ * fare da guardia alla join, o la join verrebbe saltata proprio quando serve. */
+int bpechoThreadStarted = 0;
+int bundleReceptionThreadStarted = 0;
+
 /**
  * Logging helper function with color support
  * 
@@ -1705,6 +1711,7 @@ int main(int argc, char **argv) {
                 bp_close(bpechoState.sap);
                 ionStopAttendant(&bpechoState.attendant);
             } else {
+                bpechoThreadStarted = 1;
                 dtnex_log("✅ Bpecho service thread started");
             }
         }
@@ -1723,6 +1730,7 @@ int main(int argc, char **argv) {
                 dtnex_log("❌ Failed to create bundle reception thread");
                 return 1;
             } else {
+                bundleReceptionThreadStarted = 1;
                 dtnex_log("✅ Bundle reception thread started");
             }
         }
@@ -1761,17 +1769,19 @@ int main(int argc, char **argv) {
     // Clean up
     dtnex_log("Shutting down...");
     
-    // Wait for bundle reception thread to terminate if it's running
-    if (bundleReceptionState.running) {
+    // Wait for bundle reception thread to terminate if it was ever started
+    if (bundleReceptionThreadStarted) {
         dtnex_log("Waiting for bundle reception thread to terminate...");
         stopBundleReception(&bundleReceptionState);
         pthread_join(bundleReceptionState.thread, NULL);
+        bundleReceptionThreadStarted = 0;
     }
-    
-    // Wait for bpecho thread to terminate if it's running
-    if (bpechoState.running) {
+
+    // Wait for bpecho thread to terminate if it was ever started
+    if (bpechoThreadStarted) {
         dtnex_log("Waiting for bpecho service to terminate...");
         pthread_join(bpechoThread, NULL);
+        bpechoThreadStarted = 0;
     }
     
     // Close the BP endpoint gracefully if we have one
