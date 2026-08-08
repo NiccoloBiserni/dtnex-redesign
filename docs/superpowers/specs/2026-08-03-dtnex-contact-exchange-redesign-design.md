@@ -1,7 +1,8 @@
 # DTNEX — Redesign dello scambio di contatti
 
-**Data:** 2026-08-03
-**Stato:** implementato sul branch `redesign`, con i limiti noti registrati in fondo
+**Data:** 2026-08-03 — §13 aggiunta il 2026-08-08
+**Stato:** implementato sul branch `redesign`, con i limiti noti registrati in fondo.
+Il §13 (terminazione) è **progettato ma non ancora implementato**.
 **Versione protocollo risultante:** 3 (da 2)
 
 ---
@@ -427,3 +428,154 @@ Mitigazione futura: risincronizzare gli header, oppure aggiungere in `ion_contac
 un paio di `_Static_assert` su `sizeof(IonCXref)`, `offsetof(IonCXref, fromTime)` e
 `sizeof(IonVdb)`, per trasformare il prossimo disallineamento in un errore di
 compilazione anziché in una corruzione muta.
+
+---
+
+## 13. Terminazione e integrità della transazione SDR
+
+**Aggiunto il 2026-08-08**, dopo l'esecuzione delle prove del §9 su un ION vivo. Non
+faceva parte del redesign dello scambio di contatti: è emerso validandolo.
+
+### 13.1 Perché si tocca la terminazione
+
+Durante le prove il nodo ION si è bloccato più volte: `ionadmin` e `bplist` fermi per
+minuti su un semaforo in memoria condivisa, mentre `sdrwatch` — che non prende il lock
+della transazione — continuava a rispondere. Una misura in particolare: `ionadmin` fermo
+da due minuti si è sbloccato **due secondi dopo l'arresto di dtnex**. In un'altra
+occasione dtnex non ha risposto a SIGTERM.
+
+Il meccanismo che spiega l'osservazione sta in `signalHandler` (`dtnex.c:995-1069`).
+L'handler non si limita a segnalare la terminazione: logga, chiama `bp_interrupt`, fa
+`pthread_join`, `bp_close`, `bp_detach`, e chiude con `exit(0)`. I segnali sono
+installati con `sigaction` in `main` prima che nascano i thread (`dtnex.c:1679-1685`),
+quindi **l'handler può eseguire su un thread qualsiasi**. Se il segnale arriva mentre un
+thread è dentro una transazione SDR — il ciclo principale in `ionc_get_own_contacts`, il
+thread di ricezione in `ionc_apply_contact`, `getplanlist` — quell'`exit(0)` termina il
+processo con la transazione aperta. Il lock della transazione vive nella memoria
+condivisa di ION, non nel processo: resta preso, e ogni altro client ION si blocca
+finché non arriva `ionunlock` o un `killm`.
+
+**È un'ipotesi coerente con le osservazioni, non una dimostrazione:** l'istante del
+segnale non è stato catturato. Ma basta a giustificare l'intervento, perché il difetto è
+visibile staticamente e indipendente dall'episodio: un `exit()` chiamato da contesto
+asincrono mentre un altro thread può trovarsi dentro una transazione è scorretto
+comunque.
+
+Per chiarezza: **la v2.52 ha lo stesso difetto** — stesso handler, stessi tre segnali,
+stesso `exit(0)`. Non si sta ripristinando un comportamento perduto; si sta chiudendo
+un'esposizione che la versione shell non aveva, perché parlava con ION solo attraverso
+`ionadmin`, e ogni invocazione apriva e chiudeva la propria transazione.
+
+### 13.2 Perché si elimina l'handler asincrono invece di alleggerirlo
+
+La soluzione minima sarebbe ridurre l'handler a `running = 0` e spostare il teardown nel
+ciclo principale. Risolve il problema del lock, e da sola basterebbe.
+
+Si va oltre per una ragione indipendente: **quasi tutto ciò che l'handler fa oggi non è
+async-signal-safe.** `dtnex_log` è `printf`; `pthread_join` e `bp_close` non sono nella
+lista POSIX delle funzioni chiamabili da un handler. Un `printf` interrotto a metà da un
+altro `printf` può bloccarsi sul lock interno di stdio: un deadlock che non lascia
+traccia, e che spiegherebbe il dtnex rimasto sordo a SIGTERM. Alleggerire l'handler
+lascerebbe la categoria aperta, pronta a riaprirsi la prossima volta che qualcuno
+aggiunge "solo una riga di log" lì dentro.
+
+Il pattern `sigwait` la chiude alla radice. I tre segnali vengono bloccati in tutti i
+thread e un thread dedicato li raccoglie con `sigwait()`. Quel thread **non è un
+handler**: è codice ordinario in contesto ordinario, dove loggare, fare join e chiamare
+le API di ION è lecito. Non resta nessuna funzione da tenere async-signal-safe, quindi
+nessuna regola che un contributore futuro possa violare senza accorgersene. Il costo è
+una maschera dei segnali da impostare prima di creare qualunque thread — un vincolo
+verificabile in un punto solo, contro un invariante diffuso su ogni riga dell'handler.
+
+### 13.3 Struttura della terminazione
+
+1. In `main`, **prima** di creare qualunque thread: `pthread_sigmask(SIG_BLOCK, …)` su
+   SIGINT, SIGTERM, SIGTSTP. La maschera è ereditata da ogni thread creato dopo.
+2. Nasce un thread dedicato che cicla su `sigwait()` sugli stessi tre segnali. Le
+   `sigaction` di `dtnex.c:1679-1685` spariscono, e con loro `signalHandler`
+   (`dtnex.c:995-1069`) e la sua dichiarazione in `dtnex.h:168`.
+3. **Primo segnale:** il thread logga, azzera `running`, `bpechoState.running` e
+   `bundleReceptionState.running`, poi chiama i risvegli — `bp_interrupt` sui due SAP e
+   `ionPauseAttendant` — per sbloccare chi è fermo in `bp_receive`. I risvegli sono
+   condizionati come nell'handler attuale (`ionConnected` e SAP non nullo), perché dtnex
+   può ricevere un segnale mentre ION non è raggiungibile. Non fa join, non chiude
+   endpoint, non fa detach, non chiama `exit`. Torna a `sigwait`.
+4. **Teardown:** quello che c'è già. `main` contiene la sequenza completa —
+   `stopBundleReception`, join dei due thread, `bp_close`, `bp_detach`, `return 0` — alle
+   righe `dtnex.c:1761-1788`. Oggi è **codice irraggiungibile**, perché l'handler chiama
+   `exit(0)` prima che `eventDrivenLoop` ritorni. Il lavoro non è scrivere il teardown:
+   è smettere di scavalcarlo.
+
+La garanzia è strutturale, non affidata all'attenzione: `eventDrivenLoop` controlla
+`running` solo fra un'iterazione e l'altra, quindi il punto di uscita è per costruzione
+fuori da ogni transazione. Non serve un meccanismo di risveglio nuovo — il ciclo dorme
+già a fette da un secondo controllando `running` (`dtnex.c:2365-2378`), quindi la latenza
+di risposta al segnale resta sotto il secondo.
+
+**Un difetto da correggere nel teardown esistente.** Le due join sono protette da
+`if (bundleReceptionState.running)` e `if (bpechoState.running)` (`dtnex.c:1765`, `1772`).
+Sono le stesse variabili che il thread `sigwait` azzera per chiedere ai servizi di
+fermarsi: quando il controllo viene eseguito valgono già zero, e **le join vengono
+saltate**. Finora non si notava, perché quel codice non veniva mai raggiunto. Serve
+distinguere "il thread è stato creato" da "il thread deve continuare a girare": due flag
+distinti, oppure la join incondizionata sui thread effettivamente creati. Senza questo, la
+terminazione cooperativa chiuderebbe i SAP mentre i thread di servizio li stanno ancora
+usando — sostituendo un difetto con un altro.
+
+Da verificare nello stesso passaggio: il teardown di `main` chiude `sap` ma non
+`bpechoState.sap` (che l'handler invece chiudeva per sicurezza). Se non lo chiude il
+thread bpecho uscendo, va chiuso lì.
+
+### 13.4 Uscita forzata
+
+Il secondo segnale mantiene la via di fuga che c'è oggi, ma smette di essere silenziosa:
+si logga esplicitamente che l'uscita è forzata, che la transazione SDR può restare
+aperta e che il rimedio è `ionunlock ion`. Poi `_exit(1)`, non `exit(1)`: con altri
+thread ancora vivi non si vogliono far girare gli handler `atexit` né il flush di stdio.
+
+Forzare l'uscita è esattamente ciò che può lasciare il lock preso. Resta disponibile
+perché un operatore bloccato deve poter uscire, ma deve sapere cosa gli è costato.
+
+### 13.5 Invariante da preservare
+
+Ogni `sdr_begin_xn` ha il suo `sdr_exit_xn` / `sdr_end_xn` su **tutti** i cammini di
+uscita. Oggi è vero — verificato in `ion_contacts.c` e in `getplanlist` — e va registrato
+come invariante, non come constatazione. Vale anche per il re-exec su restart di ION
+(`dtnex.c:2422`): non si re-esegue con una transazione aperta.
+
+### 13.6 `planListMutex`: nessun intervento, e il perché
+
+`planListMutex` (`dtnex.c:511`) è un `pthread_mutex_t` **locale al processo**: `ionadmin`
+è un altro processo e non lo vede. Non può essere la causa di ciò che si è osservato, e
+non c'è nessun "unlock di recovery" da aggiungere. Con lo shutdown cooperativo un thread
+che si trova dentro `getplanlist` quando `running` va a zero arriva in fondo alla
+funzione e fa l'unlock da solo.
+
+La sezione esiste per evitare che l'idea venga reintrodotta più avanti: i due lock —
+mutex di processo e transazione SDR condivisa — sono facili da confondere, e solo il
+secondo è quello che blocca gli altri client di ION.
+
+### 13.7 Ambito e limiti
+
+Coperti gli stessi modi di morte della v2.52: **SIGINT, SIGTERM, SIGTSTP** e uscita
+ordinaria. Restano fuori segfault, abort e SIGKILL: lì il processo muore senza eseguire
+nulla, e se la transazione era aperta il lock resta preso. Il rimedio documentato è
+`ionunlock ion`.
+
+Coprirli richiederebbe un recupero all'avvio — dtnex che rileva un lock stantio e lo
+sblocca — che porta con sé il rischio di sbloccare la transazione di un altro processo
+ION legittimo. Fuori ambito per scelta.
+
+### 13.8 Verifica
+
+Manuale, come il resto: non esiste una suite.
+
+| # | prova | verifica |
+|---|---|---|
+| 1 | SIGTERM durante il funzionamento normale | dtnex esce, e `ionadmin` interrogato subito dopo risponde senza attese |
+| 2 | SIGTERM mentre è in corso l'applicazione di un contatto ricevuto | come sopra: nessun blocco di `ionadmin`, nessun `ionunlock` necessario |
+| 3 | doppio Ctrl+C | compare l'avviso di uscita forzata con il suggerimento `ionunlock ion` |
+| 4 | SIGTERM in modalità servizio | uscita pulita, stesso esito della prova 1 |
+
+La prova 2 è quella che discrimina davvero: è l'unica che mette il segnale e la
+transazione nella stessa finestra temporale.
