@@ -522,9 +522,11 @@ distinti, oppure la join incondizionata sui thread effettivamente creati. Senza 
 terminazione cooperativa chiuderebbe i SAP mentre i thread di servizio li stanno ancora
 usando — sostituendo un difetto con un altro.
 
-Da verificare nello stesso passaggio: il teardown di `main` chiude `sap` ma non
-`bpechoState.sap` (che l'handler invece chiudeva per sicurezza). Se non lo chiude il
-thread bpecho uscendo, va chiuso lì.
+Il teardown di `main` chiude `sap` ma non `bpechoState.sap`, che l'handler invece
+chiudeva per sicurezza. Verificato: non serve, perché **il thread bpecho lo chiude e lo
+azzera da solo uscendo** (`dtnex.c:1523-1526`). È un'altra ragione per cui la join va
+fatta davvero: se si salta, si chiudono i SAP mentre quel thread sta ancora eseguendo la
+propria pulizia.
 
 ### 13.4 Uscita forzata
 
