@@ -75,7 +75,11 @@ BundleReceptionState bundleReceptionState;  // Bundle reception service state
 
 /* "Il thread e' stato creato" e' un fatto diverso da "il thread deve continuare
  * a girare": il secondo viene azzerato per CHIEDERE l'arresto, quindi non puo'
- * fare da guardia alla join, o la join verrebbe saltata proprio quando serve. */
+ * fare da guardia alla join, o la join verrebbe saltata proprio quando serve.
+ * Ciascun thread puo' nascere in due punti: all'avvio in main() se ION e' gia'
+ * raggiungibile, oppure dentro eventDrivenLoop() dopo una riconnessione a ION
+ * avvenuta più tardi. Il flag va alzato in entrambi i punti, altrimenti un
+ * thread nato solo per riconnessione non verrebbe mai atteso in join. */
 int bpechoThreadStarted = 0;
 int bundleReceptionThreadStarted = 0;
 
@@ -2252,6 +2256,7 @@ void eventDrivenLoop(DtnexConfig *config) {
                     dtnex_log("🚀 Initializing bpecho service after ION reconnection...");
                     if (initBpechoService(config, &bpechoState) == 0) {
                         if (pthread_create(&bpechoThread, NULL, runBpechoService, (void *)config) == 0) {
+                            bpechoThreadStarted = 1;
                             dtnex_log("✅ Bpecho service thread started");
                         } else {
                             dtnex_log("❌ Failed to create bpecho service thread");
@@ -2266,6 +2271,7 @@ void eventDrivenLoop(DtnexConfig *config) {
                     dtnex_log("🚀 Initializing bundle reception service after ION reconnection...");
                     if (initBundleReception(config, &bundleReceptionState) == 0) {
                         if (pthread_create(&bundleReceptionState.thread, NULL, runBundleReception, (void *)&bundleReceptionState) == 0) {
+                            bundleReceptionThreadStarted = 1;
                             dtnex_log("✅ Bundle reception thread started");
                         } else {
                             dtnex_log("❌ Failed to create bundle reception thread");
