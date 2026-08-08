@@ -2,7 +2,9 @@
  * dtnex.h
  * DTNEX - DTN Network Information Exchange
  * High-performance C implementation for exchanging DTN contact and metadata information
+ *
  * Author: Samo Grasic (samo@grasic.net)
+ * v3 contact-exchange redesign: Niccolo Biserni (niccolo.biserni@studio.unibo.it)
  */
 
 #ifndef DTNEX_H

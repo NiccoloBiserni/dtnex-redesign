@@ -2,7 +2,9 @@
  * dtnex.c
  * DTNEX - DTN Network Information Exchange
  * High-performance C implementation for exchanging DTN contact and metadata information
+ *
  * Author: Samo Grasic (samo@grasic.net)
+ * v3 contact-exchange redesign: Niccolo Biserni (niccolo.biserni@studio.unibo.it)
  */
 
 #include "dtnex.h"
@@ -498,8 +500,10 @@ int tryConnectToIon(DtnexConfig *config) {
  * Initialize the DTNEX application - Modified to work without requiring ION connection
  */
 int init(DtnexConfig *config) {
-    dtnex_log("Starting DTNEXC v%s (built %s %s), author: Samo Grasic (samo@grasic.net)", 
+    dtnex_log("Starting DTNEXC v%s (built %s %s)", 
               DTNEXC_VERSION, DTNEXC_BUILD_DATE, DTNEXC_BUILD_TIME);
+    dtnex_log("Original author: Samo Grasic (samo@grasic.net) — "
+              "v3 contact-exchange redesign: Niccolo Biserni (niccolo.biserni@studio.unibo.it)");
     
     // Try to connect to ION, but don't fail if unavailable
     if (tryConnectToIon(config) == 0) {

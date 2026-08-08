@@ -445,3 +445,23 @@ The CBOR protocol can be extended for custom applications:
 - **Message Expiry**: Contact messages expire at the contact's own `toTime`; metadata messages expire after `contactLifetime` — both bound how long a captured message stays replayable
 - **Nonce Entropy**: Ensure good randomness for nonce generation
 - **Replay Window**: Balance cache size with replay protection needs
+
+## Credits
+
+DTNEX was written by **Samo Grasic** (samo@grasic.net), who remains the author of
+the original project at
+[samograsic/ion-dtn-dtnex](https://github.com/samograsic/ion-dtn-dtnex) — the
+architecture, the CBOR protocol with HMAC authentication, the bpecho service and
+the epidemic forwarding are his.
+
+The **v3 contact-exchange redesign** in this fork is by **Niccolo Biserni**
+(niccolo.biserni@studio.unibo.it): contacts and ranges are now read from and written to ION's
+contact plan through the `rfx_*` API, times travel as absolute epochs, writes are
+idempotent and targeted, and termination is cooperative. It is described in full in
+[the design spec](docs/spec_dtnex_v3.md).
+
+## License
+
+No license has been declared for this project, upstream or here. Until one is,
+default copyright applies and no redistribution or modification rights are
+granted. If you intend to use this code, please contact the original author.
