@@ -203,12 +203,19 @@ esattamente il comportamento che `c54a8cb` doveva produrre. Prima del fix: silen
   inattivo. L'ipotesi del §13.1 della spec, che attribuiva anche questo all'`exit(0)`
   asincrono, e' smentita.
 
-  **Dove guardare.** Durante il blocco il thread principale di dtnex era in
-  `nanosleep` (non teneva transazioni), il thread `sigwait` in `do_sigtimedwait`, e i
-  due thread di servizio fermi su semafori dentro `bp_receive`. L'indizio piu' forte
-  e' un thread che resta dentro `bp_receive` trattenendo un lock di ION mentre attende
-  un bundle: spiegherebbe perche' il blocco c'e' a dtnex inattivo e cessa quando dtnex
-  muore. Dettagli e misure in §13.9 della spec.
+  **E non e' nemmeno detto che sia dtnex.** Misure successive, stesso giorno e nodo
+  appena riavviato, hanno mostrato `ionadmin` bloccato oltre dieci minuti **con dtnex
+  spento**, per poi completare da solo. Il nodo ha stalli pluriminuto propri, quindi
+  "bloccato mentre dtnex gira" non basta a incolpare dtnex.
+
+  **Come riprenderla.** Serve una base di misure pulite, una variabile per volta:
+  nodo nudo, poi solo `bprecvfile`, poi solo dtnex, poi entrambi. L'ipotesi da testare
+  per prima e' un thread parcheggiato in `bp_receive` che trattiene un lock di ION —
+  forma comune ai thread di servizio di dtnex e al `bprecvfile` dell'operatore.
+  Tabella di cosa e' stabilito e cosa no in §13.9 della spec.
+
+  **Avvertenza:** uccidere `ionadmin` mentre attende blocca il nodo per davvero e
+  falsa ogni misura successiva. Va lanciato solo dove nessun timeout lo interrompa.
 - **`bpsendfile` con il file del payload cancellato subito dopo l'invio manda ION in
   `Unrecoverable SDR error`** (`Can't compute payload block CRC` → `Can't serialize
   bundle payload`). ION serializza il payload dopo, rileggendo il file. E' un limite

@@ -601,13 +601,30 @@ teneva nessuna transazione — il thread `sigwait` era correttamente in
 `do_sigtimedwait`, e i due thread di servizio erano fermi su semafori dentro
 `bp_receive`.
 
-**Conseguenza.** Il difetto corretto dal §13 è reale — un `exit()` asincrono con una
-transazione potenzialmente aperta è scorretto, e la correzione è verificata dalle
-quattro prove. Ma **non era la causa del sintomo che ha fatto partire l'indagine**.
-La causa va cercata altrove, e l'indizio più forte è un thread che resta dentro
-`bp_receive` trattenendo un lock di ION mentre attende un bundle che non arriva:
-spiegherebbe perché il blocco si verifica a dtnex *inattivo* e cessa quando dtnex
-muore.
+**Ma nemmeno "è colpa di dtnex" è dimostrato.** Misure successive, sempre del
+2026-08-08 e su un nodo appena riavviato, mostrano `ionadmin` bloccato per **oltre
+dieci minuti con dtnex completamente spento**, per poi completare da solo. Ripetuto
+piu' volte. Quindi il nodo ha stalli pluriminuto propri, indipendenti da dtnex, e
+l'inferenza "bloccato mentre dtnex gira ⇒ lo blocca dtnex" non regge: lo sblocco a
+1,0 s dal SIGTERM resta suggestivo, ma con stalli di durata così variabile può essere
+una coincidenza.
 
-Da indagare separatamente. Non chiudere la voce corrispondente nel documento di
-stato dandola per risolta.
+**Cosa si può affermare, e cosa no.**
+
+| affermazione | stato |
+|---|---|
+| Il §13 corregge un difetto reale (un `exit()` asincrono con una transazione potenzialmente aperta è scorretto) | ✅ stabilito, e verificato dalle quattro prove del §13.8 |
+| Dopo un'uscita ordinata il nodo resta usabile (`ionadmin` in 8-10 ms, 5 misure) | ✅ stabilito |
+| Il §13 risolve il blocco di `ionadmin` osservato a dtnex vivo | ❌ **smentito**: il blocco si riproduce col binario corretto |
+| Il blocco è causato da dtnex | ❓ **non dimostrato**: si riproduce anche a dtnex spento |
+| Il blocco è causato da un thread parcheggiato in `bp_receive` | ❓ ipotesi non verificata — la forma è la stessa sia per i thread di servizio di dtnex sia per il `bprecvfile` dell'operatore, ma l'esperimento decisivo (fermare `bprecvfile` e vedere se il blocco cessa) non è stato eseguito |
+
+**Come riprenderla.** Servono misure pulite su un nodo non perturbato, con una sola
+variabile per volta: (a) nodo appena riavviato, nessun client, N interrogazioni
+cronometrate; (b) stesso nodo con il solo `bprecvfile`; (c) stesso nodo con il solo
+dtnex; (d) entrambi. Senza quella base, ogni singola osservazione è aneddotica —
+compresa quella che ha fatto nascere questa sezione.
+
+**Avvertenza operativa.** Uccidere `ionadmin` mentre attende blocca il nodo davvero,
+e falsa tutte le misure successive. Va lanciato solo dove nessun timeout possa
+interromperlo. Diverse misure di questa giornata sono state invalidate proprio così.
