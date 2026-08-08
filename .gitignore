@@ -21,9 +21,11 @@ dev/
 obsolete/
 .claude/
 .vscode/
+.superpowers/
 
 # Project documentation (local only)
 CLAUDE.md
+docs/superpowers/
 
 # Security-sensitive files
 setup_ssh_keys.sh
