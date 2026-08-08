@@ -15,10 +15,10 @@
 
 // Global variables
 volatile int running = 1;
-/* 
-    variabile di flag che tiene in vita il loop, volatile per evitare problemi di ottimizzazione con il signal handler,
-    infatti viene modificata dal signal hadler quando arriva un segnale (SIGINT/SIGTERM) e la setta a 0, così il
-    loop principale termina ordinatamante 
+/*
+    variabile di flag che tiene in vita il loop, volatile perché a modificarla è signalWaitThread,
+    un thread diverso da quello che esegue il loop: viene settata a 0 quando arriva un segnale
+    (SIGINT/SIGTERM/SIGTSTP), così il loop principale termina ordinatamante
 */
 volatile int ionConnected = 0;  // Global ION connection status, volatile perché può cambiare in modo asincrono (es. se ION si riavvia mentre DTNEX è in esecuzione)
 volatile int ionRestartDetected = 0;  // Flag to trigger complete restart
@@ -82,6 +82,8 @@ BundleReceptionState bundleReceptionState;  // Bundle reception service state
  * thread nato solo per riconnessione non verrebbe mai atteso in join. */
 int bpechoThreadStarted = 0;
 int bundleReceptionThreadStarted = 0;
+
+pthread_t signalThread;    /* Thread dedicato alla raccolta dei segnali via sigwait */
 
 /**
  * Logging helper function with color support
@@ -999,83 +1001,80 @@ void updateNodeMetadata(DtnexConfig *config, unsigned long nodeId, const char *m
  */
 
 /**
- * Signal handler for clean shutdown
- * Based on bpsink's handleQuit pattern
+ * Raccolta dei segnali di terminazione.
+ *
+ * NON e' un signal handler: i tre segnali sono bloccati in tutti i thread
+ * (pthread_sigmask in main) e questo thread li preleva con sigwait(). Gira
+ * quindi in contesto ordinario, dove loggare e chiamare le API di ION e'
+ * lecito — cosa che in un handler asincrono non lo era: dtnex_log e' printf,
+ * e ne' pthread_join ne' bp_close sono async-signal-safe.
+ *
+ * Al primo segnale abbassa i flag di esecuzione e sveglia chi e' fermo in
+ * bp_receive. NON fa join, non chiude endpoint, non fa detach e non chiama
+ * exit: la pulizia la fa main quando eventDrivenLoop ritorna, che e' per
+ * costruzione un punto fuori da ogni transazione SDR. Uscire di qui mentre un
+ * altro thread e' dentro una transazione lascerebbe il lock preso nella
+ * memoria condivisa di ION, bloccando ogni altro client fino a ionunlock.
  */
-void signalHandler(int sig) {
-    // Re-arm signal handlers in case we receive multiple signals
-    isignal(SIGINT, signalHandler);
-    isignal(SIGTERM, signalHandler);
-    isignal(SIGTSTP, signalHandler);
-    
-    // Prevent re-entrancy (in case signal is received again during shutdown)
-    static int inShutdown = 0;
-    if (inShutdown) {
-        dtnex_log("Already in shutdown process, forcing immediate exit...");
-        exit(1);  // Force exit if shutdown takes too long
-    }
-    inShutdown = 1;
-    
-    // Provide feedback based on signal type
-    if (sig == SIGINT) {
-        dtnex_log("Received interrupt signal (Ctrl+C), shutting down gracefully...");
-    } else if (sig == SIGTERM) {
-        dtnex_log("Received termination signal, shutting down gracefully...");
-    } else if (sig == SIGTSTP) {
-        dtnex_log("Received suspend signal (Ctrl+Z), shutting down gracefully instead of suspending...");
-    } else {
-        dtnex_log("Received signal %d, shutting down gracefully...", sig);
-    }
-    
-    // Set global flag to stop the main loop
-    running = 0;
-    
-    // Only perform ION cleanup if we're actually connected to ION
-    if (ionConnected && sap != NULL) {
-        // Interrupt any pending receives if we have an open endpoint
-        dtnex_log("Interrupting BP endpoint");
-        bp_interrupt(sap);
-        
-        // Stop bundle reception service
-        stopBundleReception(&bundleReceptionState);
-        
-        // Stop bpecho service
-        bpechoState.running = 0;
-        if (bpechoState.sap != NULL) {
-            bp_interrupt(bpechoState.sap);
-            ionPauseAttendant(&bpechoState.attendant);
-            
-            // Wait for bpecho thread to terminate before closing its resources
-            dtnex_log("Waiting for bpecho service to terminate...");
-            pthread_join(bpechoThread, NULL);
+static void *signalWaitThread(void *arg)
+{
+    sigset_t waitSet;
+    int      sig;
+    int      signalCount = 0;
+
+    (void) arg;
+
+    sigemptyset(&waitSet);
+    sigaddset(&waitSet, SIGINT);
+    sigaddset(&waitSet, SIGTERM);
+    sigaddset(&waitSet, SIGTSTP);
+
+    while (1) {
+        if (sigwait(&waitSet, &sig) != 0) {
+            continue;
         }
-        
-        // Force cleanup and exit for all signals since main loop might be blocked
-        dtnex_log("Performing cleanup and immediate exit...");
-        
-        // Close endpoints directly
-        dtnex_log("🔌 Closing BP endpoint");
-        bp_close(sap);
-        sap = NULL;
-        
-        // Close bpecho endpoint if it exists (should be closed by thread, but double-check)
-        if (bpechoState.sap != NULL) {
-            bp_close(bpechoState.sap);
-            bpechoState.sap = NULL;
+
+        signalCount++;
+
+        if (signalCount > 1) {
+            dtnex_log("⚠️  Uscita forzata richiesta: se un thread e' dentro una "
+                    "transazione SDR il lock di ION restera' preso e bloccherra' "
+                    "gli altri client. In quel caso sbloccare con: ionunlock ion");
+            _exit(1);
         }
-        
-        // Detach from BP
-        dtnex_log("🧹 Detaching from ION BP system");
-        bp_detach();
-    } else {
-        dtnex_log("Performing cleanup without ION detachment (not connected)...");
-        // Reset states even if not connected to ION
+
+        if (sig == SIGINT) {
+            dtnex_log("Ricevuto SIGINT (Ctrl+C), arresto in corso...");
+        } else if (sig == SIGTERM) {
+            dtnex_log("Ricevuto SIGTERM, arresto in corso...");
+        } else {
+            dtnex_log("Ricevuto SIGTSTP (Ctrl+Z), arresto in corso invece della "
+                    "sospensione...");
+        }
+
+        /* Chiedere l'arresto: il ciclo principale controlla running fra
+         * un'iterazione e l'altra, e dorme a fette da un secondo, quindi
+         * risponde entro il secondo (dtnex.c, eventDrivenLoop). */
+        running = 0;
         bpechoState.running = 0;
         bundleReceptionState.running = 0;
+
+        /* Risvegli: senza questi i thread di servizio resterebbero fermi nella
+         * bp_receive bloccante e la join non tornerebbe mai. Condizionati,
+         * perche' un segnale puo' arrivare con ION non raggiungibile. */
+        if (ionConnected) {
+            if (sap != NULL) {
+                bp_interrupt(sap);
+            }
+
+            if (bpechoState.sap != NULL) {
+                bp_interrupt(bpechoState.sap);
+                ionPauseAttendant(&bpechoState.attendant);
+            }
+        }
     }
-    
-    dtnex_log("DTNEXC shutdown complete");
-    exit(0);
+
+    return NULL;
 }
 
 /**
@@ -1418,8 +1417,10 @@ void *runBpechoService(void *arg) {
     int bytesToEcho = 0;
     int result;
     
-    // Don't set separate signal handler for bpecho - use main process handler
-    
+    // Il thread bpecho non tocca i segnali: li ha bloccati per eredità dalla
+    // maschera impostata in main. Si ferma tramite bpechoState.running più
+    // il risveglio di bp_interrupt, entrambi comandati da signalWaitThread.
+
     sdr = bp_get_sdr();
     dtnex_log("Starting bpecho service thread on service %s", config->bpechoServiceNr);
     
@@ -1671,29 +1672,34 @@ void stopBundleReception(BundleReceptionState *state) {
  */
 int main(int argc, char **argv) {
     DtnexConfig config;
-    
+
+    /* I segnali di terminazione vanno bloccati PRIMA che nasca qualunque
+     * thread — inclusi quelli che ION puo' creare in bp_attach — perche' la
+     * maschera si eredita alla creazione. Da qui in poi nessun thread li
+     * riceve in modo asincrono: li raccoglie signalWaitThread con sigwait. */
+    sigset_t terminationSignals;
+
+    sigemptyset(&terminationSignals);
+    sigaddset(&terminationSignals, SIGINT);
+    sigaddset(&terminationSignals, SIGTERM);
+    sigaddset(&terminationSignals, SIGTSTP);
+
+    if (pthread_sigmask(SIG_BLOCK, &terminationSignals, NULL) != 0) {
+        dtnex_log("❌ Impossibile bloccare i segnali di terminazione: "
+                "l'arresto non sarebbe sicuro per ION, esco");
+        return 1;
+    }
+
+    if (pthread_create(&signalThread, NULL, signalWaitThread, NULL) != 0) {
+        dtnex_log("❌ Impossibile creare il thread dei segnali: "
+                "l'arresto non sarebbe sicuro per ION, esco");
+        return 1;
+    }
+
     // Store original arguments for potential restart
     original_argc = argc;
     original_argv = argv;
-    
-    // Set up signal handlers for clean shutdown with signal masking
-    struct sigaction sa;
-    sigset_t mask;
-    
-    // Block signals during handler execution
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGINT);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGTSTP);
-    
-    sa.sa_handler = signalHandler;
-    sa.sa_mask = mask;
-    sa.sa_flags = SA_RESTART; // Restart interrupted system calls
-    
-    sigaction(SIGINT, &sa, NULL);   // Ctrl+C
-    sigaction(SIGTERM, &sa, NULL);  // kill
-    sigaction(SIGTSTP, &sa, NULL);  // Ctrl+Z
-    
+
     // Load configuration
     loadConfig(&config);
     

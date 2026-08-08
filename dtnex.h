@@ -165,7 +165,6 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount);
 void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount);
 void getContacts(DtnexConfig *config);
 void createGraph(DtnexConfig *config);
-void signalHandler(int sig);
 void updateNodeMetadata(DtnexConfig *config, unsigned long nodeId, const char *metadata);
 void dtnex_log(const char *format, ...);
 
