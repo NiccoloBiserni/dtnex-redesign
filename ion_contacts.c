@@ -725,7 +725,7 @@ int ionc_check_alive(unsigned long expectedNodeId)
 {
     Sdr      sdr;
     Object   iondbObject;
-    IonDB    iondb;
+    uvast    ownNodeNbr;
 
     sdr = getIonsdr();
     if (sdr == NULL) {
@@ -744,12 +744,17 @@ int ionc_check_alive(unsigned long expectedNodeId)
         return -1;
     }
 
-    sdr_read(sdr, (char *) &iondb, iondbObject, sizeof(IonDB));
+    /* Si legge solo il campo ownNodeNbr, non l'intera IonDB: la sizeof(IonDB)
+     * degli header del bundle non coincide con quella della libreria ION
+     * installata, quindi leggere l'intera struct sarebbe un over-read oltre
+     * la fine dell'oggetto in SDR. ownNodeNbr è il primo campo della struct,
+     * il suo offset coincide nei due layout. */
+    sdr_read(sdr, (char *) &ownNodeNbr, iondbObject + offsetof(IonDB, ownNodeNbr), sizeof(ownNodeNbr));
     sdr_exit_xn(sdr);
 
-    if (iondb.ownNodeNbr == 0) {
+    if (ownNodeNbr == 0) {
         return 0;
     }
 
-    return ((unsigned long) iondb.ownNodeNbr == expectedNodeId) ? 1 : 0;
+    return ((unsigned long) ownNodeNbr == expectedNodeId) ? 1 : 0;
 }

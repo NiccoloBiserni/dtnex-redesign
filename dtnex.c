@@ -210,7 +210,6 @@ void loadConfig(DtnexConfig *config) {
     // Set defaults
     config->updateInterval = DEFAULT_UPDATE_INTERVAL; // 600, 10 minuti tra un update e l'altro
     config->contactLifetime = DEFAULT_CONTACT_LIFETIME; // 3600, 1 ora di validità dei contatti
-    config->contactTimeTolerance = DEFAULT_CONTACT_TIME_TOLERANCE;
     config->bundleTTL = DEFAULT_BUNDLE_TTL; // 1800, 30 minuti di TTL per i bundle (3x update interval)
     strcpy(config->presSharedNetworkKey, DEFAULT_PRESHARED_KEY);
     sprintf(config->serviceNr, "%d", DEFAULT_SERVICE_NR);
@@ -272,8 +271,6 @@ void loadConfig(DtnexConfig *config) {
                     config->updateInterval = atoi(value);
                 } else if (strcmp(key, "contactLifetime") == 0) {
                     config->contactLifetime = atoi(value);
-                } else if (strcmp(key, "contactTimeTolerance") == 0) {
-                    config->contactTimeTolerance = atoi(value);
                 } else if (strcmp(key, "bundleTTL") == 0) {
                     config->bundleTTL = atoi(value);
                 } else if (strcmp(key, "presSharedNetworkKey") == 0) {
@@ -368,31 +365,30 @@ int tryConnectToIon(DtnexConfig *config) {
     }
     
     // Get the node number from ION configuration
-    IonDB iondb;
     Object iondbObject = getIonDbObject(); //è il puntatore all'oggetto iondb nella SDR di ION
     if (iondbObject == 0) {
         sdr_exit_xn(ionsdr);
         bp_detach();
         return -1;
     }
-    
-    // Read the iondb object to get the node number
-    sdr_read(ionsdr, (char *) &iondb, iondbObject, sizeof(IonDB));
-    /**
-     * Legge i dati dell'oggetto iondb dalla SDR di ION e li copia nella struttura iondb locale,
-     * da cui poi si ricava il nodeId. sdr_read legge direttamente dalla memoria sdr, non usa malloc.
-     * iondbObject è un puntatore alla memoria sdr.
-     */
-    config->nodeId = iondb.ownNodeNbr;
+
+    /* Si legge solo il campo ownNodeNbr, non l'intera IonDB: la sizeof(IonDB)
+     * degli header del bundle non coincide con quella della libreria ION
+     * installata, quindi leggere l'intera struct sarebbe un over-read oltre
+     * la fine dell'oggetto in SDR. ownNodeNbr è il primo campo della struct,
+     * il suo offset coincide nei due layout. */
+    uvast ownNodeNbr;
+    sdr_read(ionsdr, (char *) &ownNodeNbr, iondbObject + offsetof(IonDB, ownNodeNbr), sizeof(ownNodeNbr));
+    config->nodeId = ownNodeNbr;
     sdr_exit_xn(ionsdr);
 
     /* ---- DEBUG: dump IonDB fields ---- */
     dtnex_dbg("[tryConnectToIon] IonDB dump after sdr_read:");
-    dtnex_dbg("  ownNodeNbr = %lu", (unsigned long)iondb.ownNodeNbr);
-    dtnex_dbg("  ranges     = 0x%lx", (unsigned long)iondb.ranges);
-    /* Niente dump di iondb.contacts: quel campo non esiste nell'IonDB della
-     * libreria ION installata, a quell'offset c'e' 'ranges'. La riga stampava
-     * lo stesso valore della precedente sotto un altro nome. */
+    dtnex_dbg("  ownNodeNbr = %lu", (unsigned long)ownNodeNbr);
+    /* Nessun altro campo di IonDB viene stampato: gli offset della struct nel
+     * bundle (include/ion/ion.h) non coincidono con quelli della libreria
+     * ION installata, quindi il valore letto a quell'offset non sarebbe
+     * quello del campo nominato (rischio §12.3 della spec di design). */
     /* ---- END DEBUG ---- */
 
     if (config->nodeId == 0) {

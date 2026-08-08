@@ -57,7 +57,6 @@ char *strptime(const char *s, const char *format, struct tm *tm);
 // Configuration constants - event-driven operation
 #define DEFAULT_UPDATE_INTERVAL 600        // 10 minutes between updates
 #define DEFAULT_CONTACT_LIFETIME 3600      // 1 hour contact validity
-#define DEFAULT_CONTACT_TIME_TOLERANCE 1800 // 30 minutes time tolerance
 #define DEFAULT_BUNDLE_TTL 1800            // 30 minutes bundle TTL (3x update interval)
 #define DEFAULT_SERVICE_NR 12160
 #define DEFAULT_BPECHO_SERVICE_NR 12161
@@ -86,7 +85,6 @@ char *strptime(const char *s, const char *format, struct tm *tm);
 typedef struct {
     int updateInterval;
     int contactLifetime;
-    int contactTimeTolerance;
     int bundleTTL;
     char presSharedNetworkKey[64];
     char serviceNr[16];
