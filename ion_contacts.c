@@ -1,6 +1,6 @@
 /**
  * ion_contacts.c
- * DTNEX - accesso a ION per contatti e range.
+ * DTNEX - access to ION for contacts and ranges.
  */
 
 #include "include/ion/ion.h"
@@ -12,18 +12,18 @@
 
 #include "ion_contacts.h"
 
-/* Il logger vive in dtnex.c. Lo dichiariamo qui invece di includere
- * dtnex.h per non trascinare dentro il modulo bundle, config e CBOR. */
+/* The logger lives in dtnex.c. It is declared here rather than including
+ * dtnex.h, so that bundles, config and CBOR are not dragged into this module. */
 extern void dtnex_log(const char *format, ...);
 
 /**
- * Cerca nel rangeIndex di ION un range fra fromNode e toNode la cui
- * finestra si sovrappone a [fromTime, toTime]. In ION l'OWLT e' una
- * proprieta' geometrica simmetrica, quindi se non troviamo il verso
- * richiesto proviamo quello opposto.
+ * Looks up, in ION's rangeIndex, a range between fromNode and toNode whose
+ * window overlaps [fromTime, toTime]. In ION the OWLT is a symmetric
+ * geometric property, so if the requested direction is not found we try the
+ * opposite one.
  *
- * Va chiamata con una transazione SDR gia' aperta.
- * Ritorna 1 e scrive *owlt se trova un range, 0 altrimenti.
+ * Must be called with an SDR transaction already open.
+ * Returns 1 and writes *owlt if a range is found, 0 otherwise.
  */
 static int findOwlt(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
         uvast toNode, time_t fromTime, time_t toTime, unsigned int *owlt)
@@ -53,7 +53,7 @@ static int findOwlt(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
             continue;
         }
 
-        /* Finestre che si sovrappongono */
+        /* Overlapping windows */
         if (range->fromTime > toTime || range->toTime < fromTime) {
             continue;
         }
@@ -66,16 +66,15 @@ static int findOwlt(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
 }
 
 /**
- * Cerca il contatto con chiave esatta (fromNode, toNode, fromTime).
- * Va chiamata con una transazione SDR gia' aperta.
- * Ritorna 1 e copia il contatto in *copy, oppure 0 se non esiste.
+ * Looks up the contact with the exact key (fromNode, toNode, fromTime).
+ * Must be called with an SDR transaction already open.
+ * Returns 1 and copies the contact into *copy, or 0 if it does not exist.
  *
- * IonCXref.regionNbr viene volutamente ignorato nel confronto: dtnex e'
- * mono-region (§5.3) e tutte le scritture usano IONC_DEFAULT_REGION, quindi
- * ogni contatto che ci interessa vive in quella region. L'assunzione e'
- * portante: e' proprio da lei che dipende il codice 7 di rfx_insert_contact
- * ("contact is for a foreign region"), che scatta se la region locale non e'
- * la 1.
+ * IonCXref.regionNbr is deliberately ignored in the comparison: dtnex is
+ * single-region (§5.3) and every write uses IONC_DEFAULT_REGION, so every
+ * contact we care about lives in that region. The assumption is load-bearing:
+ * it is exactly what code 7 of rfx_insert_contact ("contact is for a foreign
+ * region") depends on, which fires if the local region is not region 1.
  */
 static int findContact(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
         uvast toNode, time_t fromTime, IonCXref *copy)
@@ -111,8 +110,8 @@ static int findContact(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
 }
 
 /**
- * Cerca il range con chiave esatta (fromNode, toNode, fromTime).
- * Va chiamata con una transazione SDR gia' aperta.
+ * Looks up the range with the exact key (fromNode, toNode, fromTime).
+ * Must be called with an SDR transaction already open.
  */
 static int findRange(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
         uvast toNode, time_t fromTime, IonRXref *copy)
@@ -154,7 +153,7 @@ const char *ionc_outcome_name(IoncApplyOutcome outcome)
     case IONC_REVISED:  return "revised";
     case IONC_INSERTED: return "inserted";
     case IONC_REPLACED: return "replaced";
-    case IONC_LOST:     return "perso";
+    case IONC_LOST:     return "lost";
     default:            return "error";
     }
 }
@@ -180,8 +179,8 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
         return -1;
     }
 
-    /* sdr_begin_xn restituisce 1 in caso di successo e 0 in caso di
-     * fallimento: il confronto con < 0 non scatterebbe mai. */
+    /* sdr_begin_xn returns 1 on success and 0 on failure: a comparison
+     * against < 0 would never fire. */
     if (sdr_begin_xn(sdr) != 1) {
         return -1;
     }
@@ -200,8 +199,8 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
         unsigned int owlt = 0;
 
         if (count >= maxRecords) {
-            dtnex_log("Snapshot dei contatti pieno (%d): i restanti non "
-                    "verranno annunciati", maxRecords);
+            dtnex_log("Contact snapshot full (%d): the remaining contacts "
+                    "will not be announced", maxRecords);
             break;
         }
 
@@ -215,20 +214,20 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
             continue;
         }
 
-        /* Regola di autorita' (§4): annunciamo solo la nostra direzione. */
+        /* Authority rule (§4): we announce our own direction only. */
         if ((unsigned long) contact->fromNode != myNodeId) {
             continue;
         }
 
-        /* I contatti di registrazione (fromNode == toNode) non sono
-         * topologia: non vanno annunciati. */
+        /* Registration contacts (fromNode == toNode) are not topology:
+         * they must not be announced. */
         if (contact->fromNode == contact->toNode) {
             continue;
         }
 
-        /* Scheduled e Predicted sono le uniche finestre reali. In
-         * particolare i Discovered hanno toTime = MAX_POSIX_TIME e
-         * annunciarli propagherebbe un contatto eterno (§6.1 controllo 6). */
+        /* Scheduled and Predicted are the only real windows. Discovered
+         * contacts in particular have toTime = MAX_POSIX_TIME, and
+         * announcing them would propagate an eternal contact (§6.1 check 6). */
         if (contact->type != CtScheduled && contact->type != CtPredicted) {
             continue;
         }
@@ -237,13 +236,13 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
             continue;
         }
 
-        /* §3.4: senza range CGR scarta il contatto come next-hop, quindi
-         * annunciarlo genererebbe churn senza mai produrre una rotta. */
+        /* §3.4: without a range, CGR discards the contact as a next hop, so
+         * announcing it would generate churn without ever producing a route. */
         if (!findOwlt(ionwm, ionvdb, contact->fromNode, contact->toNode,
                 contact->fromTime, contact->toTime, &owlt)) {
             if (debugMode) {
-                dtnex_log("Contatto %lu→%lu (from %ld) senza range: non "
-                        "annunciato — controllare ionrc",
+                dtnex_log("Contact %lu→%lu (from %ld) has no range: not "
+                        "announced — check ionrc",
                         (unsigned long) contact->fromNode,
                         (unsigned long) contact->toNode,
                         (long) contact->fromTime);
@@ -268,77 +267,77 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
 
 /*
  * ---------------------------------------------------------------------------
- * Classificazione degli esiti delle rfx_*
+ * Classifying the outcomes of the rfx_* calls
  *
- * Contratto documentato in rfx.h:70-73 e confermato in ici/library/rfx.c:
- *   0  = successo
- *   -1 = errore di sistema (anomalia vera: ION e' rotto o irraggiungibile)
- *   >0 = errore utente, cioe' ION ha rifiutato la scrittura per una
- *        condizione locale che sa descrivere.
+ * Contract documented in rfx.h:70-73 and confirmed in ici/library/rfx.c:
+ *   0  = success
+ *   -1 = system error (a genuine anomaly: ION is broken or unreachable)
+ *   >0 = user error, i.e. ION refused the write because of a local
+ *        condition it is able to describe.
  *
- * Un errore utente NON e' un'anomalia. Il caso di gran lunga piu' frequente e'
- * il codice 9 di rfx_insert_contact: in un ionrc convenzionale entrambi i nodi
- * dichiarano entrambe le direzioni con tempi relativi, quindi il contatto che
- * il peer ci annuncia si sovrappone a quello che l'operatore ha gia'
- * configurato in locale, ma con un fromTime diverso. findContact cerca per
- * fromTime esatto e non puo' vederlo. La sovrapposizione e' lo stato
- * stazionario atteso, non un guasto: si logga a debug e si tira dritto.
+ * A user error is NOT an anomaly. By far the most frequent case is code 9 of
+ * rfx_insert_contact: in a conventional ionrc both nodes declare both
+ * directions using relative times, so the contact a peer announces to us
+ * overlaps the one the operator already configured locally, but with a
+ * different fromTime. findContact looks up an exact fromTime and cannot see
+ * it. The overlap is the expected steady state, not a fault: it is logged at
+ * debug level and we carry on.
  * ---------------------------------------------------------------------------
  */
 
-/* Significato dei codici > 0 di rfx_insert_contact (rfx.c:1411-1735). */
+/* Meaning of the > 0 codes of rfx_insert_contact (rfx.c:1411-1735). */
 static const char *insertContactUserError(int rc)
 {
     switch (rc) {
-    case 1: return "region 0 non ammessa";
-    case 2: return "fromNode 0 non ammesso";
-    case 3: return "toNode 0 non ammesso";
-    case 4: return "confidence fuori range rifiutata da ION";
-    case 5: return "xmitRate nullo rifiutato da ION";
-    case 6: return "toTime precedente a fromTime";
-    case 7: return "region non corrispondente: dtnex e' mono-region (region 1)";
-    case 8: return "il contatto ipotetico corrispondente risulta gia' scoperto";
-    case 9: return "si sovrappone a un contatto configurato localmente; "
-                   "si mantiene quello locale";
-    default: return "condizione locale non catalogata";
+    case 1: return "region 0 not allowed";
+    case 2: return "fromNode 0 not allowed";
+    case 3: return "toNode 0 not allowed";
+    case 4: return "confidence out of range, refused by ION";
+    case 5: return "zero xmitRate refused by ION";
+    case 6: return "toTime earlier than fromTime";
+    case 7: return "region mismatch: dtnex is single-region (region 1)";
+    case 8: return "the corresponding hypothetical contact is already discovered";
+    case 9: return "overlaps a locally configured contact; "
+                   "the local one is kept";
+    default: return "uncatalogued local condition";
     }
 }
 
-/* Significato dei codici > 0 di rfx_revise_contact (rfx.c:1758-1866). */
+/* Meaning of the > 0 codes of rfx_revise_contact (rfx.c:1758-1866). */
 static const char *reviseContactUserError(int rc)
 {
     switch (rc) {
-    case 1: return "il contatto bersaglio non esiste piu'";
-    case 2: return "il contatto bersaglio non e' Scheduled";
-    default: return "condizione locale non catalogata";
+    case 1: return "the target contact no longer exists";
+    case 2: return "the target contact is not Scheduled";
+    default: return "uncatalogued local condition";
     }
 }
 
-/* Significato dei codici > 0 di rfx_insert_range (rfx.c:2539-2685).
- * Il codice 1 non passa mai di qui: ION lo commenta come idempotente ed e'
- * trattato come successo dal chiamante. */
+/* Meaning of the > 0 codes of rfx_insert_range (rfx.c:2539-2685).
+ * Code 1 never reaches this function: ION documents it as idempotent and the
+ * caller treats it as success. */
 static const char *insertRangeUserError(int rc)
 {
     switch (rc) {
-    case 1: return "range gia' asserito con lo stesso owlt (idempotente)";
-    case 2: return "owlt diverso su un range gia' asserito: ION non lo revisiona";
-    case 3: return "si sovrappone alla fine di un range gia' presente";
-    case 4: return "si sovrappone all'inizio di un range gia' presente";
-    default: return "condizione locale non catalogata";
+    case 1: return "range already asserted with the same owlt (idempotent)";
+    case 2: return "different owlt on an already asserted range: ION will not revise it";
+    case 3: return "overlaps the end of an existing range";
+    case 4: return "overlaps the start of an existing range";
+    default: return "uncatalogued local condition";
     }
 }
 
-/* rfx_remove_contact e rfx_remove_range oggi restituiscono solo 0 o -1; il
- * ramo > 0 esiste per non dipendere da quel dettaglio di implementazione. */
+/* rfx_remove_contact and rfx_remove_range currently return only 0 or -1; the
+ * > 0 branch exists so as not to depend on that implementation detail. */
 static const char *removeUserError(int rc)
 {
     (void) rc;
-    return "condizione locale non catalogata";
+    return "uncatalogued local condition";
 }
 
 /**
- * Ramo di errore utente: log a debug con il significato del codice.
- * Non e' un errore, non interrompe la sequenza di scritture.
+ * User-error branch: debug log carrying the meaning of the code.
+ * This is not an error and does not interrupt the sequence of writes.
  */
 static void noteUserError(int debugMode, const char *op, const ContactRecord *rec,
         int rc, const char *meaning)
@@ -347,20 +346,20 @@ static void noteUserError(int debugMode, const char *op, const ContactRecord *re
         return;
     }
 
-    dtnex_log("[ion] %s %lu→%lu (from %ld): ION ha rifiutato con codice %d — %s",
+    dtnex_log("[ion] %s %lu→%lu (from %ld): ION refused with code %d — %s",
             op, rec->fromNode, rec->toNode, (long) rec->fromTime, rc, meaning);
 }
 
 /**
- * Riscontro incrociato sull'indirizzo restituito: rfx.h:62-63 documenta
- * *cxaddr / *rxaddr a 0 come conferma del rifiuto.
+ * Cross-check on the returned address: rfx.h:62-63 documents *cxaddr /
+ * *rxaddr left at 0 as confirmation of the refusal.
  *
- * Nel sorgente di ION la conferma vale per tutti i codici tranne quelli emessi
- * dalla scansione dei conflitti — rfx_insert_contact 8 e 9, rfx_insert_range 1
- * e 2 — dove l'indirizzo lasciato e' quello della voce in conflitto e un
- * valore non nullo e' quindi atteso. Fuori da quei casi una divergenza
- * significa che la libreria installata ha un contratto diverso da quello
- * documentato, e va detto.
+ * In ION's source that confirmation holds for every code except those emitted
+ * by the conflict scan — rfx_insert_contact 8 and 9, rfx_insert_range 1 and 2
+ * — where the address left behind is that of the conflicting entry, so a
+ * non-zero value is expected there. Outside those cases a divergence means
+ * the installed library has a different contract from the documented one,
+ * and that deserves to be said.
  */
 static void checkRejectAddr(int debugMode, const char *op, int rc,
         PsmAddress addr, int addrExpectedSet)
@@ -370,17 +369,17 @@ static void checkRejectAddr(int debugMode, const char *op, int rc,
     }
 
     if (addr != 0) {
-        dtnex_log("[ion] %s: rifiuto con codice %d ma indirizzo restituito "
-                "non nullo (0x%lx) — il contratto della libreria installata "
-                "differisce da rfx.h", op, rc, (unsigned long) addr);
+        dtnex_log("[ion] %s: refused with code %d but the returned address is "
+                "non-zero (0x%lx) — the contract of the installed library "
+                "differs from rfx.h", op, rc, (unsigned long) addr);
     }
 }
 
 /**
- * Riga di log [ion] con lo stato raggiunto fino a quel punto. Chiamata sia
- * al termine normale di ionc_apply_contact sia sui rami di errore, cosi'
- * uno stato parziale (es. contatto scritto, range fallito) resta visibile
- * in debug invece di sparire dietro un return anticipato.
+ * The [ion] log line carrying the state reached so far. Called both on the
+ * normal completion of ionc_apply_contact and on the error branches, so that
+ * a partial state (e.g. contact written, range failed) stays visible under
+ * debug instead of disappearing behind an early return.
  */
 static void logApplyOutcome(int debugMode, const ContactRecord *rec,
         IoncApplyOutcome contactOutcome, IoncApplyOutcome rangeOutcome)
@@ -389,7 +388,7 @@ static void logApplyOutcome(int debugMode, const ContactRecord *rec,
         return;
     }
 
-    dtnex_log("[ion] %lu→%lu from=%ld to=%ld: contatto=%s range=%s",
+    dtnex_log("[ion] %lu→%lu from=%ld to=%ld: contact=%s range=%s",
             rec->fromNode, rec->toNode, (long) rec->fromTime,
             (long) rec->toTime, ionc_outcome_name(contactOutcome),
             ionc_outcome_name(rangeOutcome));
@@ -423,9 +422,9 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         return IONC_ERROR;
     }
 
-    /* Fase 1: controllo di esistenza, sotto transazione (§6.4). */
-    /* sdr_begin_xn restituisce 1 in caso di successo e 0 in caso di
-     * fallimento: il confronto con < 0 non scatterebbe mai. */
+    /* Phase 1: existence check, inside a transaction (§6.4). */
+    /* sdr_begin_xn returns 1 on success and 0 on failure: a comparison
+     * against < 0 would never fire. */
     if (sdr_begin_xn(sdr) != 1) {
         return IONC_ERROR;
     }
@@ -444,20 +443,20 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
 
     sdr_exit_xn(sdr);
 
-    /* Fase 2: scritture. Le rfx_* aprono la propria transazione, quindi
-     * vanno chiamate a transazione chiusa. */
+    /* Phase 2: writes. The rfx_* calls open their own transaction, so they
+     * must be called with no transaction open. */
 
-    /* Nota: sul lato contatto un errore utente non interrompe la sequenza.
-     * Si prosegue fino alla scrittura del range, che e' indipendente: un
-     * rifiuto locale del contatto non deve impedire a ION di imparare l'OWLT. */
+    /* Note: on the contact side a user error does not interrupt the sequence.
+     * We carry on to the range write, which is independent: a local refusal
+     * of the contact must not stop ION from learning the OWLT. */
 
     if (!haveContact) {
         rc = rfx_insert_contact(IONC_DEFAULT_REGION, rec->fromTime, rec->toTime,
                 (uvast) rec->fromNode, (uvast) rec->toNode,
                 (size_t) rec->xmitRate, confidence, &cxaddr, 0);
         if (rc < 0) {
-            dtnex_log("⚠️  Anomalia: rfx_insert_contact %lu→%lu (from %ld) ha "
-                    "restituito %d", rec->fromNode, rec->toNode,
+            dtnex_log("⚠️  Anomaly: rfx_insert_contact %lu→%lu (from %ld) "
+                    "returned %d", rec->fromNode, rec->toNode,
                     (long) rec->fromTime, rc);
             contactOutcome = IONC_ERROR;
             logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
@@ -467,25 +466,25 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
                     insertContactUserError(rc));
             checkRejectAddr(debugMode, "rfx_insert_contact", rc, cxaddr,
                     (rc == 8 || rc == 9));
-            /* Nessuna scrittura: la fase contatto resta un no-op. */
+            /* Nothing written: the contact phase stays a no-op. */
         } else {
             contactOutcome = IONC_INSERTED;
         }
     } else if (existingContact.toTime != rec->toTime) {
-        /* Finestra cambiata: rimozione MIRATA per fromTime esatto. */
+        /* Window changed: TARGETED removal by exact fromTime. */
         key = rec->fromTime;
         rc = rfx_remove_contact(IONC_DEFAULT_REGION, &key,
                 (uvast) rec->fromNode, (uvast) rec->toNode, 0);
         if (rc < 0) {
-            dtnex_log("⚠️  Anomalia: rfx_remove_contact %lu→%lu (from %ld) ha "
-                    "restituito %d", rec->fromNode, rec->toNode,
+            dtnex_log("⚠️  Anomaly: rfx_remove_contact %lu→%lu (from %ld) "
+                    "returned %d", rec->fromNode, rec->toNode,
                     (long) rec->fromTime, rc);
             contactOutcome = IONC_ERROR;
             logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         } else if (rc > 0) {
-            /* La rimozione non e' avvenuta: reinserire adesso troverebbe la
-             * voce vecchia e verrebbe rifiutato. Si lascia ION com'e'. */
+            /* The removal did not happen: re-inserting now would find the old
+             * entry and be refused. ION is left as it is. */
             noteUserError(debugMode, "rfx_remove_contact", rec, rc,
                     removeUserError(rc));
         } else {
@@ -493,24 +492,23 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
                     rec->toTime, (uvast) rec->fromNode, (uvast) rec->toNode,
                     (size_t) rec->xmitRate, confidence, &cxaddr, 0);
             if (rc < 0) {
-                dtnex_log("⚠️  Anomalia: rfx_insert_contact (dopo remove) %lu→%lu "
-                        "ha restituito %d", rec->fromNode, rec->toNode, rc);
+                dtnex_log("⚠️  Anomaly: rfx_insert_contact (after remove) %lu→%lu "
+                        "returned %d", rec->fromNode, rec->toNode, rc);
                 contactOutcome = IONC_ERROR;
                 logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
                 return IONC_ERROR;
             } else if (rc > 0) {
-                /* La remove e' andata a buon fine ma la insert e' stata
-                 * rifiutata: la voce vecchia e' sparita da ION e non e'
-                 * stata rimpiazzata. A differenza di una insert rifiutata a
-                 * secco, qui ION e' peggiorato: va loggato sempre, non solo
-                 * in debug. */
-                dtnex_log("⚠️  Anomalia: rfx_insert_contact (dopo remove) "
-                        "%lu→%lu (from %ld) rifiutato con codice %d — %s: "
-                        "il contatto precedente e' stato rimosso e non "
-                        "sostituito",
+                /* The remove succeeded but the insert was refused: the old
+                 * entry is gone from ION and was not replaced. Unlike a plain
+                 * refused insert, here ION got worse: this is always logged,
+                 * not only under debug. */
+                dtnex_log("⚠️  Anomaly: rfx_insert_contact (after remove) "
+                        "%lu→%lu (from %ld) refused with code %d — %s: "
+                        "the previous contact was removed and not "
+                        "replaced",
                         rec->fromNode, rec->toNode, (long) rec->fromTime, rc,
                         insertContactUserError(rc));
-                checkRejectAddr(debugMode, "rfx_insert_contact (dopo remove)",
+                checkRejectAddr(debugMode, "rfx_insert_contact (after remove)",
                         rc, cxaddr, (rc == 8 || rc == 9));
                 contactOutcome = IONC_LOST;
             } else {
@@ -520,12 +518,12 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
     } else if ((unsigned long) existingContact.xmitRate != rec->xmitRate
             || existingContact.confidence < confidence - 0.005f
             || existingContact.confidence > confidence + 0.005f) {
-        /* Solo xmitRate/confidence: revisione in place. */
+        /* Only xmitRate/confidence differ: revise in place. */
         rc = rfx_revise_contact(IONC_DEFAULT_REGION, rec->fromTime,
                 (uvast) rec->fromNode, (uvast) rec->toNode,
                 (size_t) rec->xmitRate, confidence, 0);
         if (rc < 0) {
-            dtnex_log("⚠️  Anomalia: rfx_revise_contact %lu→%lu ha restituito %d",
+            dtnex_log("⚠️  Anomaly: rfx_revise_contact %lu→%lu returned %d",
                     rec->fromNode, rec->toNode, rc);
             contactOutcome = IONC_ERROR;
             logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
@@ -538,21 +536,21 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         }
     }
 
-    /* Range: stessa struttura, ma rfx_revise_range non esiste (§6.3). */
+    /* Range: same structure, but rfx_revise_range does not exist (§6.3). */
     if (!haveRange) {
         rc = rfx_insert_range(rec->fromTime, rec->toTime,
                 (uvast) rec->fromNode, (uvast) rec->toNode, rec->owlt,
                 &rxaddr, 0);
         if (rc < 0) {
-            dtnex_log("⚠️  Anomalia: rfx_insert_range %lu→%lu ha restituito %d",
+            dtnex_log("⚠️  Anomaly: rfx_insert_range %lu→%lu returned %d",
                     rec->fromNode, rec->toNode, rc);
             rangeOutcome = IONC_ERROR;
             logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         } else if (rc == 1) {
-            /* ION commenta esplicitamente questo caso come idempotente: il
-             * range c'e' gia' con lo stesso owlt. E' un successo, non un
-             * rifiuto — la fase range e' un no-op. */
+            /* ION explicitly documents this case as idempotent: the range is
+             * already there with the same owlt. It is a success, not a
+             * refusal — the range phase is a no-op. */
             rangeOutcome = IONC_NOOP;
         } else if (rc > 0) {
             noteUserError(debugMode, "rfx_insert_range", rec, rc,
@@ -568,13 +566,13 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         rc = rfx_remove_range(&key, (uvast) rec->fromNode,
                 (uvast) rec->toNode, 0);
         if (rc < 0) {
-            dtnex_log("⚠️  Anomalia: rfx_remove_range %lu→%lu ha restituito %d",
+            dtnex_log("⚠️  Anomaly: rfx_remove_range %lu→%lu returned %d",
                     rec->fromNode, rec->toNode, rc);
             rangeOutcome = IONC_ERROR;
             logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
             return IONC_ERROR;
         } else if (rc > 0) {
-            /* Come sopra: senza rimozione il reinserimento verrebbe rifiutato. */
+            /* As above: without the removal, re-insertion would be refused. */
             noteUserError(debugMode, "rfx_remove_range", rec, rc,
                     removeUserError(rc));
         } else {
@@ -582,24 +580,24 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
                     (uvast) rec->fromNode, (uvast) rec->toNode, rec->owlt,
                     &rxaddr, 0);
             if (rc < 0) {
-                dtnex_log("⚠️  Anomalia: rfx_insert_range (dopo remove) %lu→%lu ha "
-                        "restituito %d", rec->fromNode, rec->toNode, rc);
+                dtnex_log("⚠️  Anomaly: rfx_insert_range (after remove) %lu→%lu "
+                        "returned %d", rec->fromNode, rec->toNode, rc);
                 rangeOutcome = IONC_ERROR;
                 logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
                 return IONC_ERROR;
             } else if (rc == 1) {
                 rangeOutcome = IONC_NOOP;
             } else if (rc > 0) {
-                /* Come sopra per il contatto: la remove e' riuscita, la
-                 * insert no. Il range precedente e' sparito da ION e non e'
-                 * stato rimpiazzato: va loggato sempre, non solo in debug. */
-                dtnex_log("⚠️  Anomalia: rfx_insert_range (dopo remove) "
-                        "%lu→%lu (from %ld) rifiutato con codice %d — %s: "
-                        "il range precedente e' stato rimosso e non "
-                        "sostituito",
+                /* As above for the contact: the remove succeeded, the insert
+                 * did not. The previous range is gone from ION and was not
+                 * replaced: this is always logged, not only under debug. */
+                dtnex_log("⚠️  Anomaly: rfx_insert_range (after remove) "
+                        "%lu→%lu (from %ld) refused with code %d — %s: "
+                        "the previous range was removed and not "
+                        "replaced",
                         rec->fromNode, rec->toNode, (long) rec->fromTime, rc,
                         insertRangeUserError(rc));
-                checkRejectAddr(debugMode, "rfx_insert_range (dopo remove)", rc,
+                checkRejectAddr(debugMode, "rfx_insert_range (after remove)", rc,
                         rxaddr, (rc == 1 || rc == 2));
                 rangeOutcome = IONC_LOST;
             } else {
@@ -629,8 +627,8 @@ int ionc_print_contact_table(int debugMode)
         return -1;
     }
 
-    /* sdr_begin_xn restituisce 1 in caso di successo e 0 in caso di
-     * fallimento: il confronto con < 0 non scatterebbe mai. */
+    /* sdr_begin_xn returns 1 on success and 0 on failure: a comparison
+     * against < 0 would never fire. */
     if (sdr_begin_xn(sdr) != 1) {
         return -1;
     }
@@ -732,8 +730,8 @@ int ionc_check_alive(unsigned long expectedNodeId)
         return -1;
     }
 
-    /* sdr_begin_xn restituisce 1 in caso di successo e 0 in caso di
-     * fallimento: il confronto con < 0 non scatterebbe mai. */
+    /* sdr_begin_xn returns 1 on success and 0 on failure: a comparison
+     * against < 0 would never fire. */
     if (sdr_begin_xn(sdr) != 1) {
         return -1;
     }
@@ -744,11 +742,11 @@ int ionc_check_alive(unsigned long expectedNodeId)
         return -1;
     }
 
-    /* Si legge solo il campo ownNodeNbr, non l'intera IonDB: la sizeof(IonDB)
-     * degli header del bundle non coincide con quella della libreria ION
-     * installata, quindi leggere l'intera struct sarebbe un over-read oltre
-     * la fine dell'oggetto in SDR. ownNodeNbr è il primo campo della struct,
-     * il suo offset coincide nei due layout. */
+    /* Only the ownNodeNbr field is read, not the whole IonDB: the
+     * sizeof(IonDB) of the bundled headers does not match that of the
+     * installed ION library, so reading the entire struct would over-read
+     * past the end of the object in SDR. ownNodeNbr is the first field of the
+     * struct, so its offset is the same in both layouts. */
     sdr_read(sdr, (char *) &ownNodeNbr, iondbObject + offsetof(IonDB, ownNodeNbr), sizeof(ownNodeNbr));
     sdr_exit_xn(sdr);
 

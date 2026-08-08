@@ -26,7 +26,7 @@ obsolete/
 .superpowers/
 
 # Project documentation (local only)
-# L'unico documento di progetto pubblicato e' docs/spec_dtnex_v3.md
+# The only project document that ships publicly is docs/spec_dtnex_v3.md
 CLAUDE.md
 docs/superpowers/
 session_notes.md

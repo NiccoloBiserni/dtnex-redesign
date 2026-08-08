@@ -1,11 +1,11 @@
 /**
  * ion_contacts.h
- * DTNEX - accesso a ION per contatti e range.
+ * DTNEX - access to ION for contacts and ranges.
  *
- * Confine del modulo (design §8.1): questo modulo parla SOLO con ION.
- * Non conosce CBOR, bundle, HMAC, vicini o flooding. Se l'encoding
- * finisce qui dentro, il modulo smette di essere verificabile da solo
- * e si perde l'unica ragione per cui esiste.
+ * Module boundary (design §8.1): this module talks ONLY to ION. It knows
+ * nothing about CBOR, bundles, HMAC, neighbours or flooding. If encoding
+ * ever leaks in here, the module stops being verifiable on its own and the
+ * only reason it exists is lost.
  */
 
 #ifndef ION_CONTACTS_H
@@ -13,21 +13,21 @@
 
 #include <time.h>
 
-/* Region in cui vengono inseriti i contatti ricevuti dalla rete.
- * dtnex e' mono-region per scelta di design (§5.3): regionNbr non viaggia
- * sul filo, il ricevente usa sempre la propria region di default. */
+/* Region into which contacts received from the network are inserted.
+ * dtnex is single-region by design (§5.3): regionNbr never travels on the
+ * wire, so the receiver always uses its own default region. */
 #define IONC_DEFAULT_REGION 1
 
-/* Dimensione massima di uno snapshot di contatti annunciabili. */
+/* Maximum size of a snapshot of announceable contacts. */
 #define IONC_MAX_CONTACTS 200
 
 /**
- * Un contatto con il suo range, nelle unita' di ION:
- *   fromTime/toTime : epoch UNIX assoluti
- *   xmitRate        : byte al secondo
- *   confidence      : percentuale 0-100 (ION usa un float 0.0-1.0;
- *                     cbor.h non sa codificare i float, §5.3)
- *   owlt            : secondi
+ * A contact together with its range, in ION's own units:
+ *   fromTime/toTime : absolute UNIX epoch
+ *   xmitRate        : bytes per second
+ *   confidence      : percentage 0-100 (ION uses a 0.0-1.0 float;
+ *                     cbor.h cannot encode floats, §5.3)
+ *   owlt            : seconds
  */
 typedef struct {
     unsigned long fromNode;
@@ -40,67 +40,69 @@ typedef struct {
 } ContactRecord;
 
 /**
- * Legge da ION i contatti annunciabili dal nodo locale.
+ * Reads from ION the contacts the local node is allowed to announce.
  *
- * Filtri applicati (§3.2, §3.4):
- *   - fromNode == myNodeId          (regola di autorita', §4)
- *   - toNode != fromNode            (esclude i contatti di registrazione)
+ * Filters applied (§3.2, §3.4):
+ *   - fromNode == myNodeId          (authority rule, §4)
+ *   - toNode != fromNode            (excludes registration contacts)
  *   - type in {CtScheduled, CtPredicted}
- *   - toTime > adesso               (i contatti scaduti non si annunciano)
- *   - esiste un range corrispondente da cui ricavare l'owlt
+ *   - toTime > now                  (expired contacts are not announced)
+ *   - a matching range exists, to derive the owlt from
  *
- * Ritorna il numero di record scritti in out, oppure -1 se ION non e'
- * accessibile (SDR, vdb o working memory non disponibili).
+ * Returns the number of records written to out, or -1 if ION is not
+ * reachable (SDR, vdb or working memory unavailable).
  */
 int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
         int maxRecords, int debugMode);
 
 /**
- * Esito dell'applicazione di un contatto ricevuto. Ordine di severita'
- * crescente: se contatto e range danno esiti diversi si riporta il piu' alto.
+ * Outcome of applying a received contact. Listed in increasing order of
+ * severity: if the contact and the range yield different outcomes, the
+ * higher one is reported.
  */
 typedef enum {
-    IONC_NOOP = 0,      /* ION era gia' allineato: nessuna scrittura */
-    IONC_REVISED,       /* xmitRate/confidence aggiornati in place */
-    IONC_INSERTED,      /* contatto e/o range nuovi */
-    IONC_REPLACED,      /* finestra cambiata: remove mirato + insert */
-    IONC_LOST,          /* remove riuscita ma la insert successiva e' stata
-                          * rifiutata da ION: la voce vecchia e' sparita e non
-                          * e' stata rimpiazzata, quindi la topologia in ION e'
-                          * peggiorata rispetto a prima della chiamata */
-    IONC_ERROR          /* fallimento di una rfx_*: stato di ION inatteso */
+    IONC_NOOP = 0,      /* ION was already in sync: nothing was written */
+    IONC_REVISED,       /* xmitRate/confidence updated in place */
+    IONC_INSERTED,      /* contact and/or range are new */
+    IONC_REPLACED,      /* window changed: targeted remove + insert */
+    IONC_LOST,          /* the remove succeeded but the following insert was
+                          * rejected by ION: the old entry is gone and was not
+                          * replaced, so the topology held by ION is worse than
+                          * it was before the call */
+    IONC_ERROR          /* an rfx_* call failed: unexpected ION state */
 } IoncApplyOutcome;
 
 /**
- * Applica in ION il contatto ricevuto e il suo range, con identita'
- * (regione locale, fromNode, toNode, fromTime) (§6.2-6.3).
+ * Applies the received contact and its range to ION, keyed by identity
+ * (local region, fromNode, toNode, fromTime) (§6.2-6.3).
  *
- * Idempotente: se ION contiene gia' esattamente questo contatto non viene
- * eseguita nessuna scrittura. Le rimozioni passano SEMPRE il puntatore al
- * fromTime esatto, mai NULL: con NULL ION applica lo scope '*' e cancella
- * tutti i contatti della coppia, inclusi quelli configurati dall'operatore.
+ * Idempotent: if ION already holds exactly this contact, nothing is
+ * written. Removals ALWAYS pass a pointer to the exact fromTime, never
+ * NULL: with NULL, ION applies the '*' scope and deletes every contact
+ * between the pair, including those configured by the operator.
  */
 IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode);
 
-/* Nome leggibile dell'esito, per i log. */
+/* Human-readable name of the outcome, for logging. */
 const char *ionc_outcome_name(IoncApplyOutcome outcome);
 
 /**
- * Stampa la tabella diagnostica dei contatti presenti in ION (tutti, non
- * solo i nostri). Ritorna il numero di contatti, -1 se ION non e'
- * accessibile. La stampa dettagliata avviene solo con debugMode != 0.
+ * Prints the diagnostic table of the contacts held by ION (all of them,
+ * not just ours). Returns the number of contacts, or -1 if ION is not
+ * reachable. The detailed dump is produced only when debugMode != 0.
  */
 int ionc_print_contact_table(int debugMode);
 
 /**
- * Verifica che ION sia vivo e che sia ancora la stessa istanza: legge
- * ownNodeNbr dall'IonDB e lo confronta con quello atteso.
+ * Checks that ION is alive and is still the same instance: reads
+ * ownNodeNbr from the IonDB and compares it against the expected value.
  *
- * Ritorna 1 se ION e' vivo e coerente, 0 se e' ripartito o riconfigurato
- * con un altro node number, -1 se non e' accessibile (§6.6).
+ * Returns 1 if ION is alive and consistent, 0 if it restarted or was
+ * reconfigured with a different node number, -1 if it is not reachable
+ * (§6.6).
  *
- * NON usare "zero contatti" come indizio di restart: un nodo appena
- * avviato o di bordo ha legittimamente zero contatti.
+ * Do NOT use "zero contacts" as a hint of a restart: a freshly started or
+ * edge node legitimately has zero contacts.
  */
 int ionc_check_alive(unsigned long expectedNodeId);
 

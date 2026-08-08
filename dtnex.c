@@ -16,74 +16,82 @@
 // Global variables
 volatile int running = 1;
 /*
-    variabile di flag che tiene in vita il loop, volatile perché a modificarla è signalWaitThread,
-    un thread diverso da quello che esegue il loop: viene settata a 0 quando arriva un segnale
-    (SIGINT/SIGTERM/SIGTSTP), così il loop principale termina ordinatamante
+    Flag that keeps the main loop alive. It is volatile because the thread that
+    modifies it, signalWaitThread, is not the one running the loop: it is set to
+    0 when a signal arrives (SIGINT/SIGTERM/SIGTSTP), so that the main loop
+    terminates in an orderly fashion.
 */
-volatile int ionConnected = 0;  // Global ION connection status, volatile perché può cambiare in modo asincrono (es. se ION si riavvia mentre DTNEX è in esecuzione)
+volatile int ionConnected = 0;  // Global ION connection status; volatile because it can change asynchronously (e.g. if ION restarts while DTNEX is running)
 volatile int ionRestartDetected = 0;  // Flag to trigger complete restart
-/* 
-    Se viene settatto a 1, dtnex non esce semplicemente dal loop, ma invoca restartDtnex() che fa un execv del
-    processo su se stesso, non crea processi figli, sostituisce semplicemente l'immagine
+/*
+    If set to 1, dtnex does not simply leave the loop: it calls restartDtnex(),
+    which execv()s the process onto itself. No child process is created, the
+    process image is simply replaced.
 */
 static char **original_argv = NULL;  // Store original argv for restart
 static int original_argc = 0;        // Store original argc for restart
-/* Variabili con cui lanciare l'execv, vengono salvate all'inizio del main()*/
+/* Arguments used to perform the execv; they are saved at the top of main(). */
 BpSAP sap;
 /*
-    Bundle Protocol Service Access Point (SAP) handle principale verso il layer BP di ION. come una socket, ma per
-    bundle DTN, si ottiene con bp_open() e si usa per inviare e ricevere bundle. 
-    Viene usato in tutto il codice per tutte le operazioni BP,
+    Bundle Protocol Service Access Point (SAP): the main handle onto ION's BP
+    layer. It behaves like a socket, but for DTN bundles; it is obtained from
+    bp_open() and used to send and receive bundles. Used throughout the code
+    for every BP operation.
 */
 Sdr sdr;
 /*
-    handle per la accedere alla memoria persistente di ION condivisa di ION, non usa malloc standard
+    Handle used to access ION's shared persistent memory, which does not go
+    through the standard malloc.
 */
 
-// Cache per duplicazione dei messaggi
+// Message deduplication cache
 HashCache hashCache[MAX_HASH_CACHE];
 int hashCacheCount = 0;
-/* 
-    Serve per la deduplicazione dei messaggi processati, ogni messaggio ricevuto viene hashato e confrontato con
-    gli hash già salvati, se viene trovato un hash uguale, significa che è un messaggio duplicato e viene scartato.
+/*
+    Used to deduplicate processed messages: every received message is hashed
+    and compared against the hashes already stored. A matching hash means the
+    message is a duplicate, and it is discarded.
  */
 NonceCache nonceCache[MAX_HASH_CACHE]; // For CBOR replay protection
 int nonceCacheCount = 0;
-/* 
-    Stessa cosa però per i nonce, serve per evitare il replay dei messaggi, la cache tiene traccia di (nonce, origin), 
-    se un attaccante ad esempio intercetta e reinvia un messaggio già processato viene scartato 
+/*
+    The same, but for nonces: this guards against message replay. The cache
+    tracks (nonce, origin) pairs, so that a message intercepted and re-sent by
+    an attacker after it has already been processed is discarded.
 */
 
 NodeMetadata nodeMetadataList[MAX_PLANS];
 int nodeMetadataCount = 0;
-/*  
-    "rubrica locale", nodeId + metadata. Quando arriva un messaggio di tipo metadata, viene aggiornato con 
-    updateNodeMetadata(), poi consultato per in getContacts().
+/*
+    A local "address book" of nodeId + metadata. It is updated by
+    updateNodeMetadata() when a metadata message arrives, and then consulted
+    in getContacts().
 */
 
 BpechoState bpechoState;   // Bpecho service state
 pthread_t bpechoThread;    // Thread for bpecho service
-/* 
-    Gestione del servizio di echo, BpechoState è una struttua che tiene lo stato, un sap e un attendant.
+/*
+    Echo service management. BpechoState is a struct holding the state, a sap
+    and an attendant.
 */
 
 BundleReceptionState bundleReceptionState;  // Bundle reception service state
-/* 
-    Gestione del thread di ricezione dei bundle, BundleReceptionState è una struttura che tiene lo stato,
-    la config e l'identificatore del thread.
+/*
+    Bundle reception thread management. BundleReceptionState is a struct
+    holding the state, the config and the thread identifier.
 */
 
-/* "Il thread e' stato creato" e' un fatto diverso da "il thread deve continuare
- * a girare": il secondo viene azzerato per CHIEDERE l'arresto, quindi non puo'
- * fare da guardia alla join, o la join verrebbe saltata proprio quando serve.
- * Ciascun thread puo' nascere in due punti: all'avvio in main() se ION e' gia'
- * raggiungibile, oppure dentro eventDrivenLoop() dopo una riconnessione a ION
- * avvenuta più tardi. Il flag va alzato in entrambi i punti, altrimenti un
- * thread nato solo per riconnessione non verrebbe mai atteso in join. */
+/* "The thread has been created" is a different fact from "the thread should
+ * keep running": the latter is cleared in order to REQUEST shutdown, so it
+ * cannot guard the join, or the join would be skipped exactly when it is
+ * needed. Each thread can be born at two points: at startup in main(), if ION
+ * is already reachable, or inside eventDrivenLoop() after a later reconnection
+ * to ION. The flag must be raised at both points, otherwise a thread born only
+ * from a reconnection would never be joined. */
 int bpechoThreadStarted = 0;
 int bundleReceptionThreadStarted = 0;
 
-pthread_t signalThread;    /* Thread dedicato alla raccolta dei segnali via sigwait */
+pthread_t signalThread;    /* Thread dedicated to collecting signals via sigwait */
 
 /**
  * Logging helper function with color support
@@ -124,9 +132,9 @@ void debug_log(DtnexConfig *config, const char *format, ...) {
     fflush(stdout);
 }
 
-/* Strumentazione di analisi su file. Resta spenta finche' loadConfig non
- * accerta debugMode: senza debug non deve esistere nessun dtnex_debug.log,
- * altrimenti in --service il file cresce senza fine. */
+/* File-based analysis instrumentation. It stays off until loadConfig has
+ * established debugMode: with debug disabled no dtnex_debug.log must exist at
+ * all, otherwise under --service the file would grow without bound. */
 static int dtnexDbgToFile = 0;
 
 static void dtnex_dbg(const char *fmt, ...) {
@@ -220,13 +228,13 @@ void log_contact_update(DtnexConfig *config, int contactCount) {
  */
 void loadConfig(DtnexConfig *config) {
     // Set defaults
-    config->updateInterval = DEFAULT_UPDATE_INTERVAL; // 600, 10 minuti tra un update e l'altro
-    config->contactLifetime = DEFAULT_CONTACT_LIFETIME; // 3600, 1 ora di validità dei contatti
-    config->bundleTTL = DEFAULT_BUNDLE_TTL; // 1800, 30 minuti di TTL per i bundle (3x update interval)
+    config->updateInterval = DEFAULT_UPDATE_INTERVAL; // 600, i.e. 10 minutes between updates
+    config->contactLifetime = DEFAULT_CONTACT_LIFETIME; // 3600, i.e. 1 hour of contact validity
+    config->bundleTTL = DEFAULT_BUNDLE_TTL; // 1800, i.e. 30 minutes of bundle TTL (3x update interval)
     strcpy(config->presSharedNetworkKey, DEFAULT_PRESHARED_KEY);
     sprintf(config->serviceNr, "%d", DEFAULT_SERVICE_NR);
     sprintf(config->bpechoServiceNr, "%d", DEFAULT_BPECHO_SERVICE_NR);
-    config->nodeId = 0; // viene settato a 0 perché il nodo non conosce ancora il proprio ID finché non si connette a ION, poi viene aggiornato in tryConnectToIon(
+    config->nodeId = 0; // set to 0 because the node does not know its own ID until it connects to ION; it is then updated in tryConnectToIon()
     memset(config->nodemetadata, 0, MAX_METADATA_LENGTH);
     config->createGraph = 0;
     strcpy(config->graphFile, "contactGraph.png");
@@ -330,9 +338,10 @@ void loadConfig(DtnexConfig *config) {
         dtnex_log("No dtnex.conf found, using f settings (no metadata exchange)");
     }
 
-    /* dtnex_dbg e' static e non vede DtnexConfig: gli passiamo qui l'unico
-     * dato che gli serve. Prima di questo punto la strumentazione su file e'
-     * spenta, quindi nessun dtnex_debug.log viene creato senza debugMode. */
+    /* dtnex_dbg is static and cannot see DtnexConfig: the single piece of
+     * information it needs is handed to it here. Before this point the
+     * file instrumentation is off, so no dtnex_debug.log is ever created
+     * without debugMode. */
     dtnexDbgToFile = config->debugMode;
 }
 
@@ -345,22 +354,23 @@ void loadConfig(DtnexConfig *config) {
  */
 
 /**
- * Questa funzione è il ponte tra DTNEX e ION. Si compone di 5 fasi sequenziali, dove ogni fallimento causa un
- * rollback pulito e ritorna -1, al contrario ritorna 0 e lascia DTNEX pronto a usare ION, ritorna 0.
+ * This function is the bridge between DTNEX and ION. It is made of 5 sequential
+ * phases; any failure performs a clean rollback and returns -1. On success it
+ * returns 0 and leaves DTNEX ready to use ION.
  */
 int tryConnectToIon(DtnexConfig *config) {
     char endpointId[MAX_EID_LENGTH];
     
     // Try to attach to ION BP system
     /**
-     * Aggancia il processo all'istanza di ION già in esecuzione
+     * Attaches the process to the already running ION instance.
      */
     if (bp_attach() < 0) {
         return -1;
     }
 
     /**
-     * Lettura del Node ID da ION,
+     * Reading the Node ID from ION.
      */
     
     // Get the node ID from ION configuration
@@ -377,18 +387,18 @@ int tryConnectToIon(DtnexConfig *config) {
     }
     
     // Get the node number from ION configuration
-    Object iondbObject = getIonDbObject(); //è il puntatore all'oggetto iondb nella SDR di ION
+    Object iondbObject = getIonDbObject(); // pointer to the iondb object inside ION's SDR
     if (iondbObject == 0) {
         sdr_exit_xn(ionsdr);
         bp_detach();
         return -1;
     }
 
-    /* Si legge solo il campo ownNodeNbr, non l'intera IonDB: la sizeof(IonDB)
-     * degli header del bundle non coincide con quella della libreria ION
-     * installata, quindi leggere l'intera struct sarebbe un over-read oltre
-     * la fine dell'oggetto in SDR. ownNodeNbr è il primo campo della struct,
-     * il suo offset coincide nei due layout. */
+    /* Only the ownNodeNbr field is read, not the whole IonDB: the
+     * sizeof(IonDB) of the bundled headers does not match that of the
+     * installed ION library, so reading the entire struct would over-read
+     * past the end of the object in SDR. ownNodeNbr is the first field of
+     * the struct, so its offset is the same in both layouts. */
     uvast ownNodeNbr;
     sdr_read(ionsdr, (char *) &ownNodeNbr, iondbObject + offsetof(IonDB, ownNodeNbr), sizeof(ownNodeNbr));
     config->nodeId = ownNodeNbr;
@@ -397,10 +407,10 @@ int tryConnectToIon(DtnexConfig *config) {
     /* ---- DEBUG: dump IonDB fields ---- */
     dtnex_dbg("[tryConnectToIon] IonDB dump after sdr_read:");
     dtnex_dbg("  ownNodeNbr = %lu", (unsigned long)ownNodeNbr);
-    /* Nessun altro campo di IonDB viene stampato: gli offset della struct nel
-     * bundle (include/ion/ion.h) non coincidono con quelli della libreria
-     * ION installata, quindi il valore letto a quell'offset non sarebbe
-     * quello del campo nominato (rischio §12.3 della spec di design). */
+    /* No other IonDB field is printed: the struct offsets in the bundled
+     * headers (include/ion/ion.h) do not match those of the installed ION
+     * library, so a value read at such an offset would not be the field it
+     * is named after (risk §12.3 of the design spec). */
     /* ---- END DEBUG ---- */
 
     if (config->nodeId == 0) {
@@ -415,7 +425,7 @@ int tryConnectToIon(DtnexConfig *config) {
     dtnex_log("Using endpoint: %s", endpointId);
     
     // Get the SDR
-    sdr = bp_get_sdr(); //sdr ottenuto non come getIonsdr() ma tramite bp_get_sdr() che è la funzione corretta per ottenere l'sdr da usare con BP
+    sdr = bp_get_sdr(); // obtained via bp_get_sdr() rather than getIonsdr(): this is the correct call for the SDR to be used with BP
     if (sdr == NULL) {
         bp_detach();
         return -1;
@@ -424,9 +434,10 @@ int tryConnectToIon(DtnexConfig *config) {
     // First try to add/register the endpoint in ION's routing database
 
     /**
-     * addEndpoint() è una api di ION che aggiunge l'EID al database di routing. Dice ad ION che se arriva un bundle a
-     * questo EID, deve essere messo in coda qui, non discardBundle. Se fallisce, non fatale, perché vuole dire che
-     * l'endpoint era già registrato da avvii precedenti.
+     * addEndpoint() is an ION API that adds the EID to the routing database. It
+     * tells ION that a bundle arriving for this EID must be enqueued here
+     * rather than discarded. A failure is not fatal: it means the endpoint was
+     * already registered by a previous run.
      */
 
     if (addEndpoint(endpointId, EnqueueBundle, NULL) < 0) {
@@ -434,8 +445,9 @@ int tryConnectToIon(DtnexConfig *config) {
     }
 
     /**
-     * A questo punto registrato l'endpoint, ottengo il sap relativo a quell'EID, 
-     * da cui potrò ricevere ed inviare messaggi -> lo mette nella variabile globale sap
+     * With the endpoint now registered, we obtain the sap for that EID, which is
+     * what we will receive and send messages through; it is stored in the global
+     * variable sap.
      */
     
     // Try to open the endpoint for receiving messages
@@ -457,8 +469,9 @@ int tryConnectToIon(DtnexConfig *config) {
         // Create metadata string with GPS if available, otherwise use location field
 
         /**
-         * Aggiunge i propri metadati, presi dal file di configurazione, alla lista di metadata locali,
-         * dalla quale poi li prenderà per inserirli nei messaggi di metadata che invia ai vicini.
+         * Adds our own metadata, taken from the configuration file, to the local
+         * metadata list, from which it will later be pulled to fill the metadata
+         * messages sent to neighbours.
          */
 
         if (config->hasGpsCoordinates) {
@@ -513,21 +526,23 @@ int init(DtnexConfig *config) {
  */
 
 /**
- * A cosa serve questa funzione? -> serve per sapere quali nodi vicini conosce ION in questo momento.
- * Interroga direttamente le STRUTTURE INTERNE di ION per ottenere la lista dei nodi vicini (plans).
+ * What is this function for? It tells us which neighbour nodes ION knows about
+ * right now. It queries ION's INTERNAL STRUCTURES directly to obtain the list
+ * of neighbour nodes (plans).
  */
 
-/* getplanlist e' chiamata sia dal main loop sia dal thread di ricezione
- * (via forwardCborContactMessage) e scrive nella propria cache statica:
- * l'accesso va serializzato (§7.5). */
+/* getplanlist is called both from the main loop and from the reception thread
+ * (via forwardCborContactMessage) and writes into its own static cache:
+ * access must be serialised (§7.5). */
 static pthread_mutex_t planListMutex = PTHREAD_MUTEX_INITIALIZER;
 
 void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     time_t currentTime;
 
-    // Variabili statiche per caching dei piani, persistono tra una chiamata e l'altra per evitare troppe interrogazioni
-    // ad ION. Se abbiamo aggiornato i piani recentemente (meno di 20 secondi fa), usiamo quelli in cache.
-    //essendo variabili static l'inizializzazione viene fatta solo una volta.
+    // Static variables caching the plans; they persist across calls to avoid
+    // querying ION too often. If the plans were refreshed recently (less than
+    // 20 seconds ago), the cached ones are used.
+    // Being static, they are initialised only once.
     static Plan cachedPlans[MAX_PLANS];
     static int cachedPlanCount = 0;
     static time_t lastPlanUpdate = 0;
@@ -564,8 +579,8 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     sdr = getIonsdr();
 
     /**
-     * Il TTL della cache è scaduto, ma non riesco comunque ad ottenere l'SDR da ION,
-     * se ho qualcosa in cache la uso lo stesso.
+     * The cache TTL has expired but the SDR still cannot be obtained from ION;
+     * if anything is left in the cache, it is used anyway.
      */
 
     if (sdr == NULL) {
@@ -583,7 +598,7 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
         return;
     }
     
-    // Parte ION-Specific di interrogazione di ION per ottenere la lista dei plans
+    // ION-specific part: querying ION to obtain the list of plans
 
     // Start a transaction
     if (sdr_begin_xn(sdr) < 0) {
@@ -593,7 +608,7 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     }
     
     // Get the BP constants
-    bpConstants = getBpConstants(); // Ottengo il puntatore all'oggetto database che risiede nell'SDR
+    bpConstants = getBpConstants(); // pointer to the database object living in the SDR
     if (bpConstants == NULL) {
         dtnex_log("Error: can't get BP constants");
         sdr_exit_xn(sdr);
@@ -604,8 +619,8 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
     // Get the list of plans and iterate through it with safe access
 
     /**
-     * bpConstants->plans è una lista di plans gestita da SDR, non una lista c. 
-     * Deve essere iterata tramite le opportune api 
+     * bpConstants->plans is an SDR-managed list of plans, not a C list, so it
+     * must be iterated through the appropriate API.
      */
 
     Object planElt = 0;
@@ -614,14 +629,14 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
          planElt = sdr_list_next(sdr, planElt)) {
         
         // Get the plan data with careful error checking
-        Object planData = sdr_list_data(sdr, planElt); // è un offset relativo alla base della memoria condivisa, non un puntatore effettivo
+        Object planData = sdr_list_data(sdr, planElt); // an offset relative to the base of shared memory, not an actual pointer
         if (planData == 0) {
             dtnex_log("Warning: Null plan data, skipping");
             continue;
         }
         
         // Get the plan object - cast to BpPlan* with proper error checking
-        BpPlan *plan = (BpPlan*) sdr_pointer(sdr, planData); //trasforma l'object in un puntatore leggibile e refernziabile, puntatore alla shared memory non una copia
+        BpPlan *plan = (BpPlan*) sdr_pointer(sdr, planData); // turns the Object into a readable, dereferenceable pointer into shared memory - not a copy
         if (plan == NULL) {
             dtnex_log("Warning: Null plan pointer, skipping");
             continue;
@@ -636,7 +651,7 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
         }
 
         // Skip our own node
-        if (plan->neighborNodeNbr == config->nodeId) { // per evitare che il nodo si spedisca piani a se stessa
+        if (plan->neighborNodeNbr == config->nodeId) { // prevents the node from sending plans to itself
             continue;
         }
 
@@ -644,7 +659,7 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
 
         // Add this plan to our lists (both the output and the cache)
         if (*planCount < MAX_PLANS) {
-            plans[*planCount].planId = plan->neighborNodeNbr; // Salvo il neighborNodeNbr come planId, è l'informazione più importante che mi serve per identificare il vicino, lo userò poi per costruire l'EID -> IPN:neighborNodeNbr.serviceNr
+            plans[*planCount].planId = plan->neighborNodeNbr; // neighborNodeNbr is stored as planId: it is the key piece of information identifying the neighbour, and is used later to build the EID -> ipn:neighborNodeNbr.serviceNr
             dtnex_dbg("[getplanlist] Added to plan list: index=%d planId=%lu",
                 *planCount,
                 (unsigned long)plans[*planCount].planId);
@@ -701,24 +716,24 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
  */
 
 /**
- * Funzione che decide se, cosa e a chi inviare le informazioni, poi delega la costruzione e l'invio del bundle
- * alle funzioni CBOR. Ha 3 fasi: gate temporale, loop di invio dei contatti, loop di invio dei metadata.
+ * Decides whether, what and to whom information is sent, then delegates the
+ * construction and transmission of the bundle to the CBOR functions. It has
+ * three phases: the time gate, the contact send loop and the metadata send loop.
  */
 
 /**
- * Snapshot dei contatti annunciabili (§3.2).
+ * Snapshot of the announceable contacts (§3.2).
  *
- * INVARIANTE DI CORRETTEZZA DELLA CACHE (§7.4): questa cache e' a solo TTL,
- * senza invalidazione su scrittura, e cio' e' corretto SOLO perche' lo
- * snapshot contiene esclusivamente contatti con fromNode == nodo locale
- * (regola di autorita', §4). Nessuna scrittura che dtnex fa in ION puo'
- * quindi rientrare in questo insieme. Se qualcuno rilassa quel filtro,
- * questa cache diventa silenziosamente sbagliata.
+ * CACHE CORRECTNESS INVARIANT (§7.4): this cache is TTL-only, with no
+ * invalidation on write, and that is correct ONLY because the snapshot holds
+ * exclusively contacts whose fromNode is the local node (authority rule, §4).
+ * No write dtnex performs on ION can therefore fall inside this set. If anyone
+ * relaxes that filter, this cache silently becomes wrong.
  *
- * Il TTL governa la reattivita' del trigger 3 di §7.1: e' il tempo massimo
- * fra una modifica a ionrc e la sua scoperta da parte della rete. 60 secondi
- * e' il compromesso scelto: coincide con il periodo massimo di risveglio del
- * main loop, quindi non aggiunge accessi a ION rispetto al ritmo del loop.
+ * The TTL governs the responsiveness of trigger 3 in §7.1: it is the maximum
+ * delay between a change to ionrc and its discovery by the network. 60 seconds
+ * is the chosen compromise: it matches the longest wake-up period of the main
+ * loop, so it adds no ION accesses beyond the pace of the loop itself.
  */
 #define MY_CONTACTS_CACHE_TTL 60
 
@@ -737,12 +752,12 @@ static int sameContactRecord(const ContactRecord *a, const ContactRecord *b) {
 }
 
 /**
- * Rinfresca lo snapshot se il TTL e' scaduto. Scrive in *changed 1 se il
- * nuovo snapshot differisce dal precedente, 0 altrimenti (o se non e' stato
- * rinfrescato). Ritorna il numero di contatti nello snapshot, -1 su errore
- * di accesso a ION (nel qual caso lo snapshot precedente resta valido).
+ * Refreshes the snapshot if the TTL has expired. Writes 1 into *changed if the
+ * new snapshot differs from the previous one, 0 otherwise (or if it was not
+ * refreshed). Returns the number of contacts in the snapshot, or -1 on an ION
+ * access error (in which case the previous snapshot stays valid).
  *
- * Mono-thread (§7.5): solo il main loop chiama questa funzione.
+ * Single-threaded (§7.5): only the main loop calls this function.
  */
 static int refreshMyContacts(DtnexConfig *config, int *changed) {
     ContactRecord fresh[IONC_MAX_CONTACTS];
@@ -759,7 +774,7 @@ static int refreshMyContacts(DtnexConfig *config, int *changed) {
     freshCount = ionc_get_own_contacts(config->nodeId, fresh, IONC_MAX_CONTACTS,
             config->debugMode);
     if (freshCount < 0) {
-        debug_log(config, "⚠️ Impossibile rileggere i contatti annunciabili da ION");
+        debug_log(config, "⚠️ Could not re-read the announceable contacts from ION");
         return -1;
     }
 
@@ -779,7 +794,7 @@ static int refreshMyContacts(DtnexConfig *config, int *changed) {
     myContactsUpdated = now;
 
     if (*changed) {
-        dtnex_log("🔄 Lo snapshot dei contatti annunciabili e' cambiato (%d contatti)",
+        dtnex_log("🔄 The snapshot of announceable contacts changed (%d contacts)",
                 myContactCount);
     }
 
@@ -801,10 +816,10 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
 
     time(&currentTime);
 
-    // Trigger 3 (§7.1): rinfresca lo snapshot e guarda se e' cambiato.
+    // Trigger 3 (§7.1): refresh the snapshot and see whether it changed.
     refreshMyContacts(config, &contactsChanged);
 
-    // Trigger 2: la lista dei vicini e' cambiata
+    // Trigger 2: the neighbour list changed
     if (planCount != lastPlanCount) {
         planListChanged = 1;
     } else {
@@ -823,7 +838,7 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
         }
     }
 
-    // Trigger 1: e' passato updateInterval
+    // Trigger 1: updateInterval has elapsed
     if (!(lastExchangeTime == 0
             || (currentTime - lastExchangeTime) >= config->updateInterval
             || planListChanged
@@ -833,7 +848,7 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
         return;
     }
 
-    dtnex_log("📤 Annuncio %d contatti a %d vicini...", myContactCount, planCount);
+    dtnex_log("📤 Announcing %d contacts to %d neighbours...", myContactCount, planCount);
 
     lastExchangeTime = currentTime;
     lastPlanCount = planCount;
@@ -841,12 +856,12 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
         lastPlanList[i] = plans[i].planId;
     }
 
-    // Un messaggio per contatto annunciabile, a ogni vicino (§5.4).
+    // One message per announceable contact, to every neighbour (§5.4).
     for (i = 0; i < planCount; i++) {
         unsigned long neighborId = plans[i].planId;
 
         if (neighborId == config->nodeId) {
-            continue;  // plan locale di loopback
+            continue;  // local loopback plan
         }
 
         for (j = 0; j < myContactCount; j++) {
@@ -875,8 +890,8 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
 
     // Send CBOR metadata to neighbors (if enabled)
     /**
-     * Se lo scambio di metadata è abilitato, il nodo scambia i SUOI metadata, prendendoli dal file di configurazione
-     * e li invia a tutti i vicini
+     * If metadata exchange is enabled, the node exchanges ITS OWN metadata,
+     * taken from the configuration file, and sends it to every neighbour.
      */
     if (!config->noMetadataExchange && strlen(config->nodemetadata) > 0) {
         dtnex_log("📤 Exchanging CBOR metadata with neighbors...");
@@ -904,7 +919,7 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
             }
 
             // Encode metadata message to CBOR
-            // Scrive i dati di metadata dentro cborBuffer e ritorna la dimensione del messaggio
+            // Writes the metadata into cborBuffer and returns the message size
             messageSize = encodeCborMetadataMessage(config, &metadata, cborBuffer, MAX_CBOR_BUFFER);
             if (messageSize > 0) {
                 sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
@@ -1001,20 +1016,21 @@ void updateNodeMetadata(DtnexConfig *config, unsigned long nodeId, const char *m
  */
 
 /**
- * Raccolta dei segnali di terminazione.
+ * Collection of the termination signals.
  *
- * NON e' un signal handler: i tre segnali sono bloccati in tutti i thread
- * (pthread_sigmask in main) e questo thread li preleva con sigwait(). Gira
- * quindi in contesto ordinario, dove loggare e chiamare le API di ION e'
- * lecito — cosa che in un handler asincrono non lo era: dtnex_log e' printf,
- * e ne' pthread_join ne' bp_close sono async-signal-safe.
+ * This is NOT a signal handler: the three signals are blocked in every thread
+ * (pthread_sigmask in main) and this thread picks them up with sigwait(). It
+ * therefore runs in ordinary context, where logging and calling the ION API
+ * are legitimate — which they were not in an asynchronous handler: dtnex_log
+ * is printf, and neither pthread_join nor bp_close is async-signal-safe.
  *
- * Al primo segnale abbassa i flag di esecuzione e sveglia chi e' fermo in
- * bp_receive. NON fa join, non chiude endpoint, non fa detach e non chiama
- * exit: la pulizia la fa main quando eventDrivenLoop ritorna, che e' per
- * costruzione un punto fuori da ogni transazione SDR. Uscire di qui mentre un
- * altro thread e' dentro una transazione lascerebbe il lock preso nella
- * memoria condivisa di ION, bloccando ogni altro client fino a ionunlock.
+ * On the first signal it lowers the running flags and wakes up whoever is
+ * parked in bp_receive. It does NOT join, does not close endpoints, does not
+ * detach and does not call exit: cleanup is performed by main when
+ * eventDrivenLoop returns, which is by construction a point outside any SDR
+ * transaction. Exiting from here while another thread is inside a transaction
+ * would leave the lock held in ION's shared memory, blocking every other
+ * client until ionunlock is run.
  */
 static void *signalWaitThread(void *arg)
 {
@@ -1037,31 +1053,31 @@ static void *signalWaitThread(void *arg)
         signalCount++;
 
         if (signalCount > 1) {
-            dtnex_log("⚠️  Uscita forzata richiesta: se un thread e' dentro una "
-                    "transazione SDR il lock di ION restera' preso e blocchera' "
-                    "gli altri client. In quel caso sbloccare con: ionunlock ion");
+            dtnex_log("⚠️  Forced exit requested: if a thread is inside an SDR "
+                    "transaction, ION's lock will stay held and will block the "
+                    "other clients. In that case release it with: ionunlock ion");
             _exit(1);
         }
 
         if (sig == SIGINT) {
-            dtnex_log("Ricevuto SIGINT (Ctrl+C), arresto in corso...");
+            dtnex_log("Received SIGINT (Ctrl+C), shutting down...");
         } else if (sig == SIGTERM) {
-            dtnex_log("Ricevuto SIGTERM, arresto in corso...");
+            dtnex_log("Received SIGTERM, shutting down...");
         } else {
-            dtnex_log("Ricevuto SIGTSTP (Ctrl+Z), arresto in corso invece della "
-                    "sospensione...");
+            dtnex_log("Received SIGTSTP (Ctrl+Z), shutting down instead of "
+                    "suspending...");
         }
 
-        /* Chiedere l'arresto: il ciclo principale controlla running fra
-         * un'iterazione e l'altra, e dorme a fette da un secondo, quindi
-         * risponde entro il secondo (dtnex.c, eventDrivenLoop). */
+        /* Request shutdown: the main loop checks running between iterations
+         * and sleeps in one-second slices, so it reacts within a second
+         * (dtnex.c, eventDrivenLoop). */
         running = 0;
         bpechoState.running = 0;
         bundleReceptionState.running = 0;
 
-        /* Risvegli: senza questi i thread di servizio resterebbero fermi nella
-         * bp_receive bloccante e la join non tornerebbe mai. Condizionati,
-         * perche' un segnale puo' arrivare con ION non raggiungibile. */
+        /* Wake-ups: without these the service threads would stay parked in the
+         * blocking bp_receive and the join would never return. They are
+         * conditional, because a signal can arrive with ION unreachable. */
         if (ionConnected) {
             if (sap != NULL) {
                 bp_interrupt(sap);
@@ -1078,9 +1094,9 @@ static void *signalWaitThread(void *arg)
 }
 
 /**
- * Wrapper sottile attorno al modulo ion_contacts: stampa la tabella
- * diagnostica, verifica esplicitamente che ION sia vivo e coerente
- * (§6.6), poi genera lo snapshot dei contatti annunciabili e il grafo.
+ * A thin wrapper around the ion_contacts module: prints the diagnostic table,
+ * explicitly checks that ION is alive and consistent (§6.6), then produces the
+ * snapshot of announceable contacts and the graph.
  */
 void getContacts(DtnexConfig *config) {
     int contactCount;
@@ -1089,7 +1105,7 @@ void getContacts(DtnexConfig *config) {
     contactCount = ionc_print_contact_table(config->debugMode);
 
     if (contactCount < 0) {
-        // ION non accessibile: puo' essere un restart o una disconnessione.
+        // ION unreachable: this may be a restart or a disconnection.
         dtnex_log("⚠️  Cannot access ION contact database - ION may have been restarted");
 
         if (sap != NULL) {
@@ -1101,11 +1117,11 @@ void getContacts(DtnexConfig *config) {
         return;
     }
 
-    // Rilevazione esplicita del restart (§6.6): "zero contatti" NON e' un
-    // indizio di restart, un nodo appena avviato ne ha legittimamente zero.
+    // Explicit restart detection (§6.6): "zero contacts" is NOT a hint of a
+    // restart, a freshly started node legitimately has zero.
     alive = ionc_check_alive(config->nodeId);
     if (alive != 1) {
-        dtnex_log("⚠️  ION restart rilevato (ownNodeNbr non piu' %lu)", config->nodeId);
+        dtnex_log("⚠️  ION restart detected (ownNodeNbr is no longer %lu)", config->nodeId);
 
         if (sap != NULL) {
             bp_close(sap);
@@ -1120,17 +1136,17 @@ void getContacts(DtnexConfig *config) {
         log_contact_update(config, contactCount);
     }
 
-    // Snapshot dei contatti annunciabili: e' esattamente cio' che finisce
-    // sul filo, quindi va confrontato con 'l contact' di ionadmin.
+    // Snapshot of the announceable contacts: this is exactly what goes on the
+    // wire, so it is what should be compared against ionadmin's 'l contact'.
     if (config->debugMode) {
         ContactRecord snapshot[IONC_MAX_CONTACTS];
         int snapshotCount = ionc_get_own_contacts(config->nodeId, snapshot,
                 IONC_MAX_CONTACTS, config->debugMode);
 
         if (snapshotCount < 0) {
-            dtnex_log("⚠️  Impossibile leggere lo snapshot dei contatti annunciabili");
+            dtnex_log("⚠️  Could not read the snapshot of announceable contacts");
         } else {
-            dtnex_log("\033[36mContatti annunciabili (fromNode == %lu): %d\033[0m",
+            dtnex_log("\033[36mAnnounceable contacts (fromNode == %lu): %d\033[0m",
                     config->nodeId, snapshotCount);
             for (int s = 0; s < snapshotCount; s++) {
                 dtnex_log("  %lu→%lu  from=%ld to=%ld  xmitRate=%lu B/s  conf=%u%%  owlt=%us",
@@ -1245,10 +1261,10 @@ void createGraph(DtnexConfig *config) {
     debug_log(config, "Extracting contacts using ionadmin command...");
     
     FILE *ionadmin_pipe = popen("echo 'l contact' | ionadmin 2>/dev/null | grep -o -P '(?<=From).*?(?=is)'", "r");
-    /** Come prende i contatti pr graficare gli archi tra i nodi:
-     * Invia l contact allo stdin di ionadmin
-     * cattura l'output
-     * lo filtra con grep per estrarre solo le linee che contengono i contatti
+    /** How the contacts used to draw the edges between nodes are obtained:
+     * send 'l contact' to ionadmin's stdin,
+     * capture the output,
+     * filter it with grep to keep only the lines holding the contacts.
      */
     if (ionadmin_pipe) {
         char line[1024];
@@ -1417,9 +1433,9 @@ void *runBpechoService(void *arg) {
     int bytesToEcho = 0;
     int result;
     
-    // Il thread bpecho non tocca i segnali: li ha bloccati per eredità dalla
-    // maschera impostata in main. Si ferma tramite bpechoState.running più
-    // il risveglio di bp_interrupt, entrambi comandati da signalWaitThread.
+    // The bpecho thread does not touch signals: it inherited them blocked from
+    // the mask set in main. It stops through bpechoState.running plus the
+    // wake-up from bp_interrupt, both driven by signalWaitThread.
 
     sdr = bp_get_sdr();
     dtnex_log("Starting bpecho service thread on service %s", config->bpechoServiceNr);
@@ -1616,9 +1632,9 @@ void *runBundleReception(void *arg) {
             
             if (contentLength > 0 && contentLength < MAX_LINE_LENGTH) {
                 // Read the bundle content
-                zco_start_receiving(dlv.adu, &reader); // Inizializza lo zco reader per leggere il payload del bundle, analogo a una open
+                zco_start_receiving(dlv.adu, &reader); // initialises the zco reader for the bundle payload, the equivalent of an open
                 CHKZERO(sdr_begin_xn(sdr));
-                int len = zco_receive_source(sdr, &reader, contentLength, buffer); // copia il payload nel buffer
+                int len = zco_receive_source(sdr, &reader, contentLength, buffer); // copies the payload into the buffer
                 if (sdr_end_xn(sdr) < 0 || len < 0) {
                     dtnex_log("❌ Error reading bundle content");
                     bp_release_delivery(&dlv, 1);
@@ -1626,7 +1642,7 @@ void *runBundleReception(void *arg) {
                 }
                 
                 // Build source info string
-                // Source info mai usata per ora ma potrebbe essere utile per logging e debugging futuri
+                // Source info is unused for now, but may be useful for future logging and debugging
                 char sourceInfo[128];
                 if (dlv.bundleSourceEid && strlen(dlv.bundleSourceEid) > 0) {
                     snprintf(sourceInfo, sizeof(sourceInfo), "%s", dlv.bundleSourceEid);
@@ -1639,7 +1655,7 @@ void *runBundleReception(void *arg) {
                 // Bundle received - will be logged in message processing
                 
                 // Process the CBOR message
-                // Il payload del bundle è ora in buffer con lunghezza contentLength -> viene procesato
+                // The bundle payload is now in buffer with length contentLength -> it gets processed
                 processCborMessage(config, (unsigned char*)buffer, contentLength);
             } else {
                 dtnex_log("⚠️ Bundle content invalid size (%d bytes), skipping", contentLength);
@@ -1673,10 +1689,10 @@ void stopBundleReception(BundleReceptionState *state) {
 int main(int argc, char **argv) {
     DtnexConfig config;
 
-    /* I segnali di terminazione vanno bloccati PRIMA che nasca qualunque
-     * thread — inclusi quelli che ION puo' creare in bp_attach — perche' la
-     * maschera si eredita alla creazione. Da qui in poi nessun thread li
-     * riceve in modo asincrono: li raccoglie signalWaitThread con sigwait. */
+    /* The termination signals must be blocked BEFORE any thread is born —
+     * including those ION may create inside bp_attach — because the mask is
+     * inherited at creation time. From here on no thread receives them
+     * asynchronously: signalWaitThread collects them with sigwait. */
     sigset_t terminationSignals;
 
     sigemptyset(&terminationSignals);
@@ -1685,14 +1701,14 @@ int main(int argc, char **argv) {
     sigaddset(&terminationSignals, SIGTSTP);
 
     if (pthread_sigmask(SIG_BLOCK, &terminationSignals, NULL) != 0) {
-        dtnex_log("❌ Impossibile bloccare i segnali di terminazione: "
-                "l'arresto non sarebbe sicuro per ION, esco");
+        dtnex_log("❌ Cannot block the termination signals: "
+                "shutdown would not be safe for ION, exiting");
         return 1;
     }
 
     if (pthread_create(&signalThread, NULL, signalWaitThread, NULL) != 0) {
-        dtnex_log("❌ Impossibile creare il thread dei segnali: "
-                "l'arresto non sarebbe sicuro per ION, esco");
+        dtnex_log("❌ Cannot create the signal thread: "
+                "shutdown would not be safe for ION, exiting");
         return 1;
     }
 
@@ -1945,15 +1961,15 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
     unsigned char nonce[DTNEX_NONCE_SIZE];
     int bytesWritten = 0;
 
-    (void) bufferSize;  // il payload v3 e' ~67 byte, MAX_CBOR_BUFFER e' 128
+    (void) bufferSize;  // the v3 payload is ~67 bytes, MAX_CBOR_BUFFER is 128
 
     // Generate nonce
     generateNonce(nonce);
 
     time_t currentTime = time(NULL);
 
-    // §7.2: il messaggio e' utile esattamente finche' e' valido il contatto
-    // che descrive, quindi expireTime E' il toTime del contatto.
+    // §7.2: the message is useful exactly as long as the contact it describes
+    // is valid, so expireTime IS the contact's toTime.
     time_t expireTime = contact->toTime;
 
     // Encode main array with 9 elements [version, type, ts, exp, orig, from, nonce, data, hmac]
@@ -1965,7 +1981,7 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
     // 2. Message type "c"
     bytesWritten += cbor_encode_text_string("c", 1, &cursor);
 
-    // 3. Timestamp (istante di invio, non ha piu' effetto sulla finestra)
+    // 3. Timestamp (instant of sending; it no longer affects the window)
     bytesWritten += cbor_encode_integer(currentTime, &cursor);
 
     // 4. Expire time
@@ -2178,7 +2194,7 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Create ZCO from the extent
-    // Adessp crea un bundle di tipo ZeroCopyObject partendo direttamente dai dati in SDR
+    // Now create a ZeroCopyObject bundle directly from the data held in SDR
     bundleZco = ionCreateZco(ZcoSdrSource, extent, 0, dataSize, 
                             BP_STD_PRIORITY, 0, ZcoOutbound, NULL);
     
@@ -2220,8 +2236,8 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
  */
 
  /**
-  * while loop a stati con due timeline parallele: una per gli update programmati (updateInterval)
-  * e una per i retry di connessione a ION.
+  * A stateful while loop with two parallel timelines: one for the scheduled
+  * updates (updateInterval) and one for the ION connection retries.
   */
 void eventDrivenLoop(DtnexConfig *config) {
     Plan plans[MAX_PLANS];
@@ -2353,8 +2369,9 @@ void eventDrivenLoop(DtnexConfig *config) {
         // Bundle reception is now handled by the dedicated thread
         if (!running) break;
         
-        // A ogni risveglio (<= 60s): rivaluta i trigger di annuncio (§7.1).
-        // exchangeWithNeighbors decide da sola se c'e' qualcosa da fare.
+        // On every wake-up (<= 60s): re-evaluate the announcement triggers
+        // (§7.1). exchangeWithNeighbors decides on its own whether there is
+        // anything to do.
         if (ionConnected) {
             getplanlist(config, plans, &planCount);
             exchangeWithNeighbors(config, plans, planCount);
@@ -2485,7 +2502,7 @@ IonStatus checkIonStatus(DtnexConfig *config) {
  * Process received CBOR message - main entry point for CBOR message handling
  */
 void processCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize) {
-    if (!buffer || bufferSize <= 0) { // fa solo validazione del puntatore del buffer e della dimensione
+    if (!buffer || bufferSize <= 0) { // only validates the buffer pointer and its size
         debug_log(config, "❌ Invalid CBOR buffer (null or zero size)");
         return;
     }
@@ -2706,7 +2723,8 @@ int skipCborElement(unsigned char **cursor, unsigned int *bytesBuffered) {
  * Decode and process CBOR message format
  */
 /**
- * Viene fatto il parsing di CBOR e poi processato in base al tipo di messaggio (contact o metadata).
+ * The CBOR is parsed and then processed according to the message type
+ * (contact or metadata).
  */
 int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize) {
     unsigned char *cursor = buffer;
@@ -2851,7 +2869,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
         debug_log(config, "🔍 Extracting 7 contact elements manually");
 
         if (dataArraySize != 7) {
-            debug_log(config, "❌ Payload contatto con %lu campi (attesi 7)", dataArraySize);
+            debug_log(config, "❌ Contact payload with %lu fields (7 expected)", dataArraySize);
             return -1;
         }
 
@@ -3161,8 +3179,8 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
  * Process CBOR contact message
  */
 
-/* Oltre questa distanza nel futuro una finestra e' sospetta di clock skew
- * anziche' legittima: si scarta e lo si dice (§7.6). */
+/* Beyond this distance into the future, a window looks like clock skew rather
+ * than a legitimate one: it is discarded, and said so (§7.6). */
 #define CLOCK_SKEW_FUTURE_LIMIT (30 * 24 * 3600)
 
 int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
@@ -3173,133 +3191,134 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
     log_message_received(config, origin, from, "contact",
             contact->fromNode, contact->toNode, NULL);
 
-    /* Pipeline di validazione (§6.1). I controlli 1-3 (versione, HMAC,
-     * nonce) sono gia' stati fatti in decodeCborMessage. Ogni fallimento
-     * scarta senza inserire e senza inoltrare, e restituisce 0: non e' un
-     * errore di decodifica (il messaggio si e' decodificato perfettamente),
-     * e' un rifiuto di policy gia' loggato qui sotto col suo motivo. Un -1
-     * risalirebbe fino a decodeCborMessage e verrebbe stampato come "Failed
-     * to decode CBOR message", diagnostica fuorviante per uno scarto valido. */
+    /* Validation pipeline (§6.1). Checks 1-3 (version, HMAC, nonce) have
+     * already been performed in decodeCborMessage. Every failure discards the
+     * message without inserting and without forwarding, and returns 0: this is
+     * not a decoding error (the message decoded perfectly), it is a policy
+     * rejection, already logged below with its reason. A -1 would travel back
+     * up to decodeCborMessage and be printed as "Failed to decode CBOR
+     * message", which is misleading diagnostics for a legitimate discard. */
 
-    // 4. Non processiamo i nostri stessi messaggi
+    // 4. We do not process our own messages
     if (origin == config->nodeId) {
         debug_log(config, "⏭️ Skipping own contact message");
         return 0;
     }
 
-    // 5. Solo la sorgente annuncia la propria direzione (§4)
+    // 5. Only the source announces its own direction (§4)
     if (contact->fromNode != origin) {
-        debug_log(config, "❌ Scartato: fromNode=%lu != origin=%lu",
+        debug_log(config, "❌ Discarded: fromNode=%lu != origin=%lu",
                 contact->fromNode, origin);
         return 0;
     }
 
-    // 5b. Un contatto verso se stessi non e' topologia: in ION e' la semantica
-    // dei contatti di registrazione. ionc_get_own_contacts lo filtra in
-    // origination, ma un peer in possesso della chiave HMAC potrebbe comunque
-    // iniettarlo, quindi il filtro serve anche in ricezione.
+    // 5b. A contact towards oneself is not topology: in ION that is the
+    // semantics of registration contacts. ionc_get_own_contacts filters it out
+    // at origination, but a peer holding the HMAC key could still inject one,
+    // so the filter is needed on reception too.
     if (contact->fromNode == contact->toNode) {
-        debug_log(config, "❌ Scartato: fromNode == toNode (%lu): contatto di "
-                "registrazione, non topologia", contact->fromNode);
+        debug_log(config, "❌ Discarded: fromNode == toNode (%lu): registration "
+                "contact, not topology", contact->fromNode);
         return 0;
     }
 
-    // 6. toTime = 0 in ION significa "contatto scoperto" -> MAX_POSIX_TIME
+    // 6. toTime = 0 in ION means "discovered contact" -> MAX_POSIX_TIME
     if (contact->toTime == 0) {
-        debug_log(config, "❌ Scartato: toTime = 0 (semantica di contatto permanente)");
+        debug_log(config, "❌ Discarded: toTime = 0 (permanent-contact semantics)");
         return 0;
     }
 
-    // 7. Integrita' della finestra
+    // 7. Window integrity
     if (contact->fromTime >= contact->toTime) {
-        debug_log(config, "❌ Scartato: fromTime=%ld >= toTime=%ld",
+        debug_log(config, "❌ Discarded: fromTime=%ld >= toTime=%ld",
                 (long) contact->fromTime, (long) contact->toTime);
         return 0;
     }
 
-    // 7b. fromTime <= 0 e' la semantica di "contatto ipotetico" per ION
-    // (rfx_insert_contact prende il ramo CHKZERO su ownNodeNbr e puo'
-    // restituire 0 senza aver scritto nulla: falso successo).
+    // 7b. fromTime <= 0 carries ION's "hypothetical contact" semantics
+    // (rfx_insert_contact takes the CHKZERO branch on ownNodeNbr and can
+    // return 0 without having written anything: a false success).
     if (contact->fromTime <= 0) {
-        debug_log(config, "❌ Scartato: fromTime non valido: semantica di "
-                "contatto ipotetico in ION (fromTime=%ld)", (long) contact->fromTime);
+        debug_log(config, "❌ Discarded: invalid fromTime: hypothetical-contact "
+                "semantics in ION (fromTime=%ld)", (long) contact->fromTime);
         return 0;
     }
 
-    // 7c. fromTime == MAX_POSIX_TIME e' il trigger dei contatti di
-    // registrazione in ION, non una finestra di rete reale.
+    // 7c. fromTime == MAX_POSIX_TIME is what triggers registration contacts in
+    // ION, not a real network window.
     if (contact->fromTime >= MAX_POSIX_TIME) {
-        debug_log(config, "❌ Scartato: fromTime = MAX_POSIX_TIME: semantica "
-                "di contatto di registrazione");
+        debug_log(config, "❌ Discarded: fromTime = MAX_POSIX_TIME: "
+                "registration-contact semantics");
         return 0;
     }
 
-    // 7d. xmitRate == 0 verrebbe rifiutato da ION stesso (rfx_insert_contact
-    // restituisce 5).
+    // 7d. xmitRate == 0 would be refused by ION itself (rfx_insert_contact
+    // returns 5).
     if (contact->xmitRate == 0) {
-        debug_log(config, "❌ Scartato: xmitRate nullo: ION rifiuterebbe il contatto");
+        debug_log(config, "❌ Discarded: zero xmitRate: ION would refuse the contact");
         return 0;
     }
 
-    // 7e. confidence fuori range: ION restituisce 4 per confidence > 1.0.
+    // 7e. Out-of-range confidence: ION returns 4 for confidence > 1.0.
     if (contact->confidence > 100) {
-        debug_log(config, "❌ Scartato: confidence fuori range 0-100 (%u)",
+        debug_log(config, "❌ Discarded: confidence outside the 0-100 range (%u)",
                 contact->confidence);
         return 0;
     }
 
-    // 8. Finestra gia' scaduta
+    // 8. Window already expired
     if (contact->toTime <= currentTime) {
-        debug_log(config, "❌ Scartato: finestra interamente nel passato "
-                "(toTime=%ld, adesso=%ld) — possibile clock skew fra i nodi",
+        debug_log(config, "❌ Discarded: window entirely in the past "
+                "(toTime=%ld, now=%ld) — possible clock skew between nodes",
                 (long) contact->toTime, (long) currentTime);
         return 0;
     }
 
-    // 8b. Finestra troppo nel futuro: sospetto di clock skew (§7.6)
+    // 8b. Window too far in the future: suspected clock skew (§7.6)
     if (contact->fromTime > currentTime + CLOCK_SKEW_FUTURE_LIMIT) {
-        debug_log(config, "❌ Scartato: finestra troppo nel futuro "
-                "(fromTime=%ld, adesso=%ld) — possibile clock skew fra i nodi",
+        debug_log(config, "❌ Discarded: window too far in the future "
+                "(fromTime=%ld, now=%ld) — possible clock skew between nodes",
                 (long) contact->fromTime, (long) currentTime);
         return 0;
     }
 
-    /* Non c'e' un controllo 9 sull'owlt: 0 e' un OWLT legittimo (su una LAN e'
-     * il valore fisicamente corretto, e ION accetta "a range ... 0"). Scartarlo
-     * qui contraddiceva l'origination, dove findOwlt restituisce 0 come valore
-     * valido, e su un testbed locale faceva scartare tutto a ogni ricevente.
-     * Il formato v3 porta sempre il campo e ionc_get_own_contacts annuncia solo
-     * contatti per cui un range esiste davvero: il controllo era ridondante. */
+    /* There is no check 9 on the owlt: 0 is a legitimate OWLT (on a LAN it is
+     * the physically correct value, and ION accepts "a range ... 0"). Discarding
+     * it here contradicted origination, where findOwlt returns 0 as a valid
+     * value, and on a local testbed it made every receiver discard everything.
+     * The v3 format always carries the field, and ionc_get_own_contacts only
+     * announces contacts for which a range really exists: the check was
+     * redundant. */
 
-    /* Si scrive cio' che si impara, si annuncia solo cio' di cui si e'
-     * autoritativi (§4.5): anche i contatti con toNode == me si inseriscono. */
+    /* We write what we learn, but announce only what we are authoritative for
+     * (§4.5): contacts with toNode == me are inserted as well. */
     outcome = ionc_apply_contact(contact, config->debugMode);
     if (outcome == IONC_ERROR) {
-        /* IONC_ERROR e' un errore di sistema di una rfx_* (rc < 0) o ION
-         * irraggiungibile: dopo il fix precedente una sovrapposizione con un
-         * contatto configurato a mano e' un errore utente atteso e non
-         * arriva piu' qui. Il messaggio resta comunque valido e va inoltrato
-         * (§6.5), altrimenti un problema puramente locale partizionerebbe
-         * il flooding. */
-        dtnex_log("❌ Applicazione in ION fallita per %lu→%lu",
+        /* IONC_ERROR is a system error from an rfx_* call (rc < 0) or ION
+         * being unreachable: after the earlier fix, an overlap with a manually
+         * configured contact is an expected user error and no longer reaches
+         * this point. The message stays valid regardless and must be forwarded
+         * (§6.5), otherwise a purely local problem would partition the
+         * flooding. */
+        dtnex_log("❌ Failed to apply %lu→%lu to ION",
                 contact->fromNode, contact->toNode);
     } else if (outcome == IONC_LOST) {
-        /* La voce precedente e' stata rimossa da ION ma la insert che
-         * doveva rimpiazzarla e' stata rifiutata: a differenza degli altri
-         * esiti, qui ION e' peggiorato rispetto a prima, non solo invariato.
-         * Il dettaglio (codice ION, significato) e' gia' stato loggato da
-         * ion_contacts.c; qui si segnala solo che non e' un successo, cosi'
-         * la perdita non resta invisibile al livello di log predefinito. */
-        dtnex_log("⚠️  Contatto %lu→%lu perso in ION dopo una remove riuscita "
-                "(insert successiva rifiutata)",
+        /* The previous entry was removed from ION but the insert meant to
+         * replace it was refused: unlike the other outcomes, here ION got
+         * worse than before, not merely unchanged. The detail (ION code and
+         * its meaning) has already been logged by ion_contacts.c; here we
+         * only flag that this is not a success, so the loss does not stay
+         * invisible at the default log level. */
+        dtnex_log("⚠️  Contact %lu→%lu lost in ION after a successful remove "
+                "(the following insert was refused)",
                 contact->fromNode, contact->toNode);
     } else if (outcome != IONC_NOOP) {
-        dtnex_log("✅ Contatto %lu→%lu %s in ION",
+        dtnex_log("✅ Contact %lu→%lu %s in ION",
                 contact->fromNode, contact->toNode, ionc_outcome_name(outcome));
     }
 
-    // Inoltro invariato (§6.5): un messaggio che supera la validazione si
-    // inoltra sempre, indipendentemente dall'esito della scrittura locale in ION.
+    // Forwarding is unchanged (§6.5): a message that passes validation is
+    // always forwarded, regardless of the outcome of the local ION write.
     forwardCborContactMessage(config, nonce, timestamp, expireTime, origin, from, contact);
 
     return 0;

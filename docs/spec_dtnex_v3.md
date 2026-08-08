@@ -1,630 +1,630 @@
-# DTNEX — Redesign dello scambio di contatti
+# DTNEX — Contact exchange redesign
 
-**Data:** 2026-08-03 — §13 aggiunta e implementata il 2026-08-08
-**Stato:** implementato sul branch `redesign`, con i limiti noti registrati in fondo.
-Il §13 (terminazione) è implementato e verificato (§13.8), ma **non risolve il
-sintomo che lo aveva motivato**: vedi §13.9.
-**Versione protocollo risultante:** 3 (da 2)
-
----
-
-## 1. Problemi da risolvere
-
-Tre difetti dell'implementazione attuale, tutti verificati sul codice.
-
-### 1.1 Il contatto inviato non corrisponde a quello salvato
-
-`exchangeWithNeighbors` (`dtnex.c:734-777`) non legge il contact plan di ION. Costruisce il `ContactInfo` sinteticamente dai *plan* (adiacenze del convergence layer): `nodeA = nodeId locale`, `nodeB = un vicino`, `duration = contactLifetime / 60` preso dal file di configurazione.
-
-`getContacts` (`dtnex.c:1009`) legge davvero l'RBT dei contatti di ION, ma è una funzione puramente diagnostica: stampa una tabella, conta le entry, rileva il restart di ION. Il suo output non alimenta nulla.
-
-I due mondi non si toccano mai. La sorgente di verità di ciò che viene annunciato sono i plan, non i contatti.
-
-Seconda fonte di divergenza: in ricezione (`dtnex.c:3241-3244`) il `timestamp` ricevuto viene scartato e lo start time riscritto a `time(NULL)` locale. Su un flood multi-hop lo stesso contatto assume una finestra assoluta diversa su ogni nodo.
-
-### 1.2 Il range è inventato
-
-`owlt = 1` secondo, hardcoded (`dtnex.c:3269`). I range non vengono mai scambiati fra nodi. Non è l'unico parametro fabbricato: anche `xmitRate = 100000` e `confidence = 1.0` sono hardcoded all'inserimento (`dtnex.c:3224-3225`).
-
-### 1.3 Sovrascrittura indiscriminata
-
-`rfx_remove_contact(regionNbr, NULL, ...)` con timestamp `NULL` equivale allo scope `*` di ionadmin: cancella **tutti** i contatti della coppia, inclusi quelli configurati a mano dall'operatore, che dtnex non ha mai inserito. Idem per i range (`dtnex.c:3230-3233`, `3274-3277`).
-
-Accade a ogni bundle ricevuto, quindi anche sui re-flood: churn continuo del contact plan, che invalida ripetutamente le rotte CGR.
+**Date:** 2026-08-03 — §13 added and implemented on 2026-08-08
+**Status:** implemented on the `redesign` branch, with the known limitations recorded at the end.
+§13 (termination) is implemented and verified (§13.8), but it **does not solve the
+symptom that motivated it**: see §13.9.
+**Resulting protocol version:** 3 (from 2)
 
 ---
 
-## 2. Principio guida
+## 1. Problems to solve
 
-Tre nozioni oggi confuse vengono separate nettamente:
+Three defects of the current implementation, all verified against the code.
 
-| concetto | significato | ruolo nel design |
+### 1.1 The contact that is sent does not match the one that is stored
+
+`exchangeWithNeighbors` (`dtnex.c:734-777`) does not read ION's contact plan. It builds the `ContactInfo` synthetically from the *plans* (convergence-layer adjacencies): `nodeA = local nodeId`, `nodeB = a neighbour`, `duration = contactLifetime / 60` taken from the configuration file.
+
+`getContacts` (`dtnex.c:1009`) does genuinely read ION's contact RBT, but it is a purely diagnostic function: it prints a table, counts the entries, detects an ION restart. Its output feeds nothing.
+
+The two worlds never touch. The source of truth for what gets announced is the plans, not the contacts.
+
+A second source of divergence: on reception (`dtnex.c:3241-3244`) the received `timestamp` is discarded and the start time is rewritten to the local `time(NULL)`. Across a multi-hop flood, the same contact takes on a different absolute window on every node.
+
+### 1.2 The range is made up
+
+`owlt = 1` second, hardcoded (`dtnex.c:3269`). Ranges are never exchanged between nodes. It is not the only fabricated parameter: `xmitRate = 100000` and `confidence = 1.0` are hardcoded at insertion time as well (`dtnex.c:3224-3225`).
+
+### 1.3 Indiscriminate overwriting
+
+`rfx_remove_contact(regionNbr, NULL, ...)` with a `NULL` timestamp is equivalent to ionadmin's `*` scope: it deletes **every** contact between the pair, including those configured by hand by the operator, which dtnex never inserted. The same goes for ranges (`dtnex.c:3230-3233`, `3274-3277`).
+
+This happens on every received bundle, so on re-floods too: continuous churn of the contact plan, which repeatedly invalidates the CGR routes.
+
+---
+
+## 2. Guiding principle
+
+Three notions that are conflated today are cleanly separated:
+
+| concept | meaning | role in the design |
 |---|---|---|
-| **plan** | "ho un outduct verso X" | livello trasporto: a chi spedisco i bundle |
-| **contact** | "c'è una finestra di trasmissione X→Y" | payload: quale topologia annuncio |
-| **range** | OWLT fra due nodi | payload, trasportato insieme al contatto |
+| **plan** | "I have an outduct towards X" | transport layer: who I send bundles to |
+| **contact** | "there is a transmission window X→Y" | payload: which topology I announce |
+| **range** | OWLT between two nodes | payload, carried together with the contact |
 
-In ION plan e contact si configurano indipendentemente. La confusione fra i due è la causa d'origine del problema 1.
+In ION, plans and contacts are configured independently. Confusing the two is the root cause of problem 1.
 
 ---
 
-## 3. Modello dati
+## 3. Data model
 
-### 3.1 `plans[]` — peer set del flooding
+### 3.1 `plans[]` — the flooding peer set
 
-Ruolo: a chi spedisco i bundle. Nient'altro.
+Role: who I send bundles to. Nothing else.
 
-Struttura e popolamento invariati (`planId`, `timestamp`, da `getplanlist()` sui `BpPlan` di ION, cache a TTL). Tutto il codice che lo usa per costruire il `destEid` resta valido. Cambia solo il ruolo concettuale: non è più una sorgente di dati di contatto.
+Structure and population unchanged (`planId`, `timestamp`, from `getplanlist()` over ION's `BpPlan`s, TTL cache). All the code that uses it to build the `destEid` stays valid. Only its conceptual role changes: it is no longer a source of contact data.
 
-### 3.2 `myContacts[]` — set di origination
+### 3.2 `myContacts[]` — the origination set
 
-Ruolo: cosa annuncio. **Sola lettura da ION**, snapshot con cache a TTL, nessuno stato locale.
+Role: what I announce. **Read-only from ION**, a snapshot with a TTL cache, no local state.
 
-Popolato camminando `ionvdb->contactIndex` con filtro `fromNode == config->nodeId`. Per ogni contatto si cerca in `ionvdb->rangeIndex` il range corrispondente per ricavare l'`owlt`.
+Populated by walking `ionvdb->contactIndex` with the filter `fromNode == config->nodeId`. For each contact, the matching range is looked up in `ionvdb->rangeIndex` to derive the `owlt`.
 
-| campo | origine |
+| field | origin |
 |---|---|
 | `regionNbr` | `IonCXref` |
-| `fromNode` | `IonCXref` — sempre `== nodeId` per costruzione |
+| `fromNode` | `IonCXref` — always `== nodeId` by construction |
 | `toNode` | `IonCXref` |
-| `fromTime`, `toTime` | `IonCXref` — assoluti, mai riscritti |
-| `xmitRate` | `IonCXref` — byte/secondo |
+| `fromTime`, `toTime` | `IonCXref` — absolute, never rewritten |
+| `xmitRate` | `IonCXref` — bytes/second |
 | `confidence` | `IonCXref` |
-| `owlt` | `IonRXref`, via join |
+| `owlt` | `IonRXref`, via a join |
 
-Nessun campo di bookkeeping: niente `origin` (sono sempre io), niente `owned`, niente `lastHeard`. Un solo timestamp di validità per l'intero snapshot.
+No bookkeeping fields: no `origin` (it is always me), no `owned`, no `lastHeard`. A single validity timestamp for the whole snapshot.
 
-Questa struttura risolve i problemi 1.1 e 1.2 insieme: ciò che si annuncia è letteralmente ciò che ION ha, campo per campo.
+This structure solves problems 1.1 and 1.2 together: what is announced is literally what ION holds, field by field.
 
-### 3.3 Nessuna terza struttura
+### 3.3 No third structure
 
-Non serve un registro di "cosa ho inserito io". La rimozione mirata per `fromTime` esatto è sufficiente (§6.2). I contatti ricevuti passano da ION e basta; dtnex non ne tiene copia in memoria.
+A registry of "what I inserted myself" is not needed. Targeted removal by exact `fromTime` is sufficient (§6.2). Received contacts simply pass through ION; dtnex keeps no in-memory copy of them.
 
-### 3.4 Contatti privi di range
+### 3.4 Contacts with no range
 
-Un contatto senza range locale **non viene annunciato**, con log a livello debug. Motivo: CGR scarta dalla considerazione come next-hop un contatto privo di range, quindi annunciarlo occuperebbe SDR e genererebbe churn senza mai produrre una rotta.
+A contact with no local range **is not announced**, with a debug-level log. Reason: CGR discards a contact with no range from consideration as a next hop, so announcing it would occupy SDR and generate churn without ever producing a route.
 
-In ricezione **non** c'è un filtro simmetrico: il formato v3 porta sempre il campo `owlt` e `0` è un valore legittimo (§6.1). Il filtro vive tutto in origination.
+On reception there is **no** symmetric filter: the v3 format always carries the `owlt` field and `0` is a legitimate value (§6.1). The filter lives entirely in origination.
 
-Effetto collaterale voluto: un errore di configurazione (contatto senza range in ionrc) diventa visibile invece di propagarsi silenziosamente.
+An intentional side effect: a configuration error (a contact with no range in ionrc) becomes visible instead of propagating silently.
 
 ---
 
-## 4. Regola di autorità: `fromNode == me`
+## 4. Authority rule: `fromNode == me`
 
-**Un nodo annuncia solo i contatti in cui è lui il `fromNode`. Rifiuta ogni messaggio ricevuto che dichiari `fromNode == me`.**
+**A node announces only the contacts in which it is itself the `fromNode`. It rejects every received message declaring `fromNode == me`.**
 
-### 4.1 Perché non annunciare entrambe le direzioni
+### 4.1 Why not announce both directions
 
-Sebbene una configurazione ionrc tipica contenga entrambe le direzioni, la copertura di rete è già completa senza. Sul link A↔B: A annuncia `A→B`, B annuncia `B→A`. Entrambe le direzioni raggiungono la rete, da sorgenti diverse. Annunciarle da entrambi i capi è ridondanza, non copertura aggiuntiva.
+Although a typical ionrc configuration contains both directions, network coverage is already complete without doing so. On the link A↔B: A announces `A→B`, B announces `B→A`. Both directions reach the network, from different sources. Announcing them from both ends is redundancy, not extra coverage.
 
-### 4.2 Cosa si guadagna
+### 4.2 What is gained
 
-- ogni direzione ha esattamente una sorgente autoritativa → nessuna regola di conflict resolution
-- nessuna scrittura di dtnex può rientrare nel set di origination → **cache a solo TTL**, senza invalidazione su scrittura
-- niente flag `owned` nella struttura, niente stato persistente fra riavvii
+- every direction has exactly one authoritative source → no conflict-resolution rule
+- no write dtnex performs can fall into the origination set → **TTL-only cache**, with no invalidation on write
+- no `owned` flag in the structure, no state persisted across restarts
 
-### 4.3 Cosa si rinuncia
+### 4.3 What is given up
 
-La copertura di `B→A` quando il dtnex di B è spento con ION acceso, o quando B non esegue dtnex. In quel caso la rete vede il link a metà.
+Coverage of `B→A` when B's dtnex is down while its ION is up, or when B does not run dtnex at all. In that case the network sees the link only half-way.
 
 ### 4.4 Escape hatch
 
-Se un domani quella copertura serve: si annunciano anche i contatti con `toNode == me` e si aggiunge in ricezione la regola di precedenza *vince l'annuncio con `origin == fromNode`*. La sorgente autoritativa batte quella di rimbalzo, quindi niente flapping.
+Should that coverage be needed one day: contacts with `toNode == me` are announced as well, and a precedence rule is added on reception — *the announcement with `origin == fromNode` wins*. The authoritative source beats the bounced one, so there is no flapping.
 
-**Non cambia il formato del messaggio CBOR.** Rilassa il controllo di validazione n. 5 (§6.1). È un interruttore attivabile in seguito, non una scelta da bloccare ora.
+**It does not change the CBOR message format.** It relaxes validation check no. 5 (§6.1). It is a switch that can be flipped later, not a choice that must be locked in now.
 
-### 4.5 Contatti ricevuti con `toNode == me`
+### 4.5 Received contacts with `toNode == me`
 
-**Vengono inseriti in ION.** Senza, il nodo non ha le rotte di ritorno: conoscerebbe `me→B` ma non `B→me`.
+**They are inserted into ION.** Without them the node has no return routes: it would know `me→B` but not `B→me`.
 
-La regola è: si scrive ciò che si impara, si annuncia solo ciò di cui si è autoritativi. Le due cose sono indipendenti.
+The rule is: write what you learn, announce only what you are authoritative for. The two are independent.
 
 ---
 
-## 5. Formato del messaggio
+## 5. Message format
 
-### 5.1 Envelope: invariato
+### 5.1 Envelope: unchanged
 
-Resta l'array CBOR a 9 elementi: `[version, tipo, timestamp, expireTime, origin, from, nonce, payload, hmac]`. Nonce, HMAC, dedup e forwarding non vengono toccati.
+It stays a 9-element CBOR array: `[version, type, timestamp, expireTime, origin, from, nonce, payload, hmac]`. Nonce, HMAC, dedup and forwarding are untouched.
 
-`version` passa **da 2 a 3**. I messaggi v2 vengono **scartati**, con log a debug: una rete a versioni miste ricreerebbe esattamente l'incoerenza che il redesign elimina.
+`version` goes **from 2 to 3**. v2 messages are **discarded**, with a debug log: a mixed-version network would recreate exactly the inconsistency the redesign removes.
 
-### 5.2 Payload contatto: da 3 a 7 campi
+### 5.2 Contact payload: from 3 to 7 fields
 
-| campo | tipo sul filo | note |
+| field | type on the wire | notes |
 |---|---|---|
-| `fromNode` | intero | direzionale, sempre `== origin` |
-| `toNode` | intero | |
-| `fromTime` | intero | epoch assoluto, mai riscritto |
-| `toTime` | intero | epoch assoluto |
-| `xmitRate` | intero | byte/secondo, come ION |
-| `confidence` | intero 0-100 | percentuale |
-| `owlt` | intero | secondi |
+| `fromNode` | integer | directional, always `== origin` |
+| `toNode` | integer | |
+| `fromTime` | integer | absolute epoch, never rewritten |
+| `toTime` | integer | absolute epoch |
+| `xmitRate` | integer | bytes/second, as in ION |
+| `confidence` | integer 0-100 | percentage |
+| `owlt` | integer | seconds |
 
-### 5.3 Scelte di codifica
+### 5.3 Encoding choices
 
-**Tempi assoluti, non durata.** È la decisione che risolve strutturalmente il problema 1.1: il ricevente non ricalcola mai la finestra. Richiede sincronizzazione oraria fra i nodi, che ION già impone per CGR — non è un requisito nuovo.
+**Absolute times, not durations.** This is the decision that structurally solves problem 1.1: the receiver never recomputes the window. It requires clock synchronisation between nodes, which ION already imposes for CGR — it is not a new requirement.
 
-**`toTime` assoluto, non delta da `fromTime`.** Il delta risparmierebbe ~3 byte introducendo un'asimmetria fra i due estremi. Chiarezza sopra 3 byte.
+**Absolute `toTime`, not a delta from `fromTime`.** A delta would save ~3 bytes while introducing an asymmetry between the two ends. Clarity beats 3 bytes.
 
-**`confidence` come intero 0-100.** Obbligato: `include/ion/cbor.h` non ha encoding per i float. Si perde la granularità dello 0.01 rispetto al `float` di ION; in pratica i valori usati sono 1.0 per i contatti schedulati e valori grossolani per quelli predetti. Codificare il float come byte string grezza sarebbe fragile fra architetture diverse.
+**`confidence` as an integer 0-100.** Forced: `include/ion/cbor.h` has no encoding for floats. The 0.01 granularity of ION's `float` is lost; in practice the values used are 1.0 for scheduled contacts and coarse values for predicted ones. Encoding the float as a raw byte string would be fragile across architectures.
 
-**`regionNbr` non va sul filo.** Il ricevente inserisce nella propria region di default. Propagarlo rischierebbe che il ricevente tenti di inserire in una region che non conosce, facendo fallire l'inserimento. **Limitazione consapevole: dtnex resta mono-region**, e va documentata come tale.
+**`regionNbr` does not go on the wire.** The receiver inserts into its own default region. Propagating it would risk the receiver trying to insert into a region it does not know, making the insertion fail. **A conscious limitation: dtnex stays single-region**, and must be documented as such.
 
-### 5.4 Budget dimensionale e traffico
+### 5.4 Size budget and traffic
 
-Envelope ~33-37 byte, payload ~26-30 byte → **circa 60-67 byte per messaggio**, contro i ~50 attuali. `MAX_CBOR_BUFFER` resta 128, con margine abbondante.
+Envelope ~33-37 bytes, payload ~26-30 bytes → **roughly 60-67 bytes per message**, against the current ~50. `MAX_CBOR_BUFFER` stays at 128, with ample margin.
 
-**Volume di messaggi invariato.** Oggi: N contatti (`me↔B`) × N vicini = N². Domani: N contatti (`me→B`) × N vicini = N². Il passaggio a messaggi direzionali non raddoppia nulla, perché la direzione opposta la annuncia l'altro capo. Il volume cresce solo se ION ha più finestre temporali per la stessa coppia — nel qual caso si sta propagando informazione reale in più.
+**Message volume unchanged.** Today: N contacts (`me↔B`) × N neighbours = N². Tomorrow: N contacts (`me→B`) × N neighbours = N². Moving to directional messages doubles nothing, because the opposite direction is announced by the other end. The volume grows only if ION holds more time windows for the same pair — in which case genuinely more information is being propagated.
 
 ---
 
-## 6. Ricezione e scrittura in ION
+## 6. Reception and writing to ION
 
-### 6.1 Pipeline di validazione
+### 6.1 Validation pipeline
 
-In ordine, prima di toccare ION. Ogni fallimento: **scarta senza inserire e senza inoltrare**.
+In order, before touching ION. Every failure: **discard without inserting and without forwarding**.
 
-| # | controllo | motivo |
+| # | check | reason |
 |---|---|---|
-| 1 | `version == 3` | rete a versioni miste ricrea l'incoerenza |
-| 2 | HMAC valido | invariato |
-| 3 | nonce non duplicato | invariato |
-| 4 | `origin != me` | invariato (`dtnex.c:3196`) |
-| 5 | `fromNode == origin` | solo la sorgente annuncia la propria direzione |
-| 5b | `fromNode != toNode` | un contatto verso se stessi è la semantica dei *contatti di registrazione*, non topologia; l'origination lo filtra già, ma un peer in possesso della chiave potrebbe iniettarlo |
-| 6 | `toTime != 0` | in ION `toTime = 0` significa *contatto scoperto* → `MAX_POSIX_TIME`, cioè permanente (`rfx.h:53-56`) |
-| 7 | `fromTime < toTime` | integrità |
-| 7b | `fromTime <= 0` | in ION `fromTime = 0` significa *contatto ipotetico* |
-| 7c | `fromTime >= MAX_POSIX_TIME` | in ION è il trigger dei *contatti di registrazione* |
-| 7d | `xmitRate == 0` | ION rifiuta il contatto con errore utente 5 |
-| 7e | `confidence > 100` | fuori dal range 0-100: ION rifiuta con errore utente 4 |
-| 8 | `toTime > now` | già scaduto: inutile inserirlo e inondarlo |
-| 8b | `fromTime <= now + 30 giorni` | finestra troppo nel futuro: sospetto di clock skew (§7.6) |
+| 1 | `version == 3` | a mixed-version network recreates the inconsistency |
+| 2 | valid HMAC | unchanged |
+| 3 | nonce not duplicated | unchanged |
+| 4 | `origin != me` | unchanged (`dtnex.c:3196`) |
+| 5 | `fromNode == origin` | only the source announces its own direction |
+| 5b | `fromNode != toNode` | a contact towards oneself is the semantics of *registration contacts*, not topology; origination already filters it, but a peer holding the key could inject one |
+| 6 | `toTime != 0` | in ION `toTime = 0` means *discovered contact* → `MAX_POSIX_TIME`, i.e. permanent (`rfx.h:53-56`) |
+| 7 | `fromTime < toTime` | integrity |
+| 7b | `fromTime <= 0` | in ION `fromTime = 0` means *hypothetical contact* |
+| 7c | `fromTime >= MAX_POSIX_TIME` | in ION this is what triggers *registration contacts* |
+| 7d | `xmitRate == 0` | ION refuses the contact with user error 5 |
+| 7e | `confidence > 100` | outside the 0-100 range: ION refuses with user error 4 |
+| 8 | `toTime > now` | already expired: pointless to insert and flood |
+| 8b | `fromTime <= now + 30 days` | window too far in the future: suspected clock skew (§7.6) |
 
-**Non c'è un controllo sull'`owlt`.** La prima stesura ne prevedeva uno ("`owlt` presente e valido"), ma `owlt = 0` è un valore legittimo — su una LAN è quello fisicamente corretto, e ION accetta `a range ... 0`. Il controllo contraddiceva l'origination, dove `findOwlt` restituisce 0 come valore valido, e su un testbed locale avrebbe fatto scartare ogni contatto a ogni ricevente. Il formato v3 porta sempre il campo e §3.4 garantisce che si annuncino solo contatti per cui un range esiste davvero: il controllo in ricezione era ridondante.
+**There is no check on the `owlt`.** The first draft included one ("`owlt` present and valid"), but `owlt = 0` is a legitimate value — on a LAN it is the physically correct one, and ION accepts `a range ... 0`. The check contradicted origination, where `findOwlt` returns 0 as a valid value, and on a local testbed it would have made every receiver discard every contact. The v3 format always carries the field and §3.4 guarantees that only contacts for which a range really exists are announced: the receive-side check was redundant.
 
-Un messaggio scartato da questa pipeline restituisce **0**, non -1: lo scarto è una decisione di policy, non un fallimento di decodifica — il messaggio si è decodificato correttamente, si è solo deciso di non applicarlo. Un -1 risalirebbe fino a `decodeCborMessage` e produrrebbe un fuorviante "formato bundle sconosciuto" per un messaggio perfettamente valido.
+A message discarded by this pipeline returns **0**, not -1: the discard is a policy decision, not a decoding failure — the message decoded correctly, we simply decided not to apply it. A -1 would travel back up to `decodeCborMessage` and produce a misleading "unknown bundle format" for a perfectly valid message.
 
-Il controllo 5 rende superfluo un controllo esplicito su `fromNode == me`: cadrebbe già al 4. È la regola che si rilassa attivando l'escape hatch (§4.4).
+Check 5 makes an explicit `fromNode == me` check superfluous: such a message would already fall at check 4. It is the rule that gets relaxed when the escape hatch is enabled (§4.4).
 
-Il controllo 6 non è teorico: un messaggio malformato che innescasse quella semantica inserirebbe un contatto eterno, propagato per flooding a tutta la rete.
+Check 6 is not theoretical: a malformed message triggering that semantics would insert an eternal contact, flooded to the whole network.
 
-### 6.2 Scrittura del contatto
+### 6.2 Writing the contact
 
-Identità: `K = (regionNbr locale, fromNode, toNode, fromTime)`.
+Identity: `K = (local regionNbr, fromNode, toNode, fromTime)`.
 
-| stato in ION | azione |
+| state in ION | action |
 |---|---|
-| `K` non esiste | `rfx_insert_contact` |
-| `K` esiste, tutto identico | **no-op** |
-| `K` esiste, cambiano solo `xmitRate` / `confidence` | **`rfx_revise_contact`** — in place |
-| `K` esiste, cambia `toTime` | `rfx_remove_contact(&fromTime)` + `rfx_insert_contact` |
-| `K` non esiste ma la finestra si sovrappone a un altro contatto locale | ION rifiuta con codice 9, si mantiene quello locale, si logga a debug: **non è un fallimento** |
+| `K` does not exist | `rfx_insert_contact` |
+| `K` exists, everything identical | **no-op** |
+| `K` exists, only `xmitRate` / `confidence` change | **`rfx_revise_contact`** — in place |
+| `K` exists, `toTime` changes | `rfx_remove_contact(&fromTime)` + `rfx_insert_contact` |
+| `K` does not exist but the window overlaps another local contact | ION refuses with code 9, the local one is kept, it is logged at debug level: **this is not a failure** |
 
-**La riga che risolve il problema 1.3 è una sola: `&fromTime` al posto di `NULL`.** Con `NULL` ION applica lo scope `*` e cancella tutti i contatti della coppia; con il puntatore al `fromTime` esatto colpisce solo quello che si sta davvero aggiornando.
+**The line that solves problem 1.3 is a single one: `&fromTime` instead of `NULL`.** With `NULL`, ION applies the `*` scope and deletes every contact between the pair; with a pointer to the exact `fromTime` it touches only the one actually being updated.
 
-Le prime tre righe risolvono il churn: oggi *ogni* bundle ricevuto fa remove+insert. Con queste regole il refresh periodico — il caso dominante — non tocca ION.
+The first three rows solve the churn: today *every* received bundle performs a remove+insert. Under these rules the periodic refresh — the dominant case — does not touch ION at all.
 
-`rfx_revise_contact` (`include/ion/rfx.h:101`) ha chiave `(regionNbr, fromTime, fromNode, toNode)`, esattamente la tupla di identità.
+`rfx_revise_contact` (`include/ion/rfx.h:101`) is keyed on `(regionNbr, fromTime, fromNode, toNode)`, exactly the identity tuple.
 
-### 6.3 Scrittura del range
+### 6.3 Writing the range
 
-Stessa struttura, identità `(fromNode, toNode, fromTime)`, ma **non esiste `rfx_revise_range`**: non esiste → insert; identico → no-op; diverso → `rfx_remove_range(&fromTime)` + insert.
+Same structure, identity `(fromNode, toNode, fromTime)`, but **`rfx_revise_range` does not exist**: absent → insert; identical → no-op; different → `rfx_remove_range(&fromTime)` + insert.
 
-Contatto e range si inseriscono **nello stesso passaggio, dal medesimo messaggio**. È il motivo per cui `owlt` sta nel messaggio di contatto invece di avere un tipo `RangeMessage` separato: la coppia non può mai arrivare dimezzata, lasciando un contatto senza range (inutile a CGR) o un range orfano.
+Contact and range are inserted **in the same pass, from the same message**. This is why `owlt` lives inside the contact message instead of having a separate `RangeMessage` type: the pair can never arrive halved, leaving a contact without a range (useless to CGR) or an orphan range.
 
-> Trade-off registrato: in ION "reale" i range hanno spesso finestre più lunghe dei contatti, perché il ritardo di propagazione è una proprietà della geometria e resta valido a link spento. Per l'uso attuale di dtnex — annunciare raggiungibilità fra vicini — l'accoppiamento è più semplice e più robusto. Scelta reversibile.
+> Recorded trade-off: in "real" ION, ranges often have longer windows than contacts, because propagation delay is a property of geometry and stays valid while the link is down. For dtnex's current use — announcing reachability between neighbours — coupling them is simpler and more robust. A reversible choice.
 
-### 6.4 Controllo di esistenza
+### 6.4 Existence check
 
-Negli header non esiste nessuna `rfx_find_*`: il controllo richiede la camminata dell'RBT su `ionvdb->contactIndex` e `ionvdb->rangeIndex`, stesso pattern di `getContacts` (`dtnex.c:1120-1122`).
+The headers expose no `rfx_find_*`: the check requires walking the RBT over `ionvdb->contactIndex` and `ionvdb->rangeIndex`, the same pattern as `getContacts` (`dtnex.c:1120-1122`).
 
-Non è un hot path: un messaggio per vicino per `updateInterval`, più i flood.
+This is not a hot path: one message per neighbour per `updateInterval`, plus the floods.
 
-Serve una **primitiva di camminata riusabile**, perché la stessa serve a costruire lo snapshot `myContacts`. Una primitiva, due chiamanti — non un'unica funzione che fa entrambe le cose, altrimenti si riaccoppia la cache alle scritture.
+A **reusable walking primitive** is needed, because the same walk is used to build the `myContacts` snapshot. One primitive, two callers — not a single function doing both jobs, otherwise the cache gets re-coupled to the writes.
 
-### 6.5 Inoltro
+### 6.5 Forwarding
 
-Invariato: un messaggio che supera la validazione viene inserito e poi inoltrato a tutti i vicini tranne `origin` e `from`. Un messaggio scartato non viene inoltrato.
+Unchanged: a message that passes validation is inserted and then forwarded to every neighbour except `origin` and `from`. A discarded message is not forwarded.
 
-I contatti con `toNode == me` seguono la regola generale: si inseriscono **e** si inoltrano. Sono topologia utile anche al resto della rete.
+Contacts with `toNode == me` follow the general rule: they are inserted **and** forwarded. They are useful topology for the rest of the network too.
 
-### 6.6 Rilevazione del restart di ION
+### 6.6 Detecting an ION restart
 
-`getContacts` oggi fa doppio lavoro: stampa la tabella diagnostica **e** rileva il restart con la regola *"zero contatti → ION è ripartito → riavvia dtnex"* (`dtnex.c:1192-1194`).
+`getContacts` today does double duty: it prints the diagnostic table **and** detects a restart with the rule *"zero contacts → ION restarted → restart dtnex"* (`dtnex.c:1192-1194`).
 
-Quella regola diventa dannosa nel design nuovo: un nodo appena avviato, o un nodo di bordo senza contatti ancora configurati, ha legittimamente zero contatti e si riavvierebbe in loop.
+That rule becomes harmful in the new design: a freshly started node, or an edge node with no contacts configured yet, legitimately has zero contacts and would restart in a loop.
 
-**Va sostituita** con un rilevamento esplicito: il campo `ownNodeNbr` dell'IonDB, oppure il fallimento della transazione SDR, già gestito a `dtnex.c:1100-1106`.
+**It must be replaced** with explicit detection: the `ownNodeNbr` field of the IonDB, or the failure of the SDR transaction, which is already handled at `dtnex.c:1100-1106`.
 
-È un bug preesistente e scollegato, ma il redesign lo rende attivamente dannoso: incluso in scope.
+It is a pre-existing, unrelated bug, but the redesign makes it actively harmful: included in scope.
 
 ---
 
-## 7. Ciclo di vita, cache, concorrenza
+## 7. Lifecycle, caching, concurrency
 
-### 7.1 Quando si annuncia
+### 7.1 When an announcement happens
 
-Tre trigger, invece dei due attuali:
+Three triggers, instead of the current two:
 
-1. è passato `updateInterval`
-2. la lista dei `plans` è cambiata (già oggi)
-3. **lo snapshot `myContacts` è cambiato** rispetto al precedente
+1. `updateInterval` has elapsed
+2. the `plans` list changed (already the case today)
+3. **the `myContacts` snapshot changed** with respect to the previous one
 
-Il terzo è nuovo: si confronta lo snapshot corrente con il precedente. Serve perché oggi un contatto aggiunto a ionrc viene scoperto dalla rete solo entro `updateInterval` (fino a 30 minuti).
+The third is new: the current snapshot is compared against the previous one. It is needed because today a contact added to ionrc is discovered by the network only within `updateInterval` (up to 30 minutes).
 
-**Cadenza:** il confronto avviene a ogni rinfresco della cache `myContacts`, quindi la reattività del trigger 3 è governata dal TTL della cache, non da `updateInterval`. È il TTL a fissare il compromesso fra reattività ai cambi di ionrc e frequenza di accesso a ION.
+**Cadence:** the comparison happens at every refresh of the `myContacts` cache, so the responsiveness of trigger 3 is governed by the cache TTL, not by `updateInterval`. It is the TTL that sets the compromise between responsiveness to ionrc changes and the frequency of ION accesses.
 
-### 7.2 Cambio di semantica di `contactLifetime`
+### 7.2 Change in the meaning of `contactLifetime`
 
-Oggi `contactLifetime` determina la durata del contatto annunciato (`dtnex.c:748`). Nel design nuovo la durata viene da ION: **quel parametro non governa più nulla sui contatti**.
+Today `contactLifetime` determines the lifetime of the announced contact (`dtnex.c:748`). In the new design the lifetime comes from ION: **that parameter no longer governs anything about contacts**.
 
-`expireTime` dell'envelope diventa il `toTime` del contatto stesso — il messaggio è utile esattamente finché è valido il contatto che descrive. `contactLifetime` resta in uso solo per i messaggi di metadata.
+The envelope's `expireTime` becomes the `toTime` of the contact itself — the message is useful exactly as long as the contact it describes is valid. `contactLifetime` remains in use only for metadata messages.
 
-**È un cambio di comportamento visibile a chi ha un `dtnex.conf` in produzione**: dopo l'aggiornamento la durata dei contatti annunciati non dipende più dalla configurazione ma da ionrc. Va nel changelog.
+**This is a behavioural change visible to anyone with a `dtnex.conf` in production**: after the upgrade, the lifetime of announced contacts no longer depends on the configuration but on ionrc. It belongs in the changelog.
 
-### 7.3 Soft state e scadenza
+### 7.3 Soft state and expiry
 
-I contatti restano soft state, con una proprietà nuova che discende direttamente dai tempi assoluti: **la scadenza è consistente su tutta la rete**. Il contatto `A→B` scade allo stesso istante su A, su B e su ogni nodo raggiunto dal flooding. Prima ogni hop ricalcolava la propria finestra e la stessa informazione moriva in momenti diversi.
+Contacts remain soft state, with a new property that follows directly from absolute times: **expiry is consistent across the whole network**. The contact `A→B` expires at the same instant on A, on B and on every node reached by the flooding. Previously each hop recomputed its own window and the same piece of information died at different moments.
 
-Il refresh periodico riannuncia la stessa finestra assoluta → per le regole di §6.2 è un no-op.
+The periodic refresh re-announces the same absolute window → by the rules of §6.2 it is a no-op.
 
-**Limite accettato, da documentare: non esiste revoca.** Se l'operatore cancella un contatto da ION locale, le copie remote restano fino al loro `toTime`. Un messaggio di withdraw aprirebbe problemi di autenticazione e di flooding di cancellazioni: fuori scope. La scadenza naturale è una rete di sicurezza sufficiente.
+**Accepted limitation, to be documented: there is no revocation.** If the operator deletes a contact from the local ION, the remote copies stay until their `toTime`. A withdraw message would open up authentication problems and the flooding of deletions: out of scope. Natural expiry is a sufficient safety net.
 
-### 7.4 Cache
+### 7.4 Caching
 
-**Solo TTL, nessuna invalidazione su scrittura**, sia per `plans` che per `myContacts`, con il meccanismo già in uso.
+**TTL only, no invalidation on write**, for both `plans` and `myContacts`, using the mechanism already in place.
 
-La correttezza poggia interamente sulla regola `fromNode == me` (§4): nessuna scrittura che dtnex fa in ION può rientrare nel set di origination. **Va scritto come commento nel codice accanto alla cache**: se qualcuno rilassa quel filtro senza accorgersene, la cache diventa silenziosamente sbagliata.
+Correctness rests entirely on the `fromNode == me` rule (§4): no write dtnex performs on ION can fall into the origination set. **This must be written as a comment in the code next to the cache**: if anyone relaxes that filter without noticing, the cache silently becomes wrong.
 
-Il valore del TTL non è una micro-ottimizzazione: governa la reattività del trigger 3 di §7.1. Un TTL breve fa scoprire prima i cambi di ionrc al costo di più accessi a ION; un TTL lungo fa il contrario. Va scelto con quel compromesso in mente, non copiato dai 20 secondi della cache dei plan senza ragionarci.
+The TTL value is not a micro-optimisation: it governs the responsiveness of trigger 3 in §7.1. A short TTL discovers ionrc changes sooner at the cost of more ION accesses; a long TTL does the opposite. It must be chosen with that trade-off in mind, not copied from the 20 seconds of the plan cache without thinking it through.
 
-### 7.5 Concorrenza
+### 7.5 Concurrency
 
-**`myContacts` è mono-thread.** Lo tocca solo il main loop, in origination. Il thread di ricezione fa le proprie camminate RBT per il controllo di esistenza, su una primitiva separata che non scrive nell'array. **Nessun mutex nuovo**; la protezione sulle letture concorrenti di ION la fornisce già la transazione SDR.
+**`myContacts` is single-threaded.** Only the main loop touches it, during origination. The reception thread performs its own RBT walks for the existence check, on a separate primitive that does not write into the array. **No new mutex**; protection for concurrent reads of ION is already provided by the SDR transaction.
 
-**`plans` ha invece una race che esiste già oggi.** `getplanlist()` scrive nelle statiche `cachedPlans[]` / `cachedPlanCount` ed è chiamata sia dal main loop sia dal thread di ricezione via `forwardCborContactMessage` (`dtnex.c:3358`). Non è introdotta dal redesign, **ma il redesign la risolve**: è un mutex su una funzione sola, con l'unlock su tutti i cammini di uscita.
+**`plans`, on the other hand, has a race that already exists today.** `getplanlist()` writes into the statics `cachedPlans[]` / `cachedPlanCount` and is called both from the main loop and from the reception thread via `forwardCborContactMessage` (`dtnex.c:3358`). It is not introduced by the redesign, **but the redesign fixes it**: it is one mutex on a single function, with the unlock on every exit path.
 
-Il precedente testo di questa sezione diceva che la race restava aperta pur essendo "inclusa in scope" — due affermazioni incompatibili. Vale la seconda: si corregge.
+The previous text of this section said the race stayed open while also being "in scope" — two incompatible statements. The second one holds: it gets fixed.
 
-### 7.6 Errori e diagnostica
+### 7.6 Errors and diagnostics
 
-**Fallimenti di inserimento.** Le `rfx_*` restituiscono `-1` su errore di sistema e `> 0` su errore utente. Le due classi vanno tenute separate, perché hanno significato opposto.
+**Insertion failures.** The `rfx_*` calls return `-1` on a system error and `> 0` on a user error. The two classes must be kept apart, because they mean opposite things.
 
-Il controllo di esistenza di §6.4 cerca per `fromTime` **esatto**: per costruzione non può rilevare le sovrapposizioni. Un errore utente è quindi non solo possibile ma **atteso in regime stazionario**: in un ionrc bidirezionale convenzionale entrambi i nodi dichiarano entrambe le direzioni con tempi relativi, quindi il contatto `A→B` che B annuncia si sovrappone a quello che B stesso ha già configurato in locale, ma con un `fromTime` assoluto diverso. `rfx_insert_contact` lo rifiuta con il codice 9 ("overlapping contact ignored"), e questo è il comportamento corretto: si mantiene la voce configurata dall'operatore.
+The existence check of §6.4 looks up an **exact** `fromTime`: by construction it cannot detect overlaps. A user error is therefore not merely possible but **expected in steady state**: in a conventional bidirectional ionrc both nodes declare both directions with relative times, so the `A→B` contact that B announces overlaps the one B itself has already configured locally, but with a different absolute `fromTime`. `rfx_insert_contact` refuses it with code 9 ("overlapping contact ignored"), and that is the correct behaviour: the operator-configured entry is kept.
 
-Regole:
+Rules:
 
-- **`rc < 0`** è l'unica anomalia: log a livello non-debug, esito `IONC_ERROR`.
-- **`rc > 0`** è una condizione locale attesa: log **a debug** con il *significato* del codice (9 = sovrapposizione con voce locale, 7 = region non corrispondente, 5 = xmitRate nullo, 4 = confidence fuori range, 2 su revise = contatto bersaglio non Scheduled), esito `IONC_NOOP`, **nessun return anticipato**: la scrittura del range prosegue comunque, perché un rifiuto sul contatto non deve impedire a ION di imparare l'OWLT.
-- **`rfx_insert_range` che restituisce 1** non è nemmeno un errore utente: il sorgente di ION lo commenta come *idempotente* (il range c'è già con lo stesso `owlt`). È un successo, esito `IONC_NOOP`.
-- `*cxaddr` / `*rxaddr` valgono come riscontro incrociato del rifiuto (`rfx.h:62-63`), con l'eccezione dei codici emessi dalla scansione dei conflitti (insert contatto 8 e 9, insert range 1 e 2), dove ION lascia di proposito l'indirizzo della voce in conflitto.
+- **`rc < 0`** is the only anomaly: logged at non-debug level, outcome `IONC_ERROR`.
+- **`rc > 0`** is an expected local condition: logged **at debug level** with the *meaning* of the code (9 = overlap with a local entry, 7 = region mismatch, 5 = zero xmitRate, 4 = confidence out of range, 2 on revise = target contact not Scheduled), outcome `IONC_NOOP`, **no early return**: the range write proceeds regardless, because a refusal on the contact must not stop ION from learning the OWLT.
+- **`rfx_insert_range` returning 1** is not even a user error: ION's own source comments it as *idempotent* (the range is already there with the same `owlt`). It is a success, outcome `IONC_NOOP`.
+- `*cxaddr` / `*rxaddr` serve as a cross-check on the refusal (`rfx.h:62-63`), with the exception of the codes emitted by the conflict scan (contact insert 8 and 9, range insert 1 and 2), where ION deliberately leaves the address of the conflicting entry.
 
-**Sfasamento degli orologi.** I tempi assoluti presuppongono nodi sincronizzati. ION lo richiede già per CGR, ma il guasto diventa visibile: un nodo con l'orologio indietro di un'ora vedrebbe tutti i contatti altrui cadere sul controllo 8 e resterebbe isolato senza spiegazione.
+**Clock skew.** Absolute times presuppose synchronised nodes. ION already requires this for CGR, but the failure becomes visible: a node whose clock is an hour behind would see every other node's contacts fall at check 8 and would stay isolated with no explanation.
 
-Mitigazione: quando un messaggio viene scartato perché la sua finestra è interamente nel passato **o interamente troppo nel futuro**, loggarlo esplicitamente come sospetto di clock skew. Costa una riga e trasforma un guasto muto in uno diagnosticabile.
+Mitigation: when a message is discarded because its window lies entirely in the past **or entirely too far in the future**, log it explicitly as suspected clock skew. It costs one line and turns a mute failure into a diagnosable one.
 
-**Disconnessione di ION a metà operazione.** Invariata: la gestione esistente su fallimento della transazione SDR (`dtnex.c:1100-1106`) copre il caso, ed è la stessa che al §6.6 sostituisce la regola "zero contatti = restart".
+**ION disconnecting mid-operation.** Unchanged: the existing handling on SDR transaction failure (`dtnex.c:1100-1106`) covers the case, and it is the same one that in §6.6 replaces the "zero contacts = restart" rule.
 
 ---
 
-## 8. Impatto sul codice
+## 8. Impact on the code
 
-| punto | intervento |
+| item | change |
 |---|---|
-| `ContactInfo` (`dtnex.h:119`) | sostituita dalla struttura a 7 campi (§3.2) |
+| `ContactInfo` (`dtnex.h:119`) | replaced by the 7-field structure (§3.2) |
 | `DTNEX_PROTOCOL_VERSION` | 2 → 3 |
-| `exchangeWithNeighbors` (`dtnex.c:674`) | riscritta: sorgente `myContacts`, non più i plan |
-| `getplanlist` (`dtnex.c:498`) | ruolo invariato, aggiunto mutex (§7.5) |
-| `getContacts` (`dtnex.c:1009`) | scorporata: resta la stampa diagnostica, esce la rilevazione restart (§6.6) |
-| nuove primitive | camminata RBT contatti, camminata range, join per `owlt` |
-| `encodeCborContactMessage` | nuovo payload (§5.2) |
-| `decodeCborMessage` | nuovo payload + tabella di validazione (§6.1) |
-| `processCborContactMessage` (`dtnex.c:3190`) | riscritta: regole idempotenti, `&fromTime` al posto di `NULL` |
-| `forwardCborContactMessage` (`dtnex.c:3358`) | logica invariata, si adegua ai nuovi campi |
-| `CLAUDE.md` | correzioni applicate (§10) |
+| `exchangeWithNeighbors` (`dtnex.c:674`) | rewritten: source is `myContacts`, no longer the plans |
+| `getplanlist` (`dtnex.c:498`) | role unchanged, mutex added (§7.5) |
+| `getContacts` (`dtnex.c:1009`) | split up: the diagnostic printout stays, restart detection moves out (§6.6) |
+| new primitives | contact RBT walk, range walk, join for the `owlt` |
+| `encodeCborContactMessage` | new payload (§5.2) |
+| `decodeCborMessage` | new payload + validation table (§6.1) |
+| `processCborContactMessage` (`dtnex.c:3190`) | rewritten: idempotent rules, `&fromTime` instead of `NULL` |
+| `forwardCborContactMessage` (`dtnex.c:3358`) | logic unchanged, adapted to the new fields |
+| `CLAUDE.md` | corrections applied (§10) |
 
-### 8.1 Estrazione di `ion_contacts.c`
+### 8.1 Extracting `ion_contacts.c`
 
-Tutto ciò che parla direttamente con ION viene estratto in un file separato: camminate RBT, join contatto/range, e le regole di scrittura di §6.2-6.3.
+Everything that talks directly to ION is extracted into a separate file: RBT walks, the contact/range join, and the write rules of §6.2-6.3.
 
-**Perché il rischio è basso:** non è "sposta e poi cambia". La lettura di `myContacts` e il join sono codice nuovo; le regole di scrittura sono una riscrittura completa di `processCborContactMessage`, di cui non sopravvive quasi nulla. L'unica cosa realmente spostata è la camminata RBT, una ventina di righe dal pattern di `getContacts`.
+**Why the risk is low:** this is not "move it and then change it". Reading `myContacts` and the join are new code; the write rules are a complete rewrite of `processCborContactMessage`, of which almost nothing survives. The only thing genuinely moved is the RBT walk, some twenty lines from the `getContacts` pattern.
 
-**Payoff concreto:** le prove 1, 4 e 5 del piano di validazione (§9) esercitano solo questo modulo, contro un ION vivo, senza bundle né rete.
+**Concrete payoff:** tests 1, 4 and 5 of the validation plan (§9) exercise this module alone, against a live ION, with no bundles and no network.
 
-**Confine, da rispettare:** il modulo espone tre operazioni —
+**A boundary to respect:** the module exposes three operations —
 
-1. leggi il set di contatti annunciabili (filtro `fromNode == me`, join con i range)
-2. applica un contatto+range ricevuto (regole idempotenti)
-3. stampa la tabella diagnostica
+1. read the set of announceable contacts (filter `fromNode == me`, join with the ranges)
+2. apply a received contact+range (idempotent rules)
+3. print the diagnostic table
 
-— e **non conosce CBOR, bundle, HMAC, vicini o flooding**. Se l'encoding vi scivola dentro perché "è roba di contatti", il modulo smette di essere testabile da solo e si perde l'unica ragione per cui esiste.
+— and it **knows nothing about CBOR, bundles, HMAC, neighbours or flooding**. If encoding slips in because "it's contact stuff", the module stops being testable on its own and the only reason it exists is lost.
 
 ---
 
-## 9. Validazione
+## 9. Validation
 
-Non esiste test suite: la validazione è manuale in `--debug`. Ogni prova è mappata su un problema specifico, così la verifica è "questo problema è chiuso" e non "sembra funzionare".
+There is no test suite: validation is manual, in `--debug`. Every test is mapped onto a specific problem, so that the verification reads "this problem is closed" and not "it seems to work".
 
-| # | prova | verifica |
+| # | test | verification |
 |---|---|---|
-| 1 | Nodo singolo | Lo snapshot `myContacts` coincide campo per campo con `l contact` / `l range` di ionadmin → **problema 1.1** |
-| 2 | Due nodi | Il contatto inserito su B ha `fromTime`, `toTime`, `xmitRate`, `owlt` identici a quelli che A ha letto da ION; nessuna riscrittura di start time → **problema 1.1 end-to-end** |
-| 3 | Due nodi | L'`owlt` su B corrisponde al range configurato su A, non a 1 secondo. Contatto senza range su A → non annunciato, e il log lo dice → **problema 1.2** |
-| 4 | Regressione mirata | Si configura a mano via ionadmin un contatto per la coppia, poi arriva un messaggio per la stessa coppia con `fromTime` diverso. **Il contatto manuale deve sopravvivere** (oggi sparisce) → **problema 1.3** |
-| 5 | Anti-churn | Due cicli di update consecutivi senza cambiamenti: il secondo non produce nessuna `rfx_insert` o `rfx_remove` → **churn** |
-| 6 | Tre nodi (se disponibile il testbed) | Lo stesso contatto propagato in due hop ha `fromTime`/`toTime` identici su tutti e tre → **proprietà di §7.3** |
+| 1 | Single node | The `myContacts` snapshot matches ionadmin's `l contact` / `l range` field by field → **problem 1.1** |
+| 2 | Two nodes | The contact inserted on B has the same `fromTime`, `toTime`, `xmitRate`, `owlt` that A read from ION; no rewriting of the start time → **problem 1.1 end-to-end** |
+| 3 | Two nodes | The `owlt` on B matches the range configured on A, not 1 second. A contact with no range on A → not announced, and the log says so → **problem 1.2** |
+| 4 | Targeted regression | A contact for the pair is configured by hand via ionadmin, then a message arrives for the same pair with a different `fromTime`. **The manual contact must survive** (today it disappears) → **problem 1.3** |
+| 5 | Anti-churn | Two consecutive update cycles with no changes: the second produces no `rfx_insert` or `rfx_remove` → **churn** |
+| 6 | Three nodes (if the testbed is available) | The same contact propagated over two hops has identical `fromTime`/`toTime` on all three → **property of §7.3** |
 
 ---
 
-## 10. Correzioni alla documentazione
+## 10. Documentation corrections
 
-`CLAUDE.md` conteneva tre imprecisioni verificate, tutte corrette:
+`CLAUDE.md` contained three verified inaccuracies, all corrected:
 
-- dichiarava il payload di tipo 1 come `[nodeA, nodeB, duration_min, datarate_bps, reliability]`; oggi documenta il payload a 7 campi (`[fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt]`) del nuovo design
-- dichiarava il data rate in **bit** al secondo; oggi dice esplicitamente `xmitRate` in **byte** al secondo, come in ION (`include/ion/ion.h:203`)
-- etichettava i due messaggi come "Type 1" e "Type 2", come se `type` fosse un intero sul filo; oggi le etichette sono "Type \"c\"" e "Type \"m\"", coerenti col valore reale del campo (stringa di testo, vedi `README.md`)
+- it declared the type 1 payload as `[nodeA, nodeB, duration_min, datarate_bps, reliability]`; it now documents the new design's 7-field payload (`[fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt]`)
+- it declared the data rate in **bits** per second; it now says explicitly `xmitRate` in **bytes** per second, as in ION (`include/ion/ion.h:203`)
+- it labelled the two messages as "Type 1" and "Type 2", as if `type` were an integer on the wire; the labels are now "Type \"c\"" and "Type \"m\"", consistent with the field's actual value (a text string, see `README.md`)
 
 ---
 
-## 11. Decisioni registrate e loro reversibilità
+## 11. Recorded decisions and their reversibility
 
-| decisione | reversibile? |
+| decision | reversible? |
 |---|---|
-| Tempi assoluti sul filo | No — è il fondamento del design |
-| Messaggi direzionali (uno per direzione) | No — determina struttura e regola di autorità |
-| Filtro di origination `fromNode == me` | **Sì** — via escape hatch §4.4, senza toccare il formato del messaggio |
-| Inserire i contatti con `toNode == me` | Sì — indipendente da cosa si annuncia |
-| `owlt` dentro il messaggio di contatto, niente `RangeMessage` | Sì — §6.3 |
-| Mono-region, `regionNbr` fuori dal protocollo | Sì — richiede bump di versione |
-| `confidence` come intero 0-100 | Vincolato da `cbor.h`, non da scelta |
-| Nessun flag `owned`, nessun registro locale | Conseguenza dei tempi assoluti |
-| Nessuna revoca esplicita dei contatti | Sì — richiederebbe un nuovo tipo di messaggio |
+| Absolute times on the wire | No — it is the foundation of the design |
+| Directional messages (one per direction) | No — it determines the structure and the authority rule |
+| Origination filter `fromNode == me` | **Yes** — via the escape hatch of §4.4, without touching the message format |
+| Inserting contacts with `toNode == me` | Yes — independent of what is announced |
+| `owlt` inside the contact message, no `RangeMessage` | Yes — §6.3 |
+| Single-region, `regionNbr` outside the protocol | Yes — requires a version bump |
+| `confidence` as an integer 0-100 | Constrained by `cbor.h`, not a choice |
+| No `owned` flag, no local registry | A consequence of absolute times |
+| No explicit contact revocation | Yes — would require a new message type |
 
 ---
 
-## 12. Limiti noti emersi in implementazione
+## 12. Known limitations that emerged during implementation
 
-Tre punti aperti che la review finale del branch ha trovato e che **non** vengono
-corretti nell'ondata di fix pre-merge. Sono registrati qui per non perderli, non
-per essere risolti adesso.
+Three open points that the final review of the branch found and that are **not**
+fixed in the pre-merge wave of fixes. They are recorded here so as not to lose
+them, not to be solved right now.
 
-### 12.1 Rilevazione del restart di ION insufficiente
+### 12.1 ION restart detection is insufficient
 
-§6.6 prescrive `ownNodeNbr` oppure il fallimento della transazione SDR. Ma un ciclo
-`ionstop && ionstart` **conserva** `ownNodeNbr`: il restart più comune non viene
-rilevato. Serve un marcatore d'istanza — per esempio l'identità della partizione di
-working memory, oppure il `PsmAddress` di `contactIndex` memorizzato all'avvio, che
-una vdb nuova rialloca. Richiede una decisione di design.
+§6.6 prescribes `ownNodeNbr` or the failure of the SDR transaction. But an
+`ionstop && ionstart` cycle **preserves** `ownNodeNbr`: the most common restart goes
+undetected. An instance marker is needed — for example the identity of the working
+memory partition, or the `PsmAddress` of `contactIndex` recorded at startup, which a
+fresh vdb reallocates. This requires a design decision.
 
-### 12.2 Il join simmetrico dei range indebolisce §3.4
+### 12.2 The symmetric range join weakens §3.4
 
-`findOwlt` accetta anche il verso opposto, e `ionc_apply_contact` inserisce un range
-`(origin → me)` per ogni contatto accettato: quel range è un candidato valido per il
-contatto locale `(me → origin)`, quindi un contatto locale **privo** di range può
-comunque essere annunciato usando un OWLT imparato da un peer. §3.4 prometteva che un
-errore di configurazione dell'`ionrc` diventasse visibile; qui può venire
-silenziosamente coperto.
+`findOwlt` accepts the opposite direction too, and `ionc_apply_contact` inserts a range
+`(origin → me)` for every accepted contact: that range is a valid candidate for the
+local contact `(me → origin)`, so a local contact **with no** range can still be
+announced using an OWLT learned from a peer. §3.4 promised that an `ionrc`
+configuration error would become visible; here it can be silently covered up.
 
-La review ha verificato che non produce churn né oscillazione: il valore è
-deterministico e in configurazione simmetrica i due OWLT coincidono. Il costo è la
-diagnostica persa, non l'instabilità.
+The review verified that this produces neither churn nor oscillation: the value is
+deterministic and in a symmetric configuration the two OWLTs coincide. The cost is the
+lost diagnostics, not instability.
 
-Mitigazione futura: preferire il verso esatto e ricadere sull'opposto solo in sua
-assenza. Va inoltre annotato che l'invariante della cache scritto in `dtnex.c` vale
-per i campi di identità del contatto ma **non** per `owlt`.
+Future mitigation: prefer the exact direction and fall back to the opposite one only in
+its absence. It should also be noted that the cache invariant written in `dtnex.c` holds
+for the contact's identity fields but **not** for `owlt`.
 
-### 12.3 Gli header ION di `include/ion/` non corrispondono alla libreria installata
+### 12.3 The ION headers in `include/ion/` do not match the installed library
 
-Sono di una release diversa: `IonRegion`, `IonDB`, `IonNode` e `IonContact`
-divergono, e `MAX_POSIX_TIME` vale 2147397247 nel bundle contro 2147483647
-nell'installato. La review ha verificato che i layout da cui questo branch dipende —
-`IonCXref`, `IonRXref`, `IonVdb`, l'offset di `ownNodeNbr` in `IonDB` — **coincidono**,
-quindi oggi il modulo è salvo; ma il commit `87590d4` di questo stesso branch esiste
-proprio perché una di queste divergenze aveva corrotto silenziosamente le letture RBT.
+They come from a different release: `IonRegion`, `IonDB`, `IonNode` and `IonContact`
+diverge, and `MAX_POSIX_TIME` is 2147397247 in the bundled headers against 2147483647
+in the installed ones. The review verified that the layouts this branch depends on —
+`IonCXref`, `IonRXref`, `IonVdb`, the offset of `ownNodeNbr` in `IonDB` — **do match**,
+so the module is safe today; but commit `87590d4` on this very branch exists precisely
+because one of these divergences had silently corrupted the RBT reads.
 
-Mitigazione futura: risincronizzare gli header, oppure aggiungere in `ion_contacts.c`
-un paio di `_Static_assert` su `sizeof(IonCXref)`, `offsetof(IonCXref, fromTime)` e
-`sizeof(IonVdb)`, per trasformare il prossimo disallineamento in un errore di
-compilazione anziché in una corruzione muta.
+Future mitigation: resynchronise the headers, or add a couple of `_Static_assert`s in
+`ion_contacts.c` on `sizeof(IonCXref)`, `offsetof(IonCXref, fromTime)` and
+`sizeof(IonVdb)`, to turn the next mismatch into a compile error rather than mute
+corruption.
 
 ---
 
-## 13. Terminazione e integrità della transazione SDR
+## 13. Termination and SDR transaction integrity
 
-**Aggiunto il 2026-08-08**, dopo l'esecuzione delle prove del §9 su un ION vivo. Non
-faceva parte del redesign dello scambio di contatti: è emerso validandolo.
+**Added on 2026-08-08**, after running the §9 tests against a live ION. It was not
+part of the contact-exchange redesign: it surfaced while validating it.
 
-### 13.1 Perché si tocca la terminazione
+### 13.1 Why termination is being touched
 
-Durante le prove il nodo ION si è bloccato più volte: `ionadmin` e `bplist` fermi per
-minuti su un semaforo in memoria condivisa, mentre `sdrwatch` — che non prende il lock
-della transazione — continuava a rispondere. Una misura in particolare: `ionadmin` fermo
-da due minuti si è sbloccato **due secondi dopo l'arresto di dtnex**. In un'altra
-occasione dtnex non ha risposto a SIGTERM.
+During the tests the ION node locked up several times: `ionadmin` and `bplist` stuck for
+minutes on a shared-memory semaphore, while `sdrwatch` — which does not take the
+transaction lock — kept responding. One measurement in particular: `ionadmin`, stuck for
+two minutes, unblocked **two seconds after dtnex was stopped**. On another occasion
+dtnex did not respond to SIGTERM at all.
 
-Il meccanismo che spiega l'osservazione sta in `signalHandler` (`dtnex.c:995-1069`).
-L'handler non si limita a segnalare la terminazione: logga, chiama `bp_interrupt`, fa
-`pthread_join`, `bp_close`, `bp_detach`, e chiude con `exit(0)`. I segnali sono
-installati con `sigaction` in `main` prima che nascano i thread (`dtnex.c:1679-1685`),
-quindi **l'handler può eseguire su un thread qualsiasi**. Se il segnale arriva mentre un
-thread è dentro una transazione SDR — il ciclo principale in `ionc_get_own_contacts`, il
-thread di ricezione in `ionc_apply_contact`, `getplanlist` — quell'`exit(0)` termina il
-processo con la transazione aperta. Il lock della transazione vive nella memoria
-condivisa di ION, non nel processo: resta preso, e ogni altro client ION si blocca
-finché non arriva `ionunlock` o un `killm`.
+The mechanism that explains the observation lives in `signalHandler` (`dtnex.c:995-1069`).
+The handler does not merely signal termination: it logs, calls `bp_interrupt`, performs
+`pthread_join`, `bp_close`, `bp_detach`, and finishes with `exit(0)`. The signals are
+installed with `sigaction` in `main` before any thread is born (`dtnex.c:1679-1685`),
+so **the handler can run on any thread whatsoever**. If the signal arrives while a
+thread is inside an SDR transaction — the main loop in `ionc_get_own_contacts`, the
+reception thread in `ionc_apply_contact`, `getplanlist` — that `exit(0)` terminates the
+process with the transaction open. The transaction lock lives in ION's shared memory,
+not in the process: it stays held, and every other ION client blocks until an
+`ionunlock` or a `killm` arrives.
 
-**È un'ipotesi coerente con le osservazioni, non una dimostrazione:** l'istante del
-segnale non è stato catturato. Ma basta a giustificare l'intervento, perché il difetto è
-visibile staticamente e indipendente dall'episodio: un `exit()` chiamato da contesto
-asincrono mentre un altro thread può trovarsi dentro una transazione è scorretto
-comunque.
+**This is a hypothesis consistent with the observations, not a proof:** the instant of
+the signal was never captured. But it is enough to justify the change, because the
+defect is visible statically and independent of the episode: an `exit()` called from
+asynchronous context while another thread may be inside a transaction is incorrect
+regardless.
 
-Per chiarezza: **la v2.52 ha lo stesso difetto** — stesso handler, stessi tre segnali,
-stesso `exit(0)`. Non si sta ripristinando un comportamento perduto; si sta chiudendo
-un'esposizione che la versione shell non aveva, perché parlava con ION solo attraverso
-`ionadmin`, e ogni invocazione apriva e chiudeva la propria transazione.
+For clarity: **v2.52 has the same defect** — same handler, same three signals, same
+`exit(0)`. No lost behaviour is being restored; what is being closed is an exposure the
+shell version did not have, because it talked to ION only through `ionadmin`, and every
+invocation opened and closed its own transaction.
 
-### 13.2 Perché si elimina l'handler asincrono invece di alleggerirlo
+### 13.2 Why the asynchronous handler is removed rather than slimmed down
 
-La soluzione minima sarebbe ridurre l'handler a `running = 0` e spostare il teardown nel
-ciclo principale. Risolve il problema del lock, e da sola basterebbe.
+The minimal solution would be to reduce the handler to `running = 0` and move the
+teardown into the main loop. That solves the lock problem, and on its own would suffice.
 
-Si va oltre per una ragione indipendente: **quasi tutto ciò che l'handler fa oggi non è
-async-signal-safe.** `dtnex_log` è `printf`; `pthread_join` e `bp_close` non sono nella
-lista POSIX delle funzioni chiamabili da un handler. Un `printf` interrotto a metà da un
-altro `printf` può bloccarsi sul lock interno di stdio: un deadlock che non lascia
-traccia, e che spiegherebbe il dtnex rimasto sordo a SIGTERM. Alleggerire l'handler
-lascerebbe la categoria aperta, pronta a riaprirsi la prossima volta che qualcuno
-aggiunge "solo una riga di log" lì dentro.
+We go further for an independent reason: **almost everything the handler does today is
+not async-signal-safe.** `dtnex_log` is `printf`; `pthread_join` and `bp_close` are not
+in the POSIX list of functions callable from a handler. A `printf` interrupted halfway
+by another `printf` can deadlock on stdio's internal lock: a deadlock that leaves no
+trace, and which would explain the dtnex that stayed deaf to SIGTERM. Slimming the
+handler down would leave the whole category open, ready to reappear the next time
+somebody adds "just one log line" in there.
 
-Il pattern `sigwait` la chiude alla radice. I tre segnali vengono bloccati in tutti i
-thread e un thread dedicato li raccoglie con `sigwait()`. Quel thread **non è un
-handler**: è codice ordinario in contesto ordinario, dove loggare, fare join e chiamare
-le API di ION è lecito. Non resta nessuna funzione da tenere async-signal-safe, quindi
-nessuna regola che un contributore futuro possa violare senza accorgersene. Il costo è
-una maschera dei segnali da impostare prima di creare qualunque thread — un vincolo
-verificabile in un punto solo, contro un invariante diffuso su ogni riga dell'handler.
+The `sigwait` pattern closes it at the root. The three signals are blocked in every
+thread and a dedicated thread collects them with `sigwait()`. That thread **is not a
+handler**: it is ordinary code in ordinary context, where logging, joining and calling
+the ION API are all legitimate. No function is left that must be kept
+async-signal-safe, hence no rule that a future contributor could break without
+noticing. The cost is a signal mask to set before creating any thread — a constraint
+verifiable in a single place, against an invariant spread over every line of the
+handler.
 
-### 13.3 Struttura della terminazione
+### 13.3 Structure of the termination
 
-1. In `main`, **prima** di creare qualunque thread: `pthread_sigmask(SIG_BLOCK, …)` su
-   SIGINT, SIGTERM, SIGTSTP. La maschera è ereditata da ogni thread creato dopo.
-2. Nasce un thread dedicato che cicla su `sigwait()` sugli stessi tre segnali. Le
-   `sigaction` di `dtnex.c:1679-1685` spariscono, e con loro `signalHandler`
-   (`dtnex.c:995-1069`) e la sua dichiarazione in `dtnex.h:168`.
-3. **Primo segnale:** il thread logga, azzera `running`, `bpechoState.running` e
-   `bundleReceptionState.running`, poi chiama i risvegli — `bp_interrupt` sui due SAP e
-   `ionPauseAttendant` — per sbloccare chi è fermo in `bp_receive`. I risvegli sono
-   condizionati come nell'handler attuale (`ionConnected` e SAP non nullo), perché dtnex
-   può ricevere un segnale mentre ION non è raggiungibile. Non fa join, non chiude
-   endpoint, non fa detach, non chiama `exit`. Torna a `sigwait`.
-4. **Teardown:** quello che c'è già. `main` contiene la sequenza completa —
-   `stopBundleReception`, join dei due thread, `bp_close`, `bp_detach`, `return 0` — alle
-   righe `dtnex.c:1761-1788`. Oggi è **codice irraggiungibile**, perché l'handler chiama
-   `exit(0)` prima che `eventDrivenLoop` ritorni. Il lavoro non è scrivere il teardown:
-   è smettere di scavalcarlo.
+1. In `main`, **before** creating any thread: `pthread_sigmask(SIG_BLOCK, …)` over
+   SIGINT, SIGTERM, SIGTSTP. The mask is inherited by every thread created afterwards.
+2. A dedicated thread is born that loops on `sigwait()` over those same three signals.
+   The `sigaction` calls at `dtnex.c:1679-1685` disappear, and with them `signalHandler`
+   (`dtnex.c:995-1069`) and its declaration in `dtnex.h:168`.
+3. **First signal:** the thread logs, clears `running`, `bpechoState.running` and
+   `bundleReceptionState.running`, then issues the wake-ups — `bp_interrupt` on the two
+   SAPs and `ionPauseAttendant` — to unblock whoever is parked in `bp_receive`. The
+   wake-ups are conditional as in the current handler (`ionConnected` and a non-null
+   SAP), because dtnex can receive a signal while ION is unreachable. It does not join,
+   does not close endpoints, does not detach, does not call `exit`. It returns to
+   `sigwait`.
+4. **Teardown:** what is already there. `main` contains the complete sequence —
+   `stopBundleReception`, joining the two threads, `bp_close`, `bp_detach`, `return 0` —
+   at lines `dtnex.c:1761-1788`. Today it is **unreachable code**, because the handler
+   calls `exit(0)` before `eventDrivenLoop` returns. The work is not to write the
+   teardown: it is to stop bypassing it.
 
-La garanzia è strutturale, non affidata all'attenzione: `eventDrivenLoop` controlla
-`running` solo fra un'iterazione e l'altra, quindi il punto di uscita è per costruzione
-fuori da ogni transazione. Non serve un meccanismo di risveglio nuovo — il ciclo dorme
-già a fette da un secondo controllando `running` (`dtnex.c:2365-2378`), quindi la latenza
-di risposta al segnale resta sotto il secondo.
+The guarantee is structural, not left to attention: `eventDrivenLoop` checks `running`
+only between iterations, so the exit point is by construction outside any transaction.
+No new wake-up mechanism is needed — the loop already sleeps in one-second slices while
+checking `running` (`dtnex.c:2365-2378`), so the response latency to a signal stays
+below one second.
 
-**Un difetto da correggere nel teardown esistente.** Le due join sono protette da
-`if (bundleReceptionState.running)` e `if (bpechoState.running)` (`dtnex.c:1765`, `1772`).
-Sono le stesse variabili che il thread `sigwait` azzera per chiedere ai servizi di
-fermarsi: quando il controllo viene eseguito valgono già zero, e **le join vengono
-saltate**. Finora non si notava, perché quel codice non veniva mai raggiunto. Serve
-distinguere "il thread è stato creato" da "il thread deve continuare a girare": due flag
-distinti, oppure la join incondizionata sui thread effettivamente creati. Senza questo, la
-terminazione cooperativa chiuderebbe i SAP mentre i thread di servizio li stanno ancora
-usando — sostituendo un difetto con un altro.
+**A defect to fix in the existing teardown.** The two joins are guarded by
+`if (bundleReceptionState.running)` and `if (bpechoState.running)` (`dtnex.c:1765`, `1772`).
+Those are the very variables the `sigwait` thread clears in order to ask the services to
+stop: by the time the guard is evaluated they are already zero, and **the joins get
+skipped**. It went unnoticed so far, because that code was never reached. We need to
+distinguish "the thread was created" from "the thread should keep running": two separate
+flags, or an unconditional join over the threads actually created. Without this,
+cooperative termination would close the SAPs while the service threads are still using
+them — replacing one defect with another.
 
-Il teardown di `main` chiude `sap` ma non `bpechoState.sap`, che l'handler invece
-chiudeva per sicurezza. Verificato: non serve, perché **il thread bpecho lo chiude e lo
-azzera da solo uscendo** (`dtnex.c:1523-1526`). È un'altra ragione per cui la join va
-fatta davvero: se si salta, si chiudono i SAP mentre quel thread sta ancora eseguendo la
-propria pulizia.
+The teardown in `main` closes `sap` but not `bpechoState.sap`, which the handler used to
+close for safety. Verified: it is not needed, because **the bpecho thread closes and
+clears it itself on the way out** (`dtnex.c:1523-1526`). That is another reason the join
+must genuinely happen: if it is skipped, the SAPs get closed while that thread is still
+running its own cleanup.
 
-### 13.4 Uscita forzata
+### 13.4 Forced exit
 
-Il secondo segnale mantiene la via di fuga che c'è oggi, ma smette di essere silenziosa:
-si logga esplicitamente che l'uscita è forzata, che la transazione SDR può restare
-aperta e che il rimedio è `ionunlock ion`. Poi `_exit(1)`, non `exit(1)`: con altri
-thread ancora vivi non si vogliono far girare gli handler `atexit` né il flush di stdio.
+The second signal keeps the escape route that exists today, but stops being silent: it
+explicitly logs that the exit is forced, that the SDR transaction may stay open and that
+the remedy is `ionunlock ion`. Then `_exit(1)`, not `exit(1)`: with other threads still
+alive we do not want to run the `atexit` handlers or flush stdio.
 
-Forzare l'uscita è esattamente ciò che può lasciare il lock preso. Resta disponibile
-perché un operatore bloccato deve poter uscire, ma deve sapere cosa gli è costato.
+Forcing the exit is exactly what can leave the lock held. It stays available because a
+stuck operator must be able to get out, but they must know what it cost them.
 
-### 13.5 Invariante da preservare
+### 13.5 Invariant to preserve
 
-Ogni `sdr_begin_xn` ha il suo `sdr_exit_xn` / `sdr_end_xn` su **tutti** i cammini di
-uscita. Oggi è vero — verificato in `ion_contacts.c` e in `getplanlist` — e va registrato
-come invariante, non come constatazione. Vale anche per il re-exec su restart di ION
-(`dtnex.c:2422`): non si re-esegue con una transazione aperta.
+Every `sdr_begin_xn` has its `sdr_exit_xn` / `sdr_end_xn` on **all** exit paths. That is
+true today — verified in `ion_contacts.c` and in `getplanlist` — and must be recorded as
+an invariant, not as an observation. It holds for the re-exec on ION restart as well
+(`dtnex.c:2422`): we do not re-exec with a transaction open.
 
-### 13.6 `planListMutex`: nessun intervento, e il perché
+### 13.6 `planListMutex`: no action, and why
 
-`planListMutex` (`dtnex.c:511`) è un `pthread_mutex_t` **locale al processo**: `ionadmin`
-è un altro processo e non lo vede. Non può essere la causa di ciò che si è osservato, e
-non c'è nessun "unlock di recovery" da aggiungere. Con lo shutdown cooperativo un thread
-che si trova dentro `getplanlist` quando `running` va a zero arriva in fondo alla
-funzione e fa l'unlock da solo.
+`planListMutex` (`dtnex.c:511`) is a `pthread_mutex_t` **local to the process**:
+`ionadmin` is a different process and cannot see it. It cannot be the cause of what was
+observed, and there is no "recovery unlock" to add. With cooperative shutdown, a thread
+that happens to be inside `getplanlist` when `running` goes to zero reaches the end of
+the function and unlocks by itself.
 
-La sezione esiste per evitare che l'idea venga reintrodotta più avanti: i due lock —
-mutex di processo e transazione SDR condivisa — sono facili da confondere, e solo il
-secondo è quello che blocca gli altri client di ION.
+This section exists to stop the idea from being reintroduced later: the two locks —
+a process mutex and the shared SDR transaction — are easy to confuse, and only the
+second is the one that blocks other ION clients.
 
-### 13.7 Ambito e limiti
+### 13.7 Scope and limits
 
-Coperti gli stessi modi di morte della v2.52: **SIGINT, SIGTERM, SIGTSTP** e uscita
-ordinaria. Restano fuori segfault, abort e SIGKILL: lì il processo muore senza eseguire
-nulla, e se la transazione era aperta il lock resta preso. Il rimedio documentato è
+The same modes of death as v2.52 are covered: **SIGINT, SIGTERM, SIGTSTP** and ordinary
+exit. Segfault, abort and SIGKILL stay out: there the process dies without executing
+anything, and if a transaction was open the lock stays held. The documented remedy is
 `ionunlock ion`.
 
-Coprirli richiederebbe un recupero all'avvio — dtnex che rileva un lock stantio e lo
-sblocca — che porta con sé il rischio di sbloccare la transazione di un altro processo
-ION legittimo. Fuori ambito per scelta.
+Covering those would require recovery at startup — dtnex detecting a stale lock and
+releasing it — which brings with it the risk of unlocking the transaction of another
+legitimate ION process. Deliberately out of scope.
 
-### 13.8 Verifica — ESEGUITA il 2026-08-08
+### 13.8 Verification — PERFORMED on 2026-08-08
 
-Manuale, come il resto: non esiste una suite. Implementato nei commit `fa12820`,
+Manual, like the rest: there is no suite. Implemented in commits `fa12820`,
 `b9f0ce3`, `3c2b56c`, `b59b059`.
 
-| # | prova | esito |
+| # | test | outcome |
 |---|---|---|
-| 1 | SIGTERM durante il funzionamento normale | ✅ uscita in 0,51 s dal segnale, teardown completo eseguito (entrambe le join, `bp_close`, `bp_detach`), `DTNEXC terminated normally` — riga finale di `main` che con il vecchio handler non compariva mai. `ionadmin` subito dopo: 7,6 ms |
-| 2 | SIGTERM mentre è in corso l'applicazione di un contatto ricevuto | ✅ ripetuta 4 volte con il segnale a 0,2 / 0,6 / 1,0 / 1,5 s dall'iniezione. In tutte: contatto applicato (`contatto=inserted range=inserted`), uscita ordinata, `ionadmin` fra 7,9 e 9,9 ms |
-| 3 | doppio segnale | ✅ avviso di uscita forzata presente, nomina `ionunlock ion` |
-| 4 | SIGTERM in modalità servizio | ✅ stesso esito della prova 1 |
+| 1 | SIGTERM during normal operation | ✅ exit 0.51 s after the signal, full teardown executed (both joins, `bp_close`, `bp_detach`), `DTNEXC terminated normally` — the final line of `main`, which never appeared with the old handler. `ionadmin` immediately afterwards: 7.6 ms |
+| 2 | SIGTERM while a received contact is being applied | ✅ repeated 4 times with the signal at 0.2 / 0.6 / 1.0 / 1.5 s after injection. In all of them: contact applied (`contact=inserted range=inserted`), orderly exit, `ionadmin` between 7.9 and 9.9 ms |
+| 3 | double signal | ✅ the forced-exit warning is present and names `ionunlock ion` |
+| 4 | SIGTERM in service mode | ✅ same outcome as test 1 |
 
-### 13.9 Il sintomo originale NON è stato risolto
+### 13.9 The original symptom was NOT solved
 
-**Il §13.1 attribuiva a questo difetto anche il blocco di `ionadmin` osservato
-mentre dtnex era in esecuzione. Quell'attribuzione è sbagliata, ed è stata smentita
-dalle prove.**
+**§13.1 also attributed to this defect the `ionadmin` lock-up observed while dtnex was
+running. That attribution is wrong, and the tests disproved it.**
 
-Le quattro prove sopra misurano tutte il *dopo-uscita*. Una prova aggiuntiva, non
-prevista dalla spec, ha misurato il caso originale — `ionadmin` interrogato **mentre
-dtnex gira**, con il binario corretto:
+The four tests above all measure the *after-exit* case. An additional test, not foreseen
+by the spec, measured the original case — `ionadmin` queried **while dtnex is running**,
+with the correct binary:
 
-- `ionadmin` bloccato per **2 minuti e 13 secondi**, senza mai completare;
-- sbloccato **1,0 secondi dopo** il SIGTERM a dtnex;
-- nello stesso nodo, negli stessi minuti, le interrogazioni a dtnex fermo tornavano
-  in 8-10 ms.
+- `ionadmin` blocked for **2 minutes and 13 seconds**, never completing;
+- unblocked **1.0 seconds after** the SIGTERM to dtnex;
+- on the same node, in the same minutes, queries with dtnex stopped returned in
+  8-10 ms.
 
-Durante il blocco il thread principale di dtnex era in `nanosleep` — dormiva, non
-teneva nessuna transazione — il thread `sigwait` era correttamente in
-`do_sigtimedwait`, e i due thread di servizio erano fermi su semafori dentro
-`bp_receive`.
+During the lock-up dtnex's main thread was in `nanosleep` — sleeping, holding no
+transaction — the `sigwait` thread was correctly in `do_sigtimedwait`, and the two
+service threads were parked on semaphores inside `bp_receive`.
 
-**Ma nemmeno "è colpa di dtnex" è dimostrato.** Misure successive, sempre del
-2026-08-08 e su un nodo appena riavviato, mostrano `ionadmin` bloccato per **oltre
-dieci minuti con dtnex completamente spento**, per poi completare da solo. Ripetuto
-piu' volte. Quindi il nodo ha stalli pluriminuto propri, indipendenti da dtnex, e
-l'inferenza "bloccato mentre dtnex gira ⇒ lo blocca dtnex" non regge: lo sblocco a
-1,0 s dal SIGTERM resta suggestivo, ma con stalli di durata così variabile può essere
-una coincidenza.
+**But "it is dtnex's fault" is not proven either.** Later measurements, also from
+2026-08-08 and on a freshly restarted node, show `ionadmin` blocked for **over ten
+minutes with dtnex completely stopped**, only to complete on its own. Repeated several
+times. So the node has multi-minute stalls of its own, independent of dtnex, and the
+inference "blocked while dtnex runs ⇒ dtnex blocks it" does not hold: unblocking 1.0 s
+after the SIGTERM remains suggestive, but with stalls of such variable duration it may
+be a coincidence.
 
-**Cosa si può affermare, e cosa no.**
+**What can be asserted, and what cannot.**
 
-| affermazione | stato |
+| statement | status |
 |---|---|
-| Il §13 corregge un difetto reale (un `exit()` asincrono con una transazione potenzialmente aperta è scorretto) | ✅ stabilito, e verificato dalle quattro prove del §13.8 |
-| Dopo un'uscita ordinata il nodo resta usabile (`ionadmin` in 8-10 ms, 5 misure) | ✅ stabilito |
-| Il §13 risolve il blocco di `ionadmin` osservato a dtnex vivo | ❌ **smentito**: il blocco si riproduce col binario corretto |
-| Il blocco è causato da dtnex | ❓ **non dimostrato**: si riproduce anche a dtnex spento |
-| Il blocco è causato da un thread parcheggiato in `bp_receive` | ❓ ipotesi non verificata — la forma è la stessa sia per i thread di servizio di dtnex sia per il `bprecvfile` dell'operatore, ma l'esperimento decisivo (fermare `bprecvfile` e vedere se il blocco cessa) non è stato eseguito |
+| §13 fixes a real defect (an asynchronous `exit()` with a potentially open transaction is incorrect) | ✅ established, and verified by the four tests of §13.8 |
+| After an orderly exit the node stays usable (`ionadmin` in 8-10 ms, 5 measurements) | ✅ established |
+| §13 solves the `ionadmin` lock-up observed with dtnex alive | ❌ **disproved**: the lock-up reproduces with the correct binary |
+| The lock-up is caused by dtnex | ❓ **not proven**: it reproduces with dtnex stopped too |
+| The lock-up is caused by a thread parked in `bp_receive` | ❓ unverified hypothesis — the shape is the same for both dtnex's service threads and the operator's `bprecvfile`, but the decisive experiment (stopping `bprecvfile` and seeing whether the lock-up ceases) was never run |
 
-**Come riprenderla.** Servono misure pulite su un nodo non perturbato, con una sola
-variabile per volta: (a) nodo appena riavviato, nessun client, N interrogazioni
-cronometrate; (b) stesso nodo con il solo `bprecvfile`; (c) stesso nodo con il solo
-dtnex; (d) entrambi. Senza quella base, ogni singola osservazione è aneddotica —
-compresa quella che ha fatto nascere questa sezione.
+**How to resume.** Clean measurements on an undisturbed node are needed, one variable at
+a time: (a) freshly restarted node, no clients, N timed queries; (b) the same node with
+`bprecvfile` only; (c) the same node with dtnex only; (d) both. Without that baseline,
+every single observation is anecdotal — including the one that gave rise to this
+section.
 
-**Avvertenza operativa.** Uccidere `ionadmin` mentre attende blocca il nodo davvero,
-e falsa tutte le misure successive. Va lanciato solo dove nessun timeout possa
-interromperlo. Diverse misure di questa giornata sono state invalidate proprio così.
+**Operational warning.** Killing `ionadmin` while it is waiting genuinely blocks the
+node, and skews every subsequent measurement. It must be launched only where no timeout
+can interrupt it. Several measurements from that day were invalidated in exactly this
+way.

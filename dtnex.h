@@ -26,7 +26,7 @@
 // CBOR support using ION's implementation
 #include "include/ion/cbor.h"
 
-// Accesso a ION per contatti e range (modulo separato, vedi ion_contacts.h)
+// Access to ION for contacts and ranges (separate module, see ion_contacts.h)
 #include "ion_contacts.h"
 
 // Added for bpecho service
