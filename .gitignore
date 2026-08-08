@@ -6,7 +6,9 @@ dtnex
 
 # Configuration and runtime files
 *.log
+dtnex_debug.log
 *.txt
+debug_prompt.txt
 *.gv
 *.png
 receivedmsgpipe
@@ -24,8 +26,10 @@ obsolete/
 .superpowers/
 
 # Project documentation (local only)
+# L'unico documento di progetto pubblicato e' docs/spec_dtnex_v3.md
 CLAUDE.md
 docs/superpowers/
+session_notes.md
 
 # Security-sensitive files
 setup_ssh_keys.sh
