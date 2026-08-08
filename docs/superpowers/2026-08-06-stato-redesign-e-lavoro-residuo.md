@@ -46,7 +46,17 @@ modulo `ion_contacts` ha tenuto per tutti e sei i task.
 
 ---
 
-## 2. Da correggere alla ripresa — regressione introdotta dall'ondata finale
+## 2. Regressione dell'ondata finale — CORRETTA il 2026-08-08 (commit `c54a8cb`)
+
+**Chiusa.** L'opzione 1 e' stata applicata ai due soli siti post-remove: log con
+`dtnex_log` invece di `noteUserError`, nuovo esito `IONC_LOST` fra `IONC_REPLACED`
+e `IONC_ERROR`, e un ramo dedicato in `processCborContactMessage` che non stampa
+piu' un falso `✅`. Gli altri cinque siti restano come li aveva lasciati il FIX 1.
+Inoltro invariato (§6.5). Build pulita; review del diff passato (spec ✅, qualita'
+approvata). Resta da eseguire la **prova 4** del §5, che e' quella che esercita
+davvero questo percorso con un ION vivo.
+
+Il resto di questa sezione descrive il difetto com'era, per riferimento.
 
 **Decisione gia' presa: si applica l'opzione 1 descritta qui sotto.**
 
@@ -92,10 +102,8 @@ Poi: build, e un re-review ristretto a quel diff.
 - `dtnex.c:392` — la riga di dump sopravvissuta stampa `iondb.ranges`, che nel layout
   installato e' `cpsNotices`. Il FIX 5.2 ha tolto la riga sbagliata indicata dal brief e
   ne ha lasciata una altrettanto sbagliata. Impatto limitato al debug.
-- `dtnex.c:3260-3261` — commento stantio: descrive ancora `IONC_ERROR` come "uno stato
-  locale di ION (es. sovrapposizione con un contatto configurato a mano)". Dopo il FIX 1
-  una sovrapposizione e' `IONC_NOOP`; `IONC_ERROR` significa solo `rc < 0` o ION
-  irraggiungibile.
+- ~~`dtnex.c:3260-3261` — commento stantio su `IONC_ERROR`.~~ Corretto in `c54a8cb`
+  insieme alla regressione del §2.
 - `ion_contacts.c:550` e `585` — l'argomento `(rc == 1 || rc == 2)` passato a
   `checkRejectAddr`: `rc == 1` e' gia' consumato dal ramo sopra, quindi solo `2` arriva
   fin li'. Innocuo, documenta l'intento.
@@ -162,7 +170,7 @@ valore diagnostico, quando ci sara' un ION vivo:
 
 ## 6. Dove riprendere
 
-1. Applicare la correzione del §2 (opzione 1, gia' decisa).
+1. ~~Applicare la correzione del §2.~~ Fatto il 2026-08-08, commit `c54a8cb`.
 2. Sistemare i minor del §3 che vale la pena chiudere.
 3. Con un ION vivo, eseguire le prove nell'ordine del §5.
 4. Solo dopo, valutare il merge di `redesign` in `main`.
