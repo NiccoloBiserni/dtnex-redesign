@@ -149,30 +149,73 @@ Registrati in §12 della spec, richiedono decisioni di design, non solo codice:
 
 ---
 
-## 5. Validazione mai eseguita
+## 5. Validazione — ESEGUITA il 2026-08-08 su ION vivo (nodo 5)
 
-**Nessuna delle sei prove di §9 della spec e' stata eseguita: ION non era in esecuzione
-sulla macchina di sviluppo.** Ogni task e' stato verificato con una build pulita piu' la
-rilettura del codice, piu' il controllo del sorgente reale di ION per la semantica delle
-`rfx_*`.
+**Cinque prove su sei passate; la sesta non e' eseguibile su un nodo solo.**
 
-Cosa questo **non** lascia in dubbio: il percorso di encode/decode, le larghezze dei
-campi CBOR, il round-trip di `confidence`, l'invariante della cache, il confine del
-modulo. Sono verificabili leggendo, e sono stati verificati.
+Ambiente: nodo ION 5 (`hostiondtn2.rc`), contatti 5↔2, 5→6, 5↔5; range solo per
+2↔5 e 5↔5 — il contatto 5→6 e' privo di range perche' la riga `a range ... 5 6 1`
+e' commentata nell'ionrc. Vicino secondo il piano BP: solo il nodo 2, irraggiungibile.
 
-Cosa lascia in dubbio: tutto cio' che dipende da come ION risponde davvero. In ordine di
-valore diagnostico, quando ci sara' un ION vivo:
+Con un nodo solo il percorso di ricezione non si esercita da se': i messaggi si sono
+iniettati costruendo il bundle a mano con uno script Python che replica byte per byte
+`encodeCborContactMessage` (dtnex.c:1939-1976) e `calculateHmac`, consegnato con
+`bpsendfile`. Il decoder li ha accettati con HMAC valido al primo colpo.
 
-1. **prova 4** (contatto manuale via ionadmin, poi un messaggio per la stessa coppia con
-   `fromTime` diverso) — il contatto manuale deve sopravvivere, ed e' anche la prova che
-   esercita direttamente il percorso della regressione descritta al §2 di questo
-   documento;
-2. **prova 2** (due nodi, finestra identica sui due capi) — in un ionrc convenzionale con
-   entrambe le direzioni e' la piu' rapida da far fallire se la gestione del codice 9 non
-   e' giusta;
-3. **prova 5** (anti-churn: due cicli senza cambiamenti, zero scritture) — attesa in
-   successo, verificata analiticamente;
-4. prove 1, 3, 6 per il resto.
+| # | esito | evidenza |
+|---|---|---|
+| 1 | ✅ | snapshot `5→2 from=1786171309 to=1786207308 xmitRate=10000000 B/s conf=100% owlt=1s` contro ionadmin `06:41:49→16:41:48, 10000000 bytes/sec, confidence 1.000000, OWLT 1`: i sette campi coincidono, conversione epoch verificata |
+| 2 | ✅ (meta' ricevente) | iniettato `7→8 from=1786186288 to=1786189888 xmitRate=54321 conf=77 owlt=7`; in ION: `54321 bytes/sec, confidence 0.770000`, finestra identica, **nessuna riscrittura dello start time** |
+| 3 | ✅ | `Contatto 5→6 (from ...) senza range: non annunciato — controllare ionrc`, e 5→6 non compare fra i contatti annunciabili |
+| 3b | ✅ | `owlt=7` iniettato → in ION `OWLT from node 7 to node 8 is 7 seconds`, non 1 |
+| 4 | ✅ | contatto manuale 7→8 `[08:51:28..09:51:28]` messo via ionadmin; iniettato 7→8 con `fromTime` diverso `[10:51:28..11:51:28]`: **dopo, ION contiene entrambi**. Problema 1.3 chiuso sul campo |
+| 5 | ✅ | reiniettato lo stesso contatto (nonce diverso): `[ion] 7→8 ...: contatto=no-op range=no-op`, zero scritture. Osservato due volte |
+| L | ✅ | vedi sotto |
+| 6 | non eseguibile | serve un testbed a tre nodi; qui c'e' un solo ION |
+
+### Prova L — il fix del §2 verificato sul campo
+
+Costruita apposta: ION con due contatti 7→8 (W1 manuale, W3 iniettato, non
+sovrapposti); iniettato un messaggio con `fromTime` di W1 e `toTime` esteso dentro W3.
+La remove riesce, la insert viene rifiutata con codice 9. Log prodotto:
+
+```
+⚠️  Anomalia: rfx_insert_contact (dopo remove) 7→8 (from 1786179088) rifiutato con
+   codice 9 — si sovrappone a un contatto configurato localmente; si mantiene quello
+   locale: il contatto precedente e' stato rimosso e non sostituito
+[ion] 7→8 from=1786179088 to=1786186888: contatto=perso range=no-op
+⚠️  Contatto 7→8 perso in ION dopo una remove riuscita (insert successiva rifiutata)
+```
+
+Entrambe le righe `⚠️` sono a livello non-debug ed esito `perso`, non `no-op`: e'
+esattamente il comportamento che `c54a8cb` doveva produrre. Prima del fix: silenzio.
+
+### Due cose emerse durante le prove, da guardare separatamente
+
+- **`ionadmin` si blocca mentre dtnex e' in esecuzione.** Misurato: bloccato da 2
+  minuti, sbloccato 2 secondi dopo l'arresto di dtnex. Nella stessa sessione dtnex ha
+  impiegato piu' volte diversi minuti ad agganciarsi a ION, e una volta non ha
+  risposto a SIGTERM. Le transazioni SDR in `ion_contacts.c` e in `getplanlist` sono
+  bilanciate a lettura del codice, quindi la causa non e' ovvia: **va indagata,
+  non e' spiegata.**
+- **`bpsendfile` con il file del payload cancellato subito dopo l'invio manda ION in
+  `Unrecoverable SDR error`** (`Can't compute payload block CRC` → `Can't serialize
+  bundle payload`). ION serializza il payload dopo, rileggendo il file. E' un limite
+  dello strumento di prova, non di dtnex, ma blocca il nodo: annotato nello script.
+
+### Cosa resta non verificato
+
+La prova 6 e la meta' "mittente" della prova 2 — cioe' che un secondo nodo ION legga e
+riannunci senza deriva — richiedono un testbed multi-nodo. Il resto del rischio
+elencato qui sotto e' chiuso.
+
+Ogni task era gia' stato verificato con una build pulita piu' la rilettura del codice,
+piu' il controllo del sorgente reale di ION per la semantica delle `rfx_*`.
+
+Il percorso di encode/decode, le larghezze dei campi CBOR, il round-trip di
+`confidence`, l'invariante della cache e il confine del modulo erano gia' verificabili
+leggendo, ed erano gia' stati verificati. Le prove del 2026-08-08 hanno chiuso la
+parte che dipendeva da come ION risponde davvero.
 
 ---
 
@@ -180,10 +223,11 @@ valore diagnostico, quando ci sara' un ION vivo:
 
 1. ~~Applicare la correzione del §2.~~ Fatto il 2026-08-08, commit `c54a8cb`.
 2. ~~Sistemare i minor del §3.~~ Fatto il 2026-08-08, commit `30effd5` e `8dc1f8f`.
-3. **Con un ION vivo, eseguire le prove nell'ordine del §5.** E' l'unico lavoro
-   rimasto prima del merge: tutto cio' che era verificabile leggendo il codice e'
-   stato verificato, e restano aperti solo i limiti di progetto del §4.
-4. Solo dopo, valutare il merge di `redesign` in `main`.
+3. ~~Con un ION vivo, eseguire le prove del §5.~~ Fatto il 2026-08-08: cinque prove
+   su sei passate, la sesta non eseguibile su un nodo solo.
+4. **Da guardare prima del merge, e non sono difetti del redesign:** il blocco di
+   `ionadmin` mentre dtnex gira (§5, non spiegato) e i limiti di progetto del §4.
+5. Poi, valutare il merge di `redesign` in `main`.
 
 Il ledger completo dell'esecuzione, con i report di ogni task e di ogni review, e' in
 `.superpowers/sdd/2026-08-06-dtnex-contact-exchange-redesign/` — **directory ignorata da
