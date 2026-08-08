@@ -92,35 +92,43 @@ Poi: build, e un re-review ristretto a quel diff.
 
 ---
 
-## 3. Minor residui, non bloccanti
+## 3. Minor residui — CHIUSI il 2026-08-08 (commit `c54a8cb`, `30effd5`, `8dc1f8f`)
 
-- `dtnex.c:393-395` — il commento che motiva la rimozione del dump di `iondb.contacts`
-  dice che quella riga "stampava lo stesso valore della precedente sotto un altro nome".
-  Falso: i due dump leggevano campi diversi. Nel layout installato `IonRegion` e' 16 byte
-  (non 8), quindi `ranges` sta a offset 48 e `contacts` a 56 nel bundle, mentre
-  nell'installato a 48 c'e' `cpsNotices` e a 56 `ranges`.
-- `dtnex.c:392` — la riga di dump sopravvissuta stampa `iondb.ranges`, che nel layout
-  installato e' `cpsNotices`. Il FIX 5.2 ha tolto la riga sbagliata indicata dal brief e
-  ne ha lasciata una altrettanto sbagliata. Impatto limitato al debug.
+Tutte le voci di questa sezione sono state chiuse. Restano elencate per memoria di
+cosa c'era e di come e' stato deciso.
+
+- ~~Il commento che motivava la rimozione del dump di `iondb.contacts` diceva il falso
+  ("stampava lo stesso valore della precedente sotto un altro nome": i due dump
+  leggevano campi diversi).~~ Commento riscritto in `30effd5` con la ragione vera: nel
+  layout installato `IonRegion` e' 16 byte e non 8, quindi gli offset dei campi dopo di
+  esso slittano.
+- ~~La riga di dump sopravvissuta stampava `iondb.ranges`, che nel layout installato e'
+  `cpsNotices`.~~ Riga rimossa in `30effd5`: si stampa solo `ownNodeNbr`, primo campo
+  della struct e unico offset che coincide nei due layout.
 - ~~`dtnex.c:3260-3261` — commento stantio su `IONC_ERROR`.~~ Corretto in `c54a8cb`
   insieme alla regressione del §2.
-- `ion_contacts.c:550` e `585` — l'argomento `(rc == 1 || rc == 2)` passato a
-  `checkRejectAddr`: `rc == 1` e' gia' consumato dal ramo sopra, quindi solo `2` arriva
-  fin li'. Innocuo, documenta l'intento.
-- `CLAUDE.md:63-66` — etichetta ancora i due tipi di messaggio come "Type 1" / "Type 2"
-  interi, la stessa incoerenza che il FIX 6 ha tolto dal `README.md`. La descrizione del
-  payload e' gia' corretta. (`CLAUDE.md` e' in `.gitignore` dal commit `ab2f973`: si
-  aggiorna su disco, non entra nei commit.)
-- Spec §10 elenca ancora come da fare due correzioni a `CLAUDE.md` che sono gia' state
-  applicate.
-- `sdr_read(sdr, (char *) &iondb, iondbObject, sizeof(IonDB))` in `tryConnectToIon` e in
-  `ionc_check_alive` usa la `sizeof(IonDB)` del bundle, piu' grande della struct
-  installata: e' un over-read oltre la fine dell'oggetto in SDR. Innocuo oggi perche'
-  entrambi i chiamanti leggono solo `ownNodeNbr`, che sta a offset 0. E' il rischio
-  registrato in §12.3 della spec.
-- `contactTimeTolerance` e' ora un parametro morto: letto in configurazione
-  (`dtnex.c:207`, `269-270`) e mai usato in nessun calcolo. Va deciso se rimuoverlo o
-  dargli un uso.
+- `checkRejectAddr` riceve `(rc == 1 || rc == 2)` mentre `rc == 1` e' gia' consumato dal
+  ramo sopra. **Lasciato com'e', deliberatamente:** l'espressione documenta l'intero
+  contratto di `rfx_insert_range` descritto nel commento della funzione e resta corretta
+  se un domani il ramo `rc == 1` venisse spostato.
+- ~~`CLAUDE.md` etichettava i due tipi di messaggio come "Type 1" / "Type 2" interi.~~
+  Allineato su disco al valore reale del campo `type`, che e' una stringa (`"c"` / `"m"`).
+  (`CLAUDE.md` e' in `.gitignore` dal commit `ab2f973`: non entra nei commit.)
+- ~~Spec §10 elencava come da fare due correzioni a `CLAUDE.md` gia' applicate.~~ §10
+  riscritta al passato in `8dc1f8f`, con l'aggiunta della terza correzione (etichette
+  `type`).
+- ~~`sdr_read(sdr, (char *) &iondb, iondbObject, sizeof(IonDB))` leggeva oltre la fine
+  dell'oggetto in SDR.~~ Corretto in `30effd5` nei due siti (`tryConnectToIon` e
+  `ionc_check_alive`): si legge il solo campo `ownNodeNbr`, con
+  `offsetof(IonDB, ownNodeNbr)` come offset e la `sizeof` del campo come lunghezza.
+  Il rischio §12.3 della spec resta aperto per gli altri usi degli header.
+- ~~`contactTimeTolerance` era un parametro morto.~~ **Rimosso** in `30effd5` (campo,
+  default, ramo del parser, `dtnex.conf`) e documentato in `8dc1f8f`: il parser ignora
+  le chiavi sconosciute, quindi un `dtnex.conf` gia' installato che la contiene ancora
+  continua a funzionare.
+
+Un solo minor nuovo, cosmetico e non tracciato altrove: l'etichetta di log
+`"[tryConnectToIon] IonDB dump after sdr_read:"` parla di "dump" per una riga sola.
 
 ## 4. Limiti di progetto aperti
 
@@ -171,8 +179,10 @@ valore diagnostico, quando ci sara' un ION vivo:
 ## 6. Dove riprendere
 
 1. ~~Applicare la correzione del §2.~~ Fatto il 2026-08-08, commit `c54a8cb`.
-2. Sistemare i minor del §3 che vale la pena chiudere.
-3. Con un ION vivo, eseguire le prove nell'ordine del §5.
+2. ~~Sistemare i minor del §3.~~ Fatto il 2026-08-08, commit `30effd5` e `8dc1f8f`.
+3. **Con un ION vivo, eseguire le prove nell'ordine del §5.** E' l'unico lavoro
+   rimasto prima del merge: tutto cio' che era verificabile leggendo il codice e'
+   stato verificato, e restano aperti solo i limiti di progetto del §4.
 4. Solo dopo, valutare il merge di `redesign` in `main`.
 
 Il ledger completo dell'esecuzione, con i report di ogni task e di ogni review, e' in
