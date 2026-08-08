@@ -1038,7 +1038,7 @@ static void *signalWaitThread(void *arg)
 
         if (signalCount > 1) {
             dtnex_log("⚠️  Uscita forzata richiesta: se un thread e' dentro una "
-                    "transazione SDR il lock di ION restera' preso e bloccherra' "
+                    "transazione SDR il lock di ION restera' preso e blocchera' "
                     "gli altri client. In quel caso sbloccare con: ionunlock ion");
             _exit(1);
         }
