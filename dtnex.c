@@ -1849,6 +1849,58 @@ int calculateHmac(const unsigned char *message, int msgLen, const char *key, uns
 }
 
 /**
+ * Writes the envelope common to all DTNEX messages: the 9-element outer
+ * array and the first 7 fields.
+ *
+ *   [version, type, timestamp, expireTime, origin, from, nonce, ...]
+ *
+ * The originator of a message passes fresh timestamp, expireTime and nonce,
+ * with origin == from == the local node; a forwarder passes the original
+ * ones and only replaces "from". The structure is identical in both cases —
+ * that's exactly why a single helper is correct.
+ *
+ * Returns the number of bytes written and advances *cursor.
+ */
+static int writeCborEnvelope(unsigned char **cursor, const char *type,
+        time_t timestamp, time_t expireTime, unsigned long origin,
+        unsigned long from, const unsigned char *nonce) {
+    int bytesWritten = 0;
+
+    bytesWritten += cbor_encode_array_open(9, cursor);
+    bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, cursor);
+    bytesWritten += cbor_encode_text_string((char *) type, 1, cursor);
+    bytesWritten += cbor_encode_integer((uvast) timestamp, cursor);
+    bytesWritten += cbor_encode_integer((uvast) expireTime, cursor);
+    bytesWritten += cbor_encode_integer(origin, cursor);
+    bytesWritten += cbor_encode_integer(from, cursor);
+    bytesWritten += cbor_encode_byte_string((unsigned char *) nonce,
+            DTNEX_NONCE_SIZE, cursor);
+
+    return bytesWritten;
+}
+
+/**
+ * Computes the HMAC over the first bytesWritten bytes of the message — i.e.
+ * everything except the HMAC itself — and appends it as the ninth element.
+ *
+ * If calculateHmac fails, the zeroed buffer it produces is appended anyway
+ * and the failure is logged: a null HMAC gets discarded by every receiver,
+ * so the system stays fail-closed without the encoder having to propagate
+ * the error.
+ *
+ * Returns the number of bytes written and advances *cursor.
+ */
+static int appendCborHmac(DtnexConfig *config, unsigned char *buffer,
+        int bytesWritten, unsigned char **cursor) {
+    unsigned char hmac[DTNEX_HMAC_SIZE];
+
+    if (calculateHmac(buffer, bytesWritten, config->presSharedNetworkKey, hmac) != DTNEX_HMAC_SIZE) {
+        debug_log(config, "❌ HMAC calculation failed during encoding: appending a null HMAC");
+    }
+    return cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, cursor);
+}
+
+/**
  * Verify HMAC
  */
 int verifyHmac(DtnexConfig *config, const unsigned char *message, int msgLen, const unsigned char *receivedHmac, const char *key) {
@@ -1929,40 +1981,14 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
 
     (void) bufferSize;  // the v3 payload is ~67 bytes, MAX_CBOR_BUFFER is 128
 
-    // Generate nonce
     generateNonce(nonce);
-
-    time_t currentTime = time(NULL);
 
     // §7.2: the message is useful exactly as long as the contact it describes
     // is valid, so expireTime IS the contact's toTime.
-    time_t expireTime = contact->toTime;
+    bytesWritten += writeCborEnvelope(&cursor, "c", time(NULL), contact->toTime,
+            config->nodeId, config->nodeId, nonce);
 
-    // Encode main array with 9 elements [version, type, ts, exp, orig, from, nonce, data, hmac]
-    bytesWritten += cbor_encode_array_open(9, &cursor);
-
-    // 1. Version
-    bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-
-    // 2. Message type "c"
-    bytesWritten += cbor_encode_text_string("c", 1, &cursor);
-
-    // 3. Timestamp (instant of sending; it no longer affects the window)
-    bytesWritten += cbor_encode_integer(currentTime, &cursor);
-
-    // 4. Expire time
-    bytesWritten += cbor_encode_integer(expireTime, &cursor);
-
-    // 5. Origin node
-    bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-
-    // 6. From node (same as origin for originating messages)
-    bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-
-    // 7. Nonce
-    bytesWritten += cbor_encode_byte_string(nonce, DTNEX_NONCE_SIZE, &cursor);
-
-    // 8. Contact data array v3 (§5.2): 7 fields, absolute times
+    // Contact data array v3 (§5.2): 7 fields, absolute times
     bytesWritten += cbor_encode_array_open(7, &cursor);
     bytesWritten += cbor_encode_integer(contact->fromNode, &cursor);
     bytesWritten += cbor_encode_integer(contact->toNode, &cursor);
@@ -1972,10 +1998,7 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
     bytesWritten += cbor_encode_integer(contact->confidence, &cursor);
     bytesWritten += cbor_encode_integer(contact->owlt, &cursor);
 
-    // 9. Calculate HMAC over everything except the HMAC field itself
-    unsigned char hmac[DTNEX_HMAC_SIZE];
-    calculateHmac(buffer, bytesWritten, config->presSharedNetworkKey, hmac);
-    bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
+    bytesWritten += appendCborHmac(config, buffer, bytesWritten, &cursor);
 
     debug_log(config, "[CBOR] Encoded contact message: %d bytes", bytesWritten);
     return bytesWritten;
@@ -1995,31 +2018,10 @@ int encodeCborMetadataMessage(DtnexConfig *config, StructuredMetadata *metadata,
     
     time_t currentTime = time(NULL);
     time_t expireTime = currentTime + config->contactLifetime;
-    
-    // Encode main array with 9 elements
-    bytesWritten += cbor_encode_array_open(9, &cursor);
-    
-    // 1. Version
-    bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-    
-    // 2. Message type "m"
-    bytesWritten += cbor_encode_text_string("m", 1, &cursor);
-    
-    // 3. Timestamp
-    bytesWritten += cbor_encode_integer(currentTime, &cursor);
-    
-    // 4. Expire time
-    bytesWritten += cbor_encode_integer(expireTime, &cursor);
-    
-    // 5. Origin node
-    bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-    
-    // 6. From node
-    bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-    
-    // 7. Nonce
-    bytesWritten += cbor_encode_byte_string(nonce, DTNEX_NONCE_SIZE, &cursor);
-    
+
+    bytesWritten += writeCborEnvelope(&cursor, "m", currentTime, expireTime,
+            config->nodeId, config->nodeId, nonce);
+
     // 8. Metadata array - format: [nodeId, name, contact, location?, lat?, lon?]
     int metadataElements = 3; // nodeId, name, contact (base)
     int hasLocation = strlen(metadata->location) > 0;
@@ -2053,11 +2055,8 @@ int encodeCborMetadataMessage(DtnexConfig *config, StructuredMetadata *metadata,
         bytesWritten += cbor_encode_text_string(metadata->location, strlen(metadata->location), &cursor);
     }
     
-    // 9. Calculate HMAC
-    unsigned char hmac[DTNEX_HMAC_SIZE];
-    calculateHmac(buffer, bytesWritten, config->presSharedNetworkKey, hmac);
-    bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
-    
+    bytesWritten += appendCborHmac(config, buffer, bytesWritten, &cursor);
+
     debug_log(config, "[CBOR] Encoded metadata message: %d bytes", bytesWritten);
     return bytesWritten;
 }
@@ -3362,15 +3361,11 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         unsigned char *cursor = cborBuffer;
         int bytesWritten = 0;
 
-        // Encode forwarded CBOR message
-        bytesWritten += cbor_encode_array_open(9, &cursor);
-        bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-        bytesWritten += cbor_encode_text_string("c", 1, &cursor);
-        bytesWritten += cbor_encode_integer(timestamp, &cursor);
-        bytesWritten += cbor_encode_integer(expireTime, &cursor);
-        bytesWritten += cbor_encode_integer(origin, &cursor);  // Keep original origin
-        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node: ONLY the "from" field is replaced with this node's ID
-        bytesWritten += cbor_encode_byte_string(originalNonce, DTNEX_NONCE_SIZE, &cursor);
+        // Encode forwarded CBOR message: only the "from" field changes, to
+        // this node; origin, timestamp, expireTime and nonce stay the
+        // original ones.
+        bytesWritten += writeCborEnvelope(&cursor, "c", timestamp, expireTime,
+                origin, config->nodeId, originalNonce);
 
         // Contact data v3
         bytesWritten += cbor_encode_array_open(7, &cursor);
@@ -3382,10 +3377,7 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         bytesWritten += cbor_encode_integer(forwardContact.confidence, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.owlt, &cursor);
 
-        // Calculate HMAC over everything except HMAC itself
-        unsigned char hmac[DTNEX_HMAC_SIZE];
-        calculateHmac(cborBuffer, bytesWritten, config->presSharedNetworkKey, hmac);
-        bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
+        bytesWritten += appendCborHmac(config, cborBuffer, bytesWritten, &cursor);
 
         // Send forwarded CBOR bundle
         sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
@@ -3429,16 +3421,12 @@ void forwardCborMetadataMessage(DtnexConfig *config, unsigned char *originalNonc
         unsigned char *cursor = cborBuffer;
         int bytesWritten = 0;
         
-        // Encode forwarded CBOR message
-        bytesWritten += cbor_encode_array_open(9, &cursor);
-        bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-        bytesWritten += cbor_encode_text_string("m", 1, &cursor);
-        bytesWritten += cbor_encode_integer(timestamp, &cursor);
-        bytesWritten += cbor_encode_integer(expireTime, &cursor);
-        bytesWritten += cbor_encode_integer(origin, &cursor);  // Keep original origin
-        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node
-        bytesWritten += cbor_encode_byte_string(originalNonce, DTNEX_NONCE_SIZE, &cursor);
-        
+        // Encode forwarded CBOR message: only the "from" field changes, to
+        // this node; origin, timestamp, expireTime and nonce stay the
+        // original ones.
+        bytesWritten += writeCborEnvelope(&cursor, "m", timestamp, expireTime,
+                origin, config->nodeId, originalNonce);
+
         // Metadata data
         int metadataElements = 3; // nodeId, name, contact (base)
         int hasLocation = strlen(metadata->location) > 0;
@@ -3472,16 +3460,13 @@ void forwardCborMetadataMessage(DtnexConfig *config, unsigned char *originalNonc
             bytesWritten += cbor_encode_text_string(metadata->location, strlen(metadata->location), &cursor);
         }
         
-        // Calculate HMAC over everything except HMAC itself
-        unsigned char hmac[DTNEX_HMAC_SIZE];
-        calculateHmac(cborBuffer, bytesWritten, config->presSharedNetworkKey, hmac);
-        bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
-        
+        bytesWritten += appendCborHmac(config, cborBuffer, bytesWritten, &cursor);
+
         // Send forwarded CBOR bundle
         sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
         sendCborBundle(destEid, cborBuffer, bytesWritten, config->bundleTTL);
-        
-        log_message_forwarded(config, origin, from, neighborId, "metadata", 
+
+        log_message_forwarded(config, origin, from, neighborId, "metadata",
                              metadata->nodeId, 0, metadata->name);
     }
 }
