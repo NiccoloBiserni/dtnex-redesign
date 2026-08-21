@@ -3252,7 +3252,11 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
     /* Transitional: as long as the "c" message carries the owlt, the range is
      * still written here, derived from the contact. This will go away once the
      * "r" message carries ranges on its own. */
-    {
+    /* Skipped on IONC_ERROR: that is a system error, so ION is unreachable or
+     * broken and the range write would be a second call failing the same way.
+     * On a user error we do carry on, because a local refusal of the contact
+     * must not stop ION from learning the OWLT. */
+    if (outcome != IONC_ERROR) {
         RangeRecord derivedRange;
         IoncApplyOutcome rangeOutcome;
 
@@ -3270,6 +3274,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
             outcome = rangeOutcome;
         }
     }
+
     if (outcome == IONC_ERROR) {
         /* IONC_ERROR is a system error from an rfx_* call (rc < 0) or ION
          * being unreachable: after the earlier fix, an overlap with a manually
