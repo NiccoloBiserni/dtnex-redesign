@@ -3248,6 +3248,28 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
     /* We write what we learn, but announce only what we are authoritative for
      * (§4.5): contacts with toNode == me are inserted as well. */
     outcome = ionc_apply_contact(contact, config->debugMode);
+
+    /* Transitional: as long as the "c" message carries the owlt, the range is
+     * still written here, derived from the contact. This will go away once the
+     * "r" message carries ranges on its own. */
+    {
+        RangeRecord derivedRange;
+        IoncApplyOutcome rangeOutcome;
+
+        derivedRange.fromNode = contact->fromNode;
+        derivedRange.toNode = contact->toNode;
+        derivedRange.fromTime = contact->fromTime;
+        derivedRange.toTime = contact->toTime;
+        derivedRange.owlt = contact->owlt;
+
+        /* IoncApplyOutcome is ordered by increasing severity: reporting the
+         * higher of the two reproduces the previous rule, when a single call
+         * wrote both. */
+        rangeOutcome = ionc_apply_range(&derivedRange, config->debugMode);
+        if (rangeOutcome > outcome) {
+            outcome = rangeOutcome;
+        }
+    }
     if (outcome == IONC_ERROR) {
         /* IONC_ERROR is a system error from an rfx_* call (rc < 0) or ION
          * being unreachable: after the earlier fix, an overlap with a manually

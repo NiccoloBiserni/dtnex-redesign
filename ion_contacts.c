@@ -265,6 +265,90 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
     return count;
 }
 
+int ionc_get_own_ranges(unsigned long myNodeId, RangeRecord *out,
+        int maxRecords, int debugMode)
+{
+    Sdr           sdr;
+    IonVdb       *ionvdb;
+    PsmPartition  ionwm;
+    PsmAddress    elt;
+    PsmAddress    addr;
+    IonRXref     *range;
+    time_t        now;
+    int           count = 0;
+
+    (void) debugMode;
+
+    if (out == NULL || maxRecords <= 0) {
+        return -1;
+    }
+
+    sdr = getIonsdr();
+    if (sdr == NULL) {
+        return -1;
+    }
+
+    /* sdr_begin_xn returns 1 on success and 0 on failure: a comparison
+     * against < 0 would never fire. */
+    if (sdr_begin_xn(sdr) != 1) {
+        return -1;
+    }
+
+    ionvdb = getIonVdb();
+    ionwm = getIonwm();
+    if (ionvdb == NULL || ionwm == NULL || ionvdb->rangeIndex == 0) {
+        sdr_exit_xn(sdr);
+        return -1;
+    }
+
+    now = time(NULL);
+
+    for (elt = sm_rbt_first(ionwm, ionvdb->rangeIndex); elt;
+            elt = sm_rbt_next(ionwm, elt)) {
+        if (count >= maxRecords) {
+            dtnex_log("Range snapshot full (%d): the remaining ranges "
+                    "will not be announced", maxRecords);
+            break;
+        }
+
+        addr = sm_rbt_data(ionwm, elt);
+        if (addr == 0) {
+            continue;
+        }
+
+        range = (IonRXref *) psp(ionwm, addr);
+        if (range == NULL) {
+            continue;
+        }
+
+        /* Authority rule (§4): we announce our own direction only. ION
+         * creates the reverse "imputed" range by itself, so each endpoint
+         * announces its own and the network stays consistent with no
+         * special cases. */
+        if ((unsigned long) range->fromNode != myNodeId) {
+            continue;
+        }
+
+        if (range->fromNode == range->toNode) {
+            continue;
+        }
+
+        if (range->toTime <= now) {
+            continue;
+        }
+
+        out[count].fromNode = (unsigned long) range->fromNode;
+        out[count].toNode = (unsigned long) range->toNode;
+        out[count].fromTime = range->fromTime;
+        out[count].toTime = range->toTime;
+        out[count].owlt = range->owlt;
+        count++;
+    }
+
+    sdr_exit_xn(sdr);
+    return count;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Classifying the outcomes of the rfx_* calls
@@ -350,6 +434,19 @@ static void noteUserError(int debugMode, const char *op, const ContactRecord *re
             op, rec->fromNode, rec->toNode, (long) rec->fromTime, rc, meaning);
 }
 
+/* Same as noteUserError, for ranges. Two functions and not a generic one
+ * because the two records do not share the fields that end up in the log. */
+static void noteUserErrorRange(int debugMode, const char *op,
+        const RangeRecord *rec, int rc, const char *meaning)
+{
+    if (!debugMode) {
+        return;
+    }
+
+    dtnex_log("[ion] %s %lu→%lu (from %ld): ION refused with code %d — %s",
+            op, rec->fromNode, rec->toNode, (long) rec->fromTime, rc, meaning);
+}
+
 /**
  * Cross-check on the returned address: rfx.h:62-63 documents *cxaddr /
  * *rxaddr left at 0 as confirmation of the refusal.
@@ -378,20 +475,34 @@ static void checkRejectAddr(int debugMode, const char *op, int rc,
 /**
  * The [ion] log line carrying the state reached so far. Called both on the
  * normal completion of ionc_apply_contact and on the error branches, so that
- * a partial state (e.g. contact written, range failed) stays visible under
- * debug instead of disappearing behind an early return.
+ * the outcome reached before an early return stays visible under debug
+ * instead of disappearing.
  */
 static void logApplyOutcome(int debugMode, const ContactRecord *rec,
-        IoncApplyOutcome contactOutcome, IoncApplyOutcome rangeOutcome)
+        IoncApplyOutcome contactOutcome)
 {
     if (!debugMode) {
         return;
     }
 
-    dtnex_log("[ion] %lu→%lu from=%ld to=%ld: contact=%s range=%s",
+    dtnex_log("[ion] %lu→%lu from=%ld to=%ld: contact=%s",
             rec->fromNode, rec->toNode, (long) rec->fromTime,
-            (long) rec->toTime, ionc_outcome_name(contactOutcome),
-            ionc_outcome_name(rangeOutcome));
+            (long) rec->toTime, ionc_outcome_name(contactOutcome));
+}
+
+/* The same line for the range side of ionc_apply_range. Two functions and not
+ * a generic one because the two records do not share the fields that end up
+ * in the log. */
+static void logApplyRangeOutcome(int debugMode, const RangeRecord *rec,
+        IoncApplyOutcome rangeOutcome)
+{
+    if (!debugMode) {
+        return;
+    }
+
+    dtnex_log("[ion] %lu→%lu from=%ld to=%ld: range=%s",
+            rec->fromNode, rec->toNode, (long) rec->fromTime,
+            (long) rec->toTime, ionc_outcome_name(rangeOutcome));
 }
 
 IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
@@ -400,16 +511,12 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
     IonVdb          *ionvdb;
     PsmPartition     ionwm;
     IonCXref         existingContact;
-    IonRXref         existingRange;
     int              haveContact;
-    int              haveRange;
     PsmAddress       cxaddr = 0;
-    PsmAddress       rxaddr = 0;
     time_t           key;
     float            confidence;
     int              rc;
     IoncApplyOutcome contactOutcome = IONC_NOOP;
-    IoncApplyOutcome rangeOutcome = IONC_NOOP;
 
     if (rec == NULL) {
         return IONC_ERROR;
@@ -438,17 +545,11 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
 
     haveContact = findContact(ionwm, ionvdb, (uvast) rec->fromNode,
             (uvast) rec->toNode, rec->fromTime, &existingContact);
-    haveRange = findRange(ionwm, ionvdb, (uvast) rec->fromNode,
-            (uvast) rec->toNode, rec->fromTime, &existingRange);
 
     sdr_exit_xn(sdr);
 
     /* Phase 2: writes. The rfx_* calls open their own transaction, so they
      * must be called with no transaction open. */
-
-    /* Note: on the contact side a user error does not interrupt the sequence.
-     * We carry on to the range write, which is independent: a local refusal
-     * of the contact must not stop ION from learning the OWLT. */
 
     if (!haveContact) {
         rc = rfx_insert_contact(IONC_DEFAULT_REGION, rec->fromTime, rec->toTime,
@@ -459,7 +560,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
                     "returned %d", rec->fromNode, rec->toNode,
                     (long) rec->fromTime, rc);
             contactOutcome = IONC_ERROR;
-            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
+            logApplyOutcome(debugMode, rec, contactOutcome);
             return IONC_ERROR;
         } else if (rc > 0) {
             noteUserError(debugMode, "rfx_insert_contact", rec, rc,
@@ -480,7 +581,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
                     "returned %d", rec->fromNode, rec->toNode,
                     (long) rec->fromTime, rc);
             contactOutcome = IONC_ERROR;
-            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
+            logApplyOutcome(debugMode, rec, contactOutcome);
             return IONC_ERROR;
         } else if (rc > 0) {
             /* The removal did not happen: re-inserting now would find the old
@@ -495,7 +596,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
                 dtnex_log("⚠️  Anomaly: rfx_insert_contact (after remove) %lu→%lu "
                         "returned %d", rec->fromNode, rec->toNode, rc);
                 contactOutcome = IONC_ERROR;
-                logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
+                logApplyOutcome(debugMode, rec, contactOutcome);
                 return IONC_ERROR;
             } else if (rc > 0) {
                 /* The remove succeeded but the insert was refused: the old
@@ -526,7 +627,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
             dtnex_log("⚠️  Anomaly: rfx_revise_contact %lu→%lu returned %d",
                     rec->fromNode, rec->toNode, rc);
             contactOutcome = IONC_ERROR;
-            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
+            logApplyOutcome(debugMode, rec, contactOutcome);
             return IONC_ERROR;
         } else if (rc > 0) {
             noteUserError(debugMode, "rfx_revise_contact", rec, rc,
@@ -536,7 +637,56 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         }
     }
 
-    /* Range: same structure, but rfx_revise_range does not exist (§6.3). */
+    logApplyOutcome(debugMode, rec, contactOutcome);
+
+    return contactOutcome;
+}
+
+IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
+{
+    Sdr              sdr;
+    IonVdb          *ionvdb;
+    PsmPartition     ionwm;
+    IonRXref         existingRange;
+    int              haveRange;
+    PsmAddress       rxaddr = 0;
+    time_t           key;
+    int              rc;
+    IoncApplyOutcome rangeOutcome = IONC_NOOP;
+
+    if (rec == NULL) {
+        return IONC_ERROR;
+    }
+
+    sdr = getIonsdr();
+    if (sdr == NULL) {
+        return IONC_ERROR;
+    }
+
+    /* Phase 1: existence check, inside a transaction (§6.4). */
+    /* sdr_begin_xn returns 1 on success and 0 on failure: a comparison
+     * against < 0 would never fire. */
+    if (sdr_begin_xn(sdr) != 1) {
+        return IONC_ERROR;
+    }
+
+    ionvdb = getIonVdb();
+    ionwm = getIonwm();
+    if (ionvdb == NULL || ionwm == NULL) {
+        sdr_exit_xn(sdr);
+        return IONC_ERROR;
+    }
+
+    haveRange = findRange(ionwm, ionvdb, (uvast) rec->fromNode,
+            (uvast) rec->toNode, rec->fromTime, &existingRange);
+
+    sdr_exit_xn(sdr);
+
+    /* Phase 2: writes. The rfx_* calls open their own transaction, so they
+     * must be called with no transaction open. */
+
+    /* Same structure as the contact, but rfx_revise_range does not exist
+     * (§6.3): any difference is a remove + insert. */
     if (!haveRange) {
         rc = rfx_insert_range(rec->fromTime, rec->toTime,
                 (uvast) rec->fromNode, (uvast) rec->toNode, rec->owlt,
@@ -545,7 +695,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
             dtnex_log("⚠️  Anomaly: rfx_insert_range %lu→%lu returned %d",
                     rec->fromNode, rec->toNode, rc);
             rangeOutcome = IONC_ERROR;
-            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
+            logApplyRangeOutcome(debugMode, rec, rangeOutcome);
             return IONC_ERROR;
         } else if (rc == 1) {
             /* ION explicitly documents this case as idempotent: the range is
@@ -553,7 +703,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
              * refusal — the range phase is a no-op. */
             rangeOutcome = IONC_NOOP;
         } else if (rc > 0) {
-            noteUserError(debugMode, "rfx_insert_range", rec, rc,
+            noteUserErrorRange(debugMode, "rfx_insert_range", rec, rc,
                     insertRangeUserError(rc));
             checkRejectAddr(debugMode, "rfx_insert_range", rc, rxaddr,
                     (rc == 1 || rc == 2));
@@ -562,6 +712,8 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         }
     } else if (existingRange.owlt != rec->owlt
             || existingRange.toTime != rec->toTime) {
+        /* Window or owlt changed: TARGETED removal by exact fromTime, never
+         * NULL. */
         key = rec->fromTime;
         rc = rfx_remove_range(&key, (uvast) rec->fromNode,
                 (uvast) rec->toNode, 0);
@@ -569,11 +721,12 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
             dtnex_log("⚠️  Anomaly: rfx_remove_range %lu→%lu returned %d",
                     rec->fromNode, rec->toNode, rc);
             rangeOutcome = IONC_ERROR;
-            logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
+            logApplyRangeOutcome(debugMode, rec, rangeOutcome);
             return IONC_ERROR;
         } else if (rc > 0) {
-            /* As above: without the removal, re-insertion would be refused. */
-            noteUserError(debugMode, "rfx_remove_range", rec, rc,
+            /* Without the removal, re-insertion would be refused: ION is left
+             * as it is. */
+            noteUserErrorRange(debugMode, "rfx_remove_range", rec, rc,
                     removeUserError(rc));
         } else {
             rc = rfx_insert_range(rec->fromTime, rec->toTime,
@@ -583,13 +736,13 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
                 dtnex_log("⚠️  Anomaly: rfx_insert_range (after remove) %lu→%lu "
                         "returned %d", rec->fromNode, rec->toNode, rc);
                 rangeOutcome = IONC_ERROR;
-                logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
+                logApplyRangeOutcome(debugMode, rec, rangeOutcome);
                 return IONC_ERROR;
             } else if (rc == 1) {
                 rangeOutcome = IONC_NOOP;
             } else if (rc > 0) {
-                /* As above for the contact: the remove succeeded, the insert
-                 * did not. The previous range is gone from ION and was not
+                /* As for the contact: the remove succeeded, the insert did
+                 * not. The previous range is gone from ION and was not
                  * replaced: this is always logged, not only under debug. */
                 dtnex_log("⚠️  Anomaly: rfx_insert_range (after remove) "
                         "%lu→%lu (from %ld) refused with code %d — %s: "
@@ -606,9 +759,9 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         }
     }
 
-    logApplyOutcome(debugMode, rec, contactOutcome, rangeOutcome);
+    logApplyRangeOutcome(debugMode, rec, rangeOutcome);
 
-    return (rangeOutcome > contactOutcome) ? rangeOutcome : contactOutcome;
+    return rangeOutcome;
 }
 
 int ionc_print_contact_table(int debugMode)

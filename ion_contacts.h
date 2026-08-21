@@ -39,6 +39,27 @@ typedef struct {
     unsigned int  owlt;
 } ContactRecord;
 
+/* Maximum size of a snapshot of announceable ranges. */
+#define IONC_MAX_RANGES 200
+
+/**
+ * A range, in ION's own units:
+ *   fromTime/toTime : absolute UNIX epoch
+ *   owlt            : seconds
+ *
+ * The range carries no region, and that is not an oversight:
+ * rfx_insert_range() and rfx_remove_range() have no region parameter
+ * (rfx.h:130 and :165) and IonRXref has no such field (ion.h:418-426). In
+ * ION ranges are global; only contacts are regional.
+ */
+typedef struct {
+    unsigned long fromNode;
+    unsigned long toNode;
+    time_t        fromTime;
+    time_t        toTime;
+    unsigned int  owlt;
+} RangeRecord;
+
 /**
  * Reads from ION the contacts the local node is allowed to announce.
  *
@@ -53,6 +74,20 @@ typedef struct {
  * reachable (SDR, vdb or working memory unavailable).
  */
 int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
+        int maxRecords, int debugMode);
+
+/**
+ * Reads from ION the ranges the local node is allowed to announce.
+ *
+ * Filters applied, the same as for contacts as far as they make sense:
+ *   - fromNode == myNodeId          (authority rule, §4)
+ *   - toNode != fromNode
+ *   - toTime > now                  (expired ranges are not announced)
+ *
+ * Returns the number of records written to out, or -1 if ION is not
+ * reachable.
+ */
+int ionc_get_own_ranges(unsigned long myNodeId, RangeRecord *out,
         int maxRecords, int debugMode);
 
 /**
@@ -82,6 +117,18 @@ typedef enum {
  * between the pair, including those configured by the operator.
  */
 IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode);
+
+/**
+ * Applies the received range to ION, keyed by (fromNode, toNode, fromTime).
+ *
+ * Idempotent like ionc_apply_contact. rfx_revise_range does not exist, so any
+ * difference in owlt or in the window means remove + insert.
+ *
+ * Removals ALWAYS pass a pointer to the exact fromTime, never NULL: with
+ * NULL, ION applies the '*' scope and deletes every range between the pair,
+ * including those configured by the operator.
+ */
+IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode);
 
 /* Human-readable name of the outcome, for logging. */
 const char *ionc_outcome_name(IoncApplyOutcome outcome);
