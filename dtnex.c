@@ -1821,16 +1821,15 @@ void generateNonce(unsigned char *nonce) {
 }
 
 /**
- * Calcola l'HMAC-SHA256 del messaggio, troncato a DTNEX_HMAC_SIZE byte.
+ * Computes the HMAC-SHA256 of the message, truncated to DTNEX_HMAC_SIZE bytes.
  *
- * Fino alla v3.00 la costruzione RFC 2104 era scritta a mano con le API
- * SHA256_Init/Update/Final di OpenSSL, deprecate dalla 3.0. HMAC() non e'
- * deprecata e produce gli stessi identici byte: il formato sul filo non
- * cambia (verificato con dev/hmac_check.c).
+ * Until v3.00, the RFC 2104 construction was hand-written using OpenSSL's
+ * SHA256_Init/Update/Final APIs, deprecated since 3.0. HMAC() is not
+ * deprecated and produces the exact same bytes: the wire format does not
+ * change (verified with dev/hmac_check.c).
  *
- * In caso di errore azzera il buffer e restituisce 0: verifyHmac confronta
- * byte a byte, quindi un fallimento fa scartare il messaggio invece di
- * accettarlo.
+ * On error, clears the buffer and returns 0: verifyHmac compares byte by
+ * byte, so a failure causes the message to be discarded instead of accepted.
  */
 int calculateHmac(const unsigned char *message, int msgLen, const char *key, unsigned char *hmac) {
     unsigned char fullHmac[SHA256_DIGEST_SIZE];
@@ -1839,7 +1838,7 @@ int calculateHmac(const unsigned char *message, int msgLen, const char *key, uns
     if (HMAC(EVP_sha256(), key, (int) strlen(key), message, (size_t) msgLen,
             fullHmac, &fullLen) == NULL
             || fullLen != SHA256_DIGEST_SIZE) {
-        dtnex_log("❌ Calcolo HMAC-SHA256 fallito");
+        dtnex_log("❌ HMAC-SHA256 computation failed");
         memset(hmac, 0, DTNEX_HMAC_SIZE);
         return 0;
     }
@@ -1906,10 +1905,10 @@ static int appendCborHmac(DtnexConfig *config, unsigned char *buffer,
 int verifyHmac(DtnexConfig *config, const unsigned char *message, int msgLen, const unsigned char *receivedHmac, const char *key) {
     unsigned char calculatedHmac[DTNEX_HMAC_SIZE];
 
-    // Se il calcolo dell'HMAC fallisce il messaggio va scartato, non accettato:
-    // non possiamo confrontare un buffer che non e' stato calcolato davvero.
+    // If HMAC computation fails, the message must be discarded, not accepted:
+    // we cannot compare a buffer that was not actually computed.
     if (calculateHmac(message, msgLen, key, calculatedHmac) != DTNEX_HMAC_SIZE) {
-        debug_log(config, "❌ Calcolo HMAC fallito durante la verifica: messaggio scartato");
+        debug_log(config, "❌ HMAC computation failed during verification: message discarded");
         return 0;
     }
 
@@ -2169,9 +2168,9 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Send the bundle using direct ION API - no source EID for CBOR messages
-    /* L'API di ION non e' const-corretta: bp_send dichiara char* pur non
-     * modificando l'EID. Il cast e' preferibile a togliere il const dalla
-     * nostra firma, che descrive correttamente cosa facciamo del puntatore. */
+    /* ION's API is not const-correct: bp_send declares char* even though it
+     * doesn't modify the EID. The cast is preferable to removing the const from
+     * our signature, which correctly describes how we use the pointer. */
     sendResult = bp_send(NULL, (char *) destEid, NULL, ttl, BP_STD_PRIORITY,
                         NoCustodyRequested, 0, 0, NULL, bundleZco, &newBundle);
     
