@@ -671,7 +671,7 @@ int ionc_print_contact_table(int debugMode)
 
         if (debugMode) {
             time_t      timediff = contact->toTime - now;
-            char        durationStr[24];
+            char        durationStr[32];
             char        startTimeStr[25];
             char        endTimeStr[25];
             struct tm  *timeinfo;

@@ -23,7 +23,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <signal.h>
-#include <openssl/sha.h>
+#include <openssl/hmac.h>
 
 // CBOR support using ION's implementation
 #include "include/ion/cbor.h"

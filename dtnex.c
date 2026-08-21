@@ -1821,44 +1821,29 @@ void generateNonce(unsigned char *nonce) {
 }
 
 /**
- * Calculate HMAC-SHA256 (truncated to DTNEX_HMAC_SIZE for size efficiency)
+ * Calcola l'HMAC-SHA256 del messaggio, troncato a DTNEX_HMAC_SIZE byte.
+ *
+ * Fino alla v3.00 la costruzione RFC 2104 era scritta a mano con le API
+ * SHA256_Init/Update/Final di OpenSSL, deprecate dalla 3.0. HMAC() non e'
+ * deprecata e produce gli stessi identici byte: il formato sul filo non
+ * cambia (verificato con dev/hmac_check.c).
+ *
+ * In caso di errore azzera il buffer e restituisce 0: verifyHmac confronta
+ * byte a byte, quindi un fallimento fa scartare il messaggio invece di
+ * accettarlo.
  */
 int calculateHmac(const unsigned char *message, int msgLen, const char *key, unsigned char *hmac) {
     unsigned char fullHmac[SHA256_DIGEST_SIZE];
-    
-    // Simple HMAC implementation (not OpenSSL's HMAC for minimal dependencies)
-    unsigned char keyPad[64]; // Block size for SHA-256
-    memset(keyPad, 0, sizeof(keyPad));
-    
-    int keyLen = strlen(key);
-    if (keyLen > 64) {
-        // Hash key if longer than block size
-        SHA256((unsigned char*)key, keyLen, keyPad);
-    } else {
-        memcpy(keyPad, key, keyLen);
+    unsigned int  fullLen = 0;
+
+    if (HMAC(EVP_sha256(), key, (int) strlen(key), message, (size_t) msgLen,
+            fullHmac, &fullLen) == NULL
+            || fullLen != SHA256_DIGEST_SIZE) {
+        dtnex_log("❌ Calcolo HMAC-SHA256 fallito");
+        memset(hmac, 0, DTNEX_HMAC_SIZE);
+        return 0;
     }
-    
-    // Create inner and outer padding
-    unsigned char ipad[64], opad[64];
-    for (int i = 0; i < 64; i++) {
-        ipad[i] = keyPad[i] ^ 0x36;
-        opad[i] = keyPad[i] ^ 0x5c;
-    }
-    
-    // Inner hash: SHA256(key XOR ipad || message)
-    SHA256_CTX ctx;
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, ipad, 64);
-    SHA256_Update(&ctx, message, msgLen);
-    SHA256_Final(fullHmac, &ctx);
-    
-    // Outer hash: SHA256(key XOR opad || inner_hash)
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, opad, 64);
-    SHA256_Update(&ctx, fullHmac, SHA256_DIGEST_SIZE);
-    SHA256_Final(fullHmac, &ctx);
-    
-    // Use only first DTNEX_HMAC_SIZE bytes for size optimization
+
     memcpy(hmac, fullHmac, DTNEX_HMAC_SIZE);
     return DTNEX_HMAC_SIZE;
 }
@@ -2179,7 +2164,10 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Send the bundle using direct ION API - no source EID for CBOR messages
-    sendResult = bp_send(NULL, destEid, NULL, ttl, BP_STD_PRIORITY,
+    /* L'API di ION non e' const-corretta: bp_send dichiara char* pur non
+     * modificando l'EID. Il cast e' preferibile a togliere il const dalla
+     * nostra firma, che descrive correttamente cosa facciamo del puntatore. */
+    sendResult = bp_send(NULL, (char *) destEid, NULL, ttl, BP_STD_PRIORITY,
                         NoCustodyRequested, 0, 0, NULL, bundleZco, &newBundle);
     
     if (sendResult <= 0) {
@@ -2786,9 +2774,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
     
     // We'll set hmacPosition right before HMAC decoding
     unsigned char *hmacPosition;
-    // Store the data array position for later processing
-    unsigned char *dataArrayPosition = cursor;
-    
+
     // Variables to store extracted contact/metadata data for later processing
     ContactRecord extractedContact = {0};
     StructuredMetadata extractedMetadata = {0};
@@ -3343,8 +3329,7 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
     int planCount = 0;
     char destEid[MAX_EID_LENGTH];
     unsigned char cborBuffer[MAX_CBOR_BUFFER];
-    int messageSize;
-    
+
     // Forwarding contact message - individual forwards logged in the loop
     
     // Get current neighbor list
@@ -3414,8 +3399,7 @@ void forwardCborMetadataMessage(DtnexConfig *config, unsigned char *originalNonc
     int planCount = 0;
     char destEid[MAX_EID_LENGTH];
     unsigned char cborBuffer[MAX_CBOR_BUFFER];
-    int messageSize;
-    
+
     // Forwarding metadata message - individual forwards logged in the loop
     
     // Get current neighbor list
