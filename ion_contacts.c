@@ -321,15 +321,33 @@ int ionc_get_own_ranges(unsigned long myNodeId, RangeRecord *out,
             continue;
         }
 
-        /* Authority rule (§4): we announce our own direction only. ION
-         * creates the reverse "imputed" range by itself, so each endpoint
-         * announces its own and the network stays consistent with no
-         * special cases. */
+        /* Authority rule (§4): we announce our own direction only. Each
+         * endpoint announces the ranges it asserted, and the receiver's ION
+         * imputes the reverse by itself, so the network stays consistent
+         * with no special cases. */
         if ((unsigned long) range->fromNode != myNodeId) {
             continue;
         }
 
         if (range->fromNode == range->toNode) {
+            continue;
+        }
+
+        /* Asserted ranges only. When a canonical range is asserted, ION
+         * automatically creates the reverse one with rangeElt == 0, which its
+         * own source comments as "imputed" (rfx.c:2490) and deleteRange uses
+         * to tell the two apart (rfx.c:2765). A range we LEARNED from the
+         * network gets such a reverse, whose fromNode is the local node: with
+         * no filter we would re-announce something ION merely inferred as if
+         * we were its authoritative source. Worse, for the receiver that
+         * record has fromNode > toNode, which ION reads as a non-canonical
+         * assertion, i.e. an explicit override of OWLT symmetry
+         * (rfx.c:2444-2456): inserting it deletes the imputed range and
+         * replaces it with an asserted one (rfx.c:2607), which removing the
+         * canonical range later does not clean up. Same principle as
+         * ionc_get_own_contacts keeping only CtScheduled/CtPredicted: we
+         * announce what we asserted, not what ION derived. */
+        if (range->rangeElt == 0) {
             continue;
         }
 
@@ -434,8 +452,11 @@ static void noteUserError(int debugMode, const char *op, const ContactRecord *re
             op, rec->fromNode, rec->toNode, (long) rec->fromTime, rc, meaning);
 }
 
-/* Same as noteUserError, for ranges. Two functions and not a generic one
- * because the two records do not share the fields that end up in the log. */
+/* Same as noteUserError, for ranges. The logged fields are the same three, but
+ * the record type is not: contacts and ranges are distinct entities in ION,
+ * with different keys, APIs and scopes. Merging the two into one function would
+ * mean either a void * or a conditional on the record type, which is worse than
+ * the parallel pair. */
 static void noteUserErrorRange(int debugMode, const char *op,
         const RangeRecord *rec, int rc, const char *meaning)
 {
@@ -490,9 +511,9 @@ static void logApplyOutcome(int debugMode, const ContactRecord *rec,
             (long) rec->toTime, ionc_outcome_name(contactOutcome));
 }
 
-/* The same line for the range side of ionc_apply_range. Two functions and not
- * a generic one because the two records do not share the fields that end up
- * in the log. */
+/* The same line for the range side of ionc_apply_range. Kept parallel to
+ * logApplyOutcome for the same reason as noteUserErrorRange: the record type
+ * differs even where the logged fields do not. */
 static void logApplyRangeOutcome(int debugMode, const RangeRecord *rec,
         IoncApplyOutcome rangeOutcome)
 {

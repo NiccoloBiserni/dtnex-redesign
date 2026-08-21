@@ -82,6 +82,8 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
  * Filters applied, the same as for contacts as far as they make sense:
  *   - fromNode == myNodeId          (authority rule, §4)
  *   - toNode != fromNode
+ *   - rangeElt != 0                 (asserted ranges only, never the reverse
+ *                                    ones ION imputes: see ionc_get_own_ranges)
  *   - toTime > now                  (expired ranges are not announced)
  *
  * Returns the number of records written to out, or -1 if ION is not
@@ -91,14 +93,16 @@ int ionc_get_own_ranges(unsigned long myNodeId, RangeRecord *out,
         int maxRecords, int debugMode);
 
 /**
- * Outcome of applying a received contact. Listed in increasing order of
- * severity: if the contact and the range yield different outcomes, the
- * higher one is reported.
+ * Outcome of applying a received contact or range. Each of ionc_apply_contact
+ * and ionc_apply_range reports its own outcome; the values are listed in
+ * increasing order of severity, so a caller that applies both and wants a
+ * single answer keeps the higher of the two. That merge is the caller's
+ * business, not this module's.
  */
 typedef enum {
     IONC_NOOP = 0,      /* ION was already in sync: nothing was written */
     IONC_REVISED,       /* xmitRate/confidence updated in place */
-    IONC_INSERTED,      /* contact and/or range are new */
+    IONC_INSERTED,      /* the entry was new: it was inserted */
     IONC_REPLACED,      /* window changed: targeted remove + insert */
     IONC_LOST,          /* the remove succeeded but the following insert was
                           * rejected by ION: the old entry is gone and was not
@@ -108,8 +112,11 @@ typedef enum {
 } IoncApplyOutcome;
 
 /**
- * Applies the received contact and its range to ION, keyed by identity
- * (local region, fromNode, toNode, fromTime) (§6.2-6.3).
+ * Applies the received contact to ION, keyed by identity
+ * (local region, fromNode, toNode, fromTime) (§6.2).
+ *
+ * The contact only: the range that goes with it is written by
+ * ionc_apply_range, which the caller invokes separately.
  *
  * Idempotent: if ION already holds exactly this contact, nothing is
  * written. Removals ALWAYS pass a pointer to the exact fromTime, never
