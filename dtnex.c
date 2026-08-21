@@ -1853,8 +1853,14 @@ int calculateHmac(const unsigned char *message, int msgLen, const char *key, uns
  */
 int verifyHmac(DtnexConfig *config, const unsigned char *message, int msgLen, const unsigned char *receivedHmac, const char *key) {
     unsigned char calculatedHmac[DTNEX_HMAC_SIZE];
-    calculateHmac(message, msgLen, key, calculatedHmac);
-    
+
+    // Se il calcolo dell'HMAC fallisce il messaggio va scartato, non accettato:
+    // non possiamo confrontare un buffer che non e' stato calcolato davvero.
+    if (calculateHmac(message, msgLen, key, calculatedHmac) != DTNEX_HMAC_SIZE) {
+        debug_log(config, "❌ Calcolo HMAC fallito durante la verifica: messaggio scartato");
+        return 0;
+    }
+
     // Debug logging for HMAC comparison
     debug_log(config, "🔍 HMAC verification details:");
     debug_log(config, "Message length: %d bytes", msgLen);
