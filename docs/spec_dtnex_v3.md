@@ -152,9 +152,19 @@ configured.
 **Why the receiver takes such a record seriously.** For ION a range with
 `fromNode > toNode` is not a harmless duplicate of the canonical one. It is a
 *non-canonical assertion*: the explicit statement that between those two nodes OWLT
-symmetry does **not** hold, so the reverse must not be derived from it. Node 2, applying
-that `3→1`, does not skip it as redundant — ION deletes the imputed entry it had derived
+symmetry does **not** hold, so the reverse must not be derived from it. Applying such a
+record therefore does not add a duplicate: ION deletes the imputed entry it had derived
 and replaces it with an asserted one.
+
+The receiver does not always get that far, and the difference matters. If the imputed
+entry it already holds carries the same OWLT and the same end time as the announcement —
+which is the case when both copies descend from the same canonical assertion — nothing is
+written at all and the message is an idempotent no-op (§5.3). But any divergence is
+enough for the insertion to happen for real: the reverse arriving before the canonical
+assertion it derives from, so that the receiver has nothing to compare against; an OWLT
+the receiver's own operator configured for that pair; or the first revision of the
+window, when the reverse announcement precedes the updated canonical one. From that
+moment the record is asserted, and stays so.
 
 **Why the damage does not heal.** When a canonical range is removed, ION cleans up the
 reverse it had derived from it — but it calls `deleteRange(rxaddr, 1)`, that is
@@ -173,8 +183,8 @@ propagated.**
 The network converges all the same. Every receiver imputes the reverse locally, from the
 canonical assertion it received, so the direction that is not announced is reconstructed
 where it is needed. And when both endpoints do assert their own side, the second
-insertion finds the range already present with the same OWLT, which ION reports as such
-and the code treats as an idempotent no-op. The filter is therefore not a restriction to
+announcement to arrive matches what the receiver already holds, so DTNEX recognises it
+before calling ION at all and treats it as an idempotent no-op. The filter is therefore not a restriction to
 be relaxed by a later reader who finds it excessive: removing it corrupts the range index
 of every node downstream.
 
@@ -282,7 +292,7 @@ each.
 
 The worst case is bounded by the encoder rather than measured: with 64-bit node numbers,
 a 32-bit region number and a 32-bit transmission rate, and epochs that still fit in 32
-bits, the envelope reaches about 36 bytes and the whole message about 90 bytes for a
+bits, the envelope reaches about 36 bytes and the whole message about 86 bytes for a
 contact and about 80 for a range. `MAX_CBOR_BUFFER` stays at 128 with room to spare.
 
 The **number** of messages grows by the ranges. For each neighbour a node sends one
@@ -300,7 +310,9 @@ more information is being propagated.
 Every received message is validated before ION is touched at all, and any failure means
 the message is discarded without being inserted and without being forwarded. The checks
 cover, in order: protocol version, HMAC, nonce, the origin not being the local node,
-and the announced direction genuinely belonging to the announcing node.
+the announced direction genuinely belonging to the announcing node, a `fromNode`
+different from the `toNode` — a contact from a node to itself is a registration, not
+topology — and a window whose start precedes its end.
 
 The remaining checks reject windows that ION would interpret as something other than a
 scheduled contact — a zero end time means a discovered, effectively permanent contact; a

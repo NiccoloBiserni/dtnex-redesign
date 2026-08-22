@@ -40,6 +40,7 @@ DTNEX builds network topology through a distributed information exchange process
 DTNEX uses CBOR (Compact Binary Object Representation) for efficient message encoding:
 
 - **Contact Messages**: Inform nodes about connectivity between node pairs
+- **Range Messages**: Propagate the one-way light time between node pairs
 - **Metadata Messages**: Share node descriptions, GPS coordinates, and operator information
 - **Authentication**: HMAC-SHA256 with configurable pre-shared network keys
 - **Replay Protection**: Nonce-based duplicate detection and caching
@@ -490,7 +491,7 @@ The CBOR protocol can be extended for custom applications:
 ### Performance Characteristics
 
 - **Contact Message Size**: 48-50 bytes observed on a testbed with single-digit node numbers; about 90 bytes in the worst case (64-bit node numbers, 32-bit region and transmission rate)
-- **Range Message Size**: shorter than a contact message by the two fields it does not carry; about 80 bytes in the same worst case
+- **Range Message Size**: shorter than a contact message — it drops three fields (`regionNbr`, `xmitRate`, `confidence`) and adds one (`owlt`); about 80 bytes in the same worst case
 - **Metadata Message Size**: ~55-85 bytes (without GPS), ~65-95 bytes (with GPS)
 - **Maximum Message Size**: 128 bytes (configurable via `MAX_CBOR_BUFFER`)
 - **Authentication Overhead**: 8 bytes HMAC + 3 bytes nonce = 11 bytes
