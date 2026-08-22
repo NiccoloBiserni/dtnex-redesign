@@ -158,7 +158,7 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
             continue;
         }
 
-        /* Authority rule (§4): we announce our own direction only. */
+        /* Authority rule: we announce our own direction only. */
         if ((unsigned long) contact->fromNode != myNodeId) {
             continue;
         }
@@ -171,7 +171,7 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
 
         /* Scheduled and Predicted are the only real windows. Discovered
          * contacts in particular have toTime = MAX_POSIX_TIME, and
-         * announcing them would propagate an eternal contact (§6.1 check 6). */
+         * announcing them would propagate an eternal contact. */
         if (contact->type != CtScheduled && contact->type != CtPredicted) {
             continue;
         }
@@ -251,7 +251,7 @@ int ionc_get_own_ranges(unsigned long myNodeId, RangeRecord *out,
             continue;
         }
 
-        /* Authority rule (§4): we announce our own direction only. Each
+        /* Authority rule: we announce our own direction only. Each
          * endpoint announces the ranges it asserted, and the receiver's ION
          * imputes the reverse by itself; the network stays consistent thanks
          * to the asserted-only filter below, not in spite of it. */
@@ -486,7 +486,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         return IONC_ERROR;
     }
 
-    /* Phase 1: existence check, inside a transaction (§6.4). */
+    /* Phase 1: existence check, inside a transaction. */
     /* sdr_begin_xn returns 1 on success and 0 on failure: a comparison
      * against < 0 would never fire. */
     if (sdr_begin_xn(sdr) != 1) {
@@ -699,7 +699,7 @@ IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
         return IONC_ERROR;
     }
 
-    /* Phase 1: existence check, inside a transaction (§6.4). */
+    /* Phase 1: existence check, inside a transaction. */
     /* sdr_begin_xn returns 1 on success and 0 on failure: a comparison
      * against < 0 would never fire. */
     if (sdr_begin_xn(sdr) != 1) {
@@ -721,8 +721,8 @@ IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
     /* Phase 2: writes. The rfx_* calls open their own transaction, so they
      * must be called with no transaction open. */
 
-    /* Same structure as the contact, but rfx_revise_range does not exist
-     * (§6.3): any difference is a remove + insert, except over an imputed
+    /* Same structure as the contact, but rfx_revise_range does not exist:
+     * any difference is a remove + insert, except over an imputed
      * range, where rfx_insert_range performs the swap on its own. */
     if (!haveRange) {
         rangeOutcome = insertRange(rec, "rfx_insert_range", IONC_INSERTED,

@@ -2,7 +2,7 @@
  * ion_contacts.h
  * DTNEX - access to ION for contacts and ranges.
  *
- * Module boundary (design §8.1): this module talks ONLY to ION. It knows
+ * Module boundary: this module talks ONLY to ION. It knows
  * nothing about CBOR, bundles, HMAC, neighbours or flooding. If encoding
  * ever leaks in here, the module stops being verifiable on its own and the
  * only reason it exists is lost.
@@ -61,8 +61,8 @@ typedef struct {
 /**
  * Reads from ION the contacts the local node is allowed to announce.
  *
- * Filters applied (§3.2):
- *   - fromNode == myNodeId          (authority rule, §4)
+ * Filters applied:
+ *   - fromNode == myNodeId          (authority rule)
  *   - toNode != fromNode            (excludes registration contacts)
  *   - type in {CtScheduled, CtPredicted}
  *   - toTime > now                  (expired contacts are not announced)
@@ -77,7 +77,7 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
  * Reads from ION the ranges the local node is allowed to announce.
  *
  * Filters applied, the same as for contacts as far as they make sense:
- *   - fromNode == myNodeId          (authority rule, §4)
+ *   - fromNode == myNodeId          (authority rule)
  *   - toNode != fromNode
  *   - rangeElt != 0                 (asserted ranges only, never the reverse
  *                                    ones ION imputes; the why is in the
@@ -112,7 +112,7 @@ typedef enum {
 
 /**
  * Applies the received contact to ION, keyed by identity
- * (regionNbr, fromNode, toNode, fromTime) (§6.2).
+ * (regionNbr, fromNode, toNode, fromTime).
  *
  * The contact only: the range that goes with it is written by
  * ionc_apply_range, which the caller invokes separately.
@@ -154,8 +154,7 @@ int ionc_print_contact_table(int debugMode);
  * ownNodeNbr from the IonDB and compares it against the expected value.
  *
  * Returns 1 if ION is alive and consistent, 0 if it restarted or was
- * reconfigured with a different node number, -1 if it is not reachable
- * (§6.6).
+ * reconfigured with a different node number, -1 if it is not reachable.
  *
  * Do NOT use "zero contacts" as a hint of a restart: a freshly started or
  * edge node legitimately has zero contacts.

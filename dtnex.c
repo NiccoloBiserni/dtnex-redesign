@@ -385,7 +385,7 @@ int tryConnectToIon(DtnexConfig *config) {
     /* Only ownNodeNbr is ever taken from the IonDB: the struct offsets in the
      * bundled headers (include/ion/ion.h) do not match those of the installed
      * ION library, so a value read at any other offset would not be the field
-     * it is named after (risk §12.3 of the design spec). */
+     * it is named after. */
 
     if (config->nodeId == 0) {
         bp_detach();
@@ -509,7 +509,7 @@ int init(DtnexConfig *config) {
 
 /* getplanlist is called both from the main loop and from the reception thread
  * (via forwardCborContactMessage) and writes into its own static cache:
- * access must be serialised (§7.5). */
+ * access must be serialised. */
 static pthread_mutex_t planListMutex = PTHREAD_MUTEX_INITIALIZER;
 
 void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
@@ -680,22 +680,24 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
 /**
  * Decides whether, what and to whom information is sent, then delegates the
  * construction and transmission of the bundle to the CBOR functions. It has
- * three phases: the time gate, the contact send loop and the metadata send loop.
+ * four phases: the time gate, the contact send loop, the range send loop and
+ * the metadata send loop.
  */
 
 /**
- * Snapshot of the announceable contacts (§3.2).
+ * Snapshot of the announceable contacts.
  *
- * CACHE CORRECTNESS INVARIANT (§7.4): this cache is TTL-only, with no
- * invalidation on write, and that is correct ONLY because the snapshot holds
- * exclusively contacts whose fromNode is the local node (authority rule, §4).
- * No write dtnex performs on ION can therefore fall inside this set. If anyone
- * relaxes that filter, this cache silently becomes wrong.
+ * CACHE CORRECTNESS INVARIANT: this cache is TTL-only, with no invalidation on
+ * write, and that is correct ONLY because the snapshot holds exclusively
+ * contacts whose fromNode is the local node (the authority rule). No write
+ * dtnex performs on ION can therefore fall inside this set. If anyone relaxes
+ * that filter, this cache silently becomes wrong.
  *
- * The TTL governs the responsiveness of trigger 3 in §7.1: it is the maximum
- * delay between a change to ionrc and its discovery by the network. 60 seconds
- * is the chosen compromise: it matches the longest wake-up period of the main
- * loop, so it adds no ION accesses beyond the pace of the loop itself.
+ * The TTL also governs how promptly the announcement trigger that watches this
+ * snapshot can fire: it is the maximum delay between a change to ionrc and its
+ * discovery by the network. 60 seconds is the chosen compromise: it matches the
+ * longest wake-up period of the main loop, so it adds no ION accesses beyond
+ * the pace of the loop itself.
  */
 #define MY_CONTACTS_CACHE_TTL 60
 
@@ -719,7 +721,7 @@ static int sameContactRecord(const ContactRecord *a, const ContactRecord *b) {
  * refreshed). Returns the number of contacts in the snapshot, or -1 on an ION
  * access error (in which case the previous snapshot stays valid).
  *
- * Single-threaded (§7.5): only the main loop calls this function.
+ * Single-threaded: only the main loop calls this function.
  */
 static int refreshMyContacts(DtnexConfig *config, int *changed) {
     ContactRecord fresh[IONC_MAX_CONTACTS];
@@ -763,10 +765,10 @@ static int refreshMyContacts(DtnexConfig *config, int *changed) {
     return myContactCount;
 }
 
-/* Snapshot of the ranges this node may announce (§4), the twin of the contact
+/* Snapshot of the ranges this node may announce, the twin of the contact
  * snapshot above. It deliberately reuses MY_CONTACTS_CACHE_TTL: despite the
- * name, that constant is the wake-up step of the main loop and governs the
- * responsiveness of trigger 3 for both snapshots alike. */
+ * name, that constant is the wake-up step of the main loop and governs how
+ * promptly either snapshot can trigger an announcement. */
 static RangeRecord myRanges[IONC_MAX_RANGES];
 static int myRangeCount = 0;
 static time_t myRangesUpdated = 0;
@@ -785,7 +787,7 @@ static int sameRangeRecord(const RangeRecord *a, const RangeRecord *b) {
  * number of ranges in the snapshot, or -1 on an ION access error (in which
  * case the previous snapshot stays valid).
  *
- * Single-threaded (§7.5): only the main loop calls this function.
+ * Single-threaded: only the main loop calls this function.
  */
 static int refreshMyRanges(DtnexConfig *config, int *changed) {
     RangeRecord fresh[IONC_MAX_RANGES];
@@ -845,10 +847,10 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
 
     time(&currentTime);
 
-    // Trigger 3 (§7.1): refresh the snapshot and see whether it changed.
+    // Trigger 3: refresh the contact snapshot and see whether it changed.
     refreshMyContacts(config, &contactsChanged);
 
-    // Trigger 3 (§7.1), range side: same mechanism as for contacts.
+    // Trigger 4: same mechanism, on the range snapshot.
     refreshMyRanges(config, &rangesChanged);
 
     // Trigger 2: the neighbour list changed
@@ -890,7 +892,7 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
         lastPlanList[i] = plans[i].planId;
     }
 
-    // One message per announceable contact, to every neighbour (§5.4).
+    // One message per announceable contact, to every neighbour.
     for (i = 0; i < planCount; i++) {
         unsigned long neighborId = plans[i].planId;
 
@@ -922,7 +924,7 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
         }
     }
 
-    // One message per announceable range, to every neighbour (§4).
+    // One message per announceable range, to every neighbour.
     for (i = 0; i < planCount; i++) {
         unsigned long neighborId = plans[i].planId;
 
@@ -1160,7 +1162,7 @@ static void *signalWaitThread(void *arg)
 
 /**
  * A thin wrapper around the ion_contacts module: prints the diagnostic table,
- * explicitly checks that ION is alive and consistent (§6.6), then produces the
+ * explicitly checks that ION is alive and consistent, then produces the
  * snapshot of announceable contacts and the graph.
  */
 void getContacts(DtnexConfig *config) {
@@ -1182,7 +1184,7 @@ void getContacts(DtnexConfig *config) {
         return;
     }
 
-    // Explicit restart detection (§6.6): "zero contacts" is NOT a hint of a
+    // Explicit restart detection: "zero contacts" is NOT a hint of a
     // restart, a freshly started node legitimately has zero.
     alive = ionc_check_alive(config->nodeId);
     if (alive != 1) {
@@ -2102,7 +2104,7 @@ void addNonceToCache(unsigned char *nonce, unsigned long origin) {
 
 /**
  * Encode CBOR contact message
- * Format (§3.3): [version, "c", timestamp, expireTime, origin, from, nonce,
+ * Format: [version, "c", timestamp, expireTime, origin, from, nonce,
  *                  [regionNbr, fromNode, toNode, fromTime, toTime, xmitRate,
  *                   confidence], hmac]
  */
@@ -2115,12 +2117,12 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
 
     generateNonce(nonce);
 
-    // §7.2: the message is useful exactly as long as the contact it describes
-    // is valid, so expireTime IS the contact's toTime.
+    // The message is useful exactly as long as the contact it describes is
+    // valid, so expireTime IS the contact's toTime.
     bytesWritten += writeCborEnvelope(&cursor, "c", time(NULL), contact->toTime,
             config->nodeId, config->nodeId, nonce);
 
-    // Contact payload (§3.3): 7 fields, regionNbr first, absolute times
+    // Contact payload: 7 fields, regionNbr first, absolute times
     bytesWritten += cbor_encode_array_open(7, &cursor);
     bytesWritten += cbor_encode_integer(contact->regionNbr, &cursor);
     bytesWritten += cbor_encode_integer(contact->fromNode, &cursor);
@@ -2138,7 +2140,7 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
 
 /**
  * Encode CBOR range message
- * Format (§3.4): [version, "r", timestamp, expireTime, origin, from, nonce,
+ * Format: [version, "r", timestamp, expireTime, origin, from, nonce,
  *                  [fromNode, toNode, fromTime, toTime, owlt], hmac]
  *
  * The payload carries no regionNbr: in ION ranges are not regional entities
@@ -2153,12 +2155,12 @@ int encodeCborRangeMessage(DtnexConfig *config, RangeRecord *range, unsigned cha
 
     generateNonce(nonce);
 
-    // As for contacts (§7.2): the message is useful exactly as long as the
-    // range it describes is, so expireTime IS the range's toTime.
+    // As for contacts: the message is useful exactly as long as the range it
+    // describes is, so expireTime IS the range's toTime.
     bytesWritten += writeCborEnvelope(&cursor, "r", time(NULL), range->toTime,
             config->nodeId, config->nodeId, nonce);
 
-    // Range data array (§3.4): 5 fields, absolute times
+    // Range data array: 5 fields, absolute times
     bytesWritten += cbor_encode_array_open(5, &cursor);
     bytesWritten += cbor_encode_integer(range->fromNode, &cursor);
     bytesWritten += cbor_encode_integer(range->toNode, &cursor);
@@ -2495,9 +2497,9 @@ void eventDrivenLoop(DtnexConfig *config) {
         // Bundle reception is now handled by the dedicated thread
         if (!running) break;
         
-        // On every wake-up (<= 60s): re-evaluate the announcement triggers
-        // (§7.1). exchangeWithNeighbors decides on its own whether there is
-        // anything to do.
+        // On every wake-up (<= 60s): re-evaluate the announcement triggers.
+        // exchangeWithNeighbors decides on its own whether there is anything
+        // to do.
         if (ionConnected) {
             getplanlist(config, plans, &planCount);
             exchangeWithNeighbors(config, plans, planCount);
@@ -2990,7 +2992,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
     
     // Extract data elements based on message type and then skip them for HMAC verification
     if (messageType[0] == 'c') {
-        // Contact message v3 (§5.2): 7 fields
+        // Contact message v3: 7 fields
         debug_log(config, "🔍 Extracting 7 contact elements manually");
 
         if (dataArraySize != 7) {
@@ -3037,7 +3039,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
         debug_log(config, "✅ Successfully skipped contact elements for HMAC");
 
     } else if (messageType[0] == 'r') {
-        // Range message (§3.4): 5 fields
+        // Range message: 5 fields
         debug_log(config, "🔍 Extracting 5 range elements manually");
 
         if (dataArraySize != 5) {
@@ -3359,7 +3361,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
  */
 
 /* Beyond this distance into the future, a window looks like clock skew rather
- * than a legitimate one: it is discarded, and said so (§7.6). */
+ * than a legitimate one: it is discarded, and said so. */
 #define CLOCK_SKEW_FUTURE_LIMIT (30 * 24 * 3600)
 
 int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
@@ -3370,7 +3372,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
     log_message_received(config, origin, from, "contact",
             contact->fromNode, contact->toNode, NULL);
 
-    /* Validation pipeline (§6.1). Checks 1-3 (version, HMAC, nonce) have
+    /* Validation pipeline. Checks 1-3 (version, HMAC, nonce) have
      * already been performed in decodeCborMessage. Every failure discards the
      * message without inserting and without forwarding, and returns 0: this is
      * not a decoding error (the message decoded perfectly), it is a policy
@@ -3384,7 +3386,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         return 0;
     }
 
-    // 5. Only the source announces its own direction (§4)
+    // 5. Only the source announces its own direction
     if (contact->fromNode != origin) {
         debug_log(config, "❌ Discarded: fromNode=%lu != origin=%lu",
                 contact->fromNode, origin);
@@ -3453,7 +3455,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         return 0;
     }
 
-    // 8b. Window too far in the future: suspected clock skew (§7.6)
+    // 8b. Window too far in the future: suspected clock skew
     if (contact->fromTime > currentTime + CLOCK_SKEW_FUTURE_LIMIT) {
         debug_log(config, "❌ Discarded: window too far in the future "
                 "(fromTime=%ld, now=%ld) — possible clock skew between nodes",
@@ -3461,17 +3463,17 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         return 0;
     }
 
-    /* We write what we learn, but announce only what we are authoritative for
-     * (§4.5): contacts with toNode == me are inserted as well. */
+    /* We write what we learn, but announce only what we are authoritative
+     * for: contacts with toNode == me are inserted as well. */
     outcome = ionc_apply_contact(contact, config->debugMode);
 
     if (outcome == IONC_ERROR) {
         /* IONC_ERROR is a system error from an rfx_* call (rc < 0) or ION
          * being unreachable: after the earlier fix, an overlap with a manually
          * configured contact is an expected user error and no longer reaches
-         * this point. The message stays valid regardless and must be forwarded
-         * (§6.5), otherwise a purely local problem would partition the
-         * flooding. */
+         * this point. The message stays valid regardless and must be
+         * forwarded anyway, otherwise a purely local problem would partition
+         * the flooding. */
         dtnex_log("❌ Failed to apply contact %lu→%lu to ION",
                 contact->fromNode, contact->toNode);
     } else if (outcome == IONC_LOST) {
@@ -3489,8 +3491,8 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
                 contact->fromNode, contact->toNode, ionc_outcome_name(outcome));
     }
 
-    // Forwarding is unchanged (§6.5): a message that passes validation is
-    // always forwarded, regardless of the outcome of the local ION write.
+    // Forwarding is unchanged: a message that passes validation is always
+    // forwarded, regardless of the outcome of the local ION write.
     forwardCborContactMessage(config, nonce, timestamp, expireTime, origin, from, contact);
 
     return 0;
@@ -3519,7 +3521,7 @@ int processCborRangeMessage(DtnexConfig *config, unsigned char *nonce, time_t ti
         return 0;
     }
 
-    // 5. Only the source announces its own direction (§4)
+    // 5. Only the source announces its own direction
     if (range->fromNode != origin) {
         debug_log(config, "❌ Discarded: fromNode=%lu != origin=%lu",
                 range->fromNode, origin);
@@ -3565,7 +3567,7 @@ int processCborRangeMessage(DtnexConfig *config, unsigned char *nonce, time_t ti
         return 0;
     }
 
-    // 8b. Window too far in the future: suspected clock skew (§7.6)
+    // 8b. Window too far in the future: suspected clock skew
     if (range->fromTime > currentTime + CLOCK_SKEW_FUTURE_LIMIT) {
         debug_log(config, "❌ Discarded: window too far in the future "
                 "(fromTime=%ld, now=%ld) — possible clock skew between nodes",
@@ -3592,7 +3594,7 @@ int processCborRangeMessage(DtnexConfig *config, unsigned char *nonce, time_t ti
                 range->fromNode, range->toNode, ionc_outcome_name(outcome));
     }
 
-    // Forwarding does not depend on the outcome of the local write (§6.5)
+    // Forwarding does not depend on the outcome of the local write
     forwardCborRangeMessage(config, nonce, timestamp, expireTime, origin, from, range);
 
     return 0;
@@ -3685,7 +3687,7 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         bytesWritten += writeCborEnvelope(&cursor, "c", timestamp, expireTime,
                 origin, config->nodeId, originalNonce);
 
-        // Contact payload (§3.3)
+        // Contact payload
         bytesWritten += cbor_encode_array_open(7, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.regionNbr, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.fromNode, &cursor);
