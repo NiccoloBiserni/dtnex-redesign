@@ -223,7 +223,16 @@ validated message, the write follows from comparing it against what ION already 
 | it does not exist but the window overlaps a local contact | ION refuses, the local entry is kept, logged at debug level — this is not a failure |
 
 Ranges follow the same structure, except that ION exposes no in-place revision for
-them, so a change means targeted removal followed by insertion.
+them, so a change means targeted removal followed by insertion — with one exception.
+ION holds two kinds of range: *asserted* ones, which somebody declared and which are
+backed by a stored assertion object, and *imputed* ones, which ION derived by itself
+from the canonical assertion in the opposite direction and which exist only as an index
+entry. Over an imputed range there is nothing to remove, and the insertion performs the
+substitution on its own within a single transaction; removing it first would split that
+substitution in two, leaving the pair without a current OWLT in between, and would
+expose the insertion to an overlap check that ION skips when the key is already present.
+An imputed range that a message merely confirms is left untouched: what ION deduced by
+itself is not promoted into an assertion of ours.
 
 **The removal is always issued with the exact start time of the entry being replaced.**
 This one detail is what closes problem 1.3: with a null timestamp ION applies the `*`
@@ -312,6 +321,15 @@ logged explicitly as suspected clock skew, so that a silent isolation becomes a
 diagnosable one.
 
 **Half-link coverage when a peer's DTNEX is not running**, as discussed in §3.3.
+
+**A confirmed imputed range stays imputed.** When a received range matches one ION
+derived by itself from the reverse assertion, nothing is written, so ION keeps only the
+derived entry. That entry lives and dies with the operator's canonical one: if the
+operator deletes it, ION drops the derived entry along with it and our knowledge of that
+direction disappears without a log, until the next received message restores it — at
+most one `updateInterval` later. Promoting it into an assertion of ours would fix the
+lifetime at the cost of silently overriding the symmetry the operator configured, which
+is the worse trade.
 
 ---
 
