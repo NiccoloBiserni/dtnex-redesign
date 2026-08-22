@@ -17,67 +17,12 @@
 extern void dtnex_log(const char *format, ...);
 
 /**
- * Looks up, in ION's rangeIndex, a range between fromNode and toNode whose
- * window overlaps [fromTime, toTime]. In ION the OWLT is a symmetric
- * geometric property, so if the requested direction is not found we try the
- * opposite one.
- *
- * Must be called with an SDR transaction already open.
- * Returns 1 and writes *owlt if a range is found, 0 otherwise.
- */
-static int findOwlt(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
-        uvast toNode, time_t fromTime, time_t toTime, unsigned int *owlt)
-{
-    PsmAddress   elt;
-    PsmAddress   addr;
-    IonRXref    *range;
-
-    if (ionvdb->rangeIndex == 0) {
-        return 0;
-    }
-
-    for (elt = sm_rbt_first(ionwm, ionvdb->rangeIndex); elt;
-            elt = sm_rbt_next(ionwm, elt)) {
-        addr = sm_rbt_data(ionwm, elt);
-        if (addr == 0) {
-            continue;
-        }
-
-        range = (IonRXref *) psp(ionwm, addr);
-        if (range == NULL) {
-            continue;
-        }
-
-        if (!((range->fromNode == fromNode && range->toNode == toNode)
-                || (range->fromNode == toNode && range->toNode == fromNode))) {
-            continue;
-        }
-
-        /* Overlapping windows */
-        if (range->fromTime > toTime || range->toTime < fromTime) {
-            continue;
-        }
-
-        *owlt = range->owlt;
-        return 1;
-    }
-
-    return 0;
-}
-
-/**
- * Looks up the contact with the exact key (fromNode, toNode, fromTime).
- * Must be called with an SDR transaction already open.
+ * Looks up the contact with the exact key (regionNbr, fromNode, toNode,
+ * fromTime). Must be called with an SDR transaction already open.
  * Returns 1 and copies the contact into *copy, or 0 if it does not exist.
- *
- * IonCXref.regionNbr is deliberately ignored in the comparison: dtnex is
- * single-region (§5.3) and every write uses IONC_DEFAULT_REGION, so every
- * contact we care about lives in that region. The assumption is load-bearing:
- * it is exactly what code 7 of rfx_insert_contact ("contact is for a foreign
- * region") depends on, which fires if the local region is not region 1.
  */
-static int findContact(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
-        uvast toNode, time_t fromTime, IonCXref *copy)
+static int findContact(PsmPartition ionwm, IonVdb *ionvdb, uint32_t regionNbr,
+        uvast fromNode, uvast toNode, time_t fromTime, IonCXref *copy)
 {
     PsmAddress   elt;
     PsmAddress   addr;
@@ -99,7 +44,8 @@ static int findContact(PsmPartition ionwm, IonVdb *ionvdb, uvast fromNode,
             continue;
         }
 
-        if (contact->fromNode == fromNode && contact->toNode == toNode
+        if (contact->regionNbr == regionNbr
+                && contact->fromNode == fromNode && contact->toNode == toNode
                 && contact->fromTime == fromTime) {
             memcpy(copy, contact, sizeof(IonCXref));
             return 1;
@@ -196,8 +142,6 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
 
     for (elt = sm_rbt_first(ionwm, ionvdb->contactIndex); elt;
             elt = sm_rbt_next(ionwm, elt)) {
-        unsigned int owlt = 0;
-
         if (count >= maxRecords) {
             dtnex_log("Contact snapshot full (%d): the remaining contacts "
                     "will not be announced", maxRecords);
@@ -236,20 +180,7 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
             continue;
         }
 
-        /* §3.4: without a range, CGR discards the contact as a next hop, so
-         * announcing it would generate churn without ever producing a route. */
-        if (!findOwlt(ionwm, ionvdb, contact->fromNode, contact->toNode,
-                contact->fromTime, contact->toTime, &owlt)) {
-            if (debugMode) {
-                dtnex_log("Contact %lu→%lu (from %ld) has no range: not "
-                        "announced — check ionrc",
-                        (unsigned long) contact->fromNode,
-                        (unsigned long) contact->toNode,
-                        (long) contact->fromTime);
-            }
-            continue;
-        }
-
+        out[count].regionNbr = contact->regionNbr;
         out[count].fromNode = (unsigned long) contact->fromNode;
         out[count].toNode = (unsigned long) contact->toNode;
         out[count].fromTime = contact->fromTime;
@@ -257,7 +188,6 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
         out[count].xmitRate = (unsigned long) contact->xmitRate;
         out[count].confidence =
                 (unsigned int) (contact->confidence * 100.0f + 0.5f);
-        out[count].owlt = owlt;
         count++;
     }
 
@@ -540,6 +470,11 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
     int              rc;
     IoncApplyOutcome contactOutcome = IONC_NOOP;
 
+    /* The region comes from the message. If it is not one of the local
+     * node's own regions, ION refuses with user error 7 ("contact is for a
+     * foreign region"), which noteUserError logs in debug like every other
+     * user error: the decision about a region is ION's, not dtnex's. */
+
     if (rec == NULL) {
         return IONC_ERROR;
     }
@@ -565,8 +500,9 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
         return IONC_ERROR;
     }
 
-    haveContact = findContact(ionwm, ionvdb, (uvast) rec->fromNode,
-            (uvast) rec->toNode, rec->fromTime, &existingContact);
+    haveContact = findContact(ionwm, ionvdb, (uint32_t) rec->regionNbr,
+            (uvast) rec->fromNode, (uvast) rec->toNode, rec->fromTime,
+            &existingContact);
 
     sdr_exit_xn(sdr);
 
@@ -574,7 +510,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
      * must be called with no transaction open. */
 
     if (!haveContact) {
-        rc = rfx_insert_contact(IONC_DEFAULT_REGION, rec->fromTime, rec->toTime,
+        rc = rfx_insert_contact(rec->regionNbr, rec->fromTime, rec->toTime,
                 (uvast) rec->fromNode, (uvast) rec->toNode,
                 (size_t) rec->xmitRate, confidence, &cxaddr, 0);
         if (rc < 0) {
@@ -596,7 +532,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
     } else if (existingContact.toTime != rec->toTime) {
         /* Window changed: TARGETED removal by exact fromTime. */
         key = rec->fromTime;
-        rc = rfx_remove_contact(IONC_DEFAULT_REGION, &key,
+        rc = rfx_remove_contact(rec->regionNbr, &key,
                 (uvast) rec->fromNode, (uvast) rec->toNode, 0);
         if (rc < 0) {
             dtnex_log("⚠️  Anomaly: rfx_remove_contact %lu→%lu (from %ld) "
@@ -611,7 +547,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
             noteUserError(debugMode, "rfx_remove_contact", rec, rc,
                     removeUserError(rc));
         } else {
-            rc = rfx_insert_contact(IONC_DEFAULT_REGION, rec->fromTime,
+            rc = rfx_insert_contact(rec->regionNbr, rec->fromTime,
                     rec->toTime, (uvast) rec->fromNode, (uvast) rec->toNode,
                     (size_t) rec->xmitRate, confidence, &cxaddr, 0);
             if (rc < 0) {
@@ -642,7 +578,7 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
             || existingContact.confidence < confidence - 0.005f
             || existingContact.confidence > confidence + 0.005f) {
         /* Only xmitRate/confidence differ: revise in place. */
-        rc = rfx_revise_contact(IONC_DEFAULT_REGION, rec->fromTime,
+        rc = rfx_revise_contact(rec->regionNbr, rec->fromTime,
                 (uvast) rec->fromNode, (uvast) rec->toNode,
                 (size_t) rec->xmitRate, confidence, 0);
         if (rc < 0) {

@@ -13,30 +13,28 @@
 
 #include <time.h>
 
-/* Region into which contacts received from the network are inserted.
- * dtnex is single-region by design (§5.3): regionNbr never travels on the
- * wire, so the receiver always uses its own default region. */
-#define IONC_DEFAULT_REGION 1
-
 /* Maximum size of a snapshot of announceable contacts. */
 #define IONC_MAX_CONTACTS 200
 
 /**
- * A contact together with its range, in ION's own units:
+ * A contact, in ION's own units:
+ *   regionNbr       : ION region number (IonCXref.regionNbr)
  *   fromTime/toTime : absolute UNIX epoch
  *   xmitRate        : bytes per second
  *   confidence      : percentage 0-100 (ION uses a 0.0-1.0 float;
- *                     cbor.h cannot encode floats, §5.3)
- *   owlt            : seconds
+ *                     cbor.h cannot encode floats)
+ *
+ * The owlt no longer lives here: the range is an entity of its own, with its
+ * own RangeRecord and its own message type "r".
  */
 typedef struct {
+    unsigned int  regionNbr;
     unsigned long fromNode;
     unsigned long toNode;
     time_t        fromTime;
     time_t        toTime;
     unsigned long xmitRate;
     unsigned int  confidence;
-    unsigned int  owlt;
 } ContactRecord;
 
 /* Maximum size of a snapshot of announceable ranges. */
@@ -68,7 +66,6 @@ typedef struct {
  *   - toNode != fromNode            (excludes registration contacts)
  *   - type in {CtScheduled, CtPredicted}
  *   - toTime > now                  (expired contacts are not announced)
- *   - a matching range exists, to derive the owlt from
  *
  * Returns the number of records written to out, or -1 if ION is not
  * reachable (SDR, vdb or working memory unavailable).
@@ -115,7 +112,7 @@ typedef enum {
 
 /**
  * Applies the received contact to ION, keyed by identity
- * (local region, fromNode, toNode, fromTime) (§6.2).
+ * (regionNbr, fromNode, toNode, fromTime) (§6.2).
  *
  * The contact only: the range that goes with it is written by
  * ionc_apply_range, which the caller invokes separately.

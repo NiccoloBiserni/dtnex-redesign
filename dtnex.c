@@ -704,13 +704,13 @@ static int myContactCount = 0;
 static time_t myContactsUpdated = 0;
 
 static int sameContactRecord(const ContactRecord *a, const ContactRecord *b) {
-    return a->fromNode == b->fromNode
+    return a->regionNbr == b->regionNbr
+        && a->fromNode == b->fromNode
         && a->toNode == b->toNode
         && a->fromTime == b->fromTime
         && a->toTime == b->toTime
         && a->xmitRate == b->xmitRate
-        && a->confidence == b->confidence
-        && a->owlt == b->owlt;
+        && a->confidence == b->confidence;
 }
 
 /**
@@ -910,10 +910,10 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
             }
 
             snprintf(destEid, sizeof(destEid), "ipn:%lu.%s", neighborId, config->serviceNr);
-            debug_log(config, "[exchange] %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u owlt=%u → %s (%d byte)",
-                    contact->fromNode, contact->toNode,
+            debug_log(config, "[exchange] contact region=%u %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u → %s (%d bytes)",
+                    contact->regionNbr, contact->fromNode, contact->toNode,
                     (long) contact->fromTime, (long) contact->toTime,
-                    contact->xmitRate, contact->confidence, contact->owlt,
+                    contact->xmitRate, contact->confidence,
                     destEid, messageSize);
 
             sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
@@ -1214,11 +1214,29 @@ void getContacts(DtnexConfig *config) {
             dtnex_log("\033[36mAnnounceable contacts (fromNode == %lu): %d\033[0m",
                     config->nodeId, snapshotCount);
             for (int s = 0; s < snapshotCount; s++) {
-                dtnex_log("  %lu→%lu  from=%ld to=%ld  xmitRate=%lu B/s  conf=%u%%  owlt=%us",
+                dtnex_log("  region=%u  %lu→%lu  from=%ld to=%ld  xmitRate=%lu B/s  conf=%u%%",
+                        snapshot[s].regionNbr,
                         snapshot[s].fromNode, snapshot[s].toNode,
                         (long) snapshot[s].fromTime, (long) snapshot[s].toTime,
-                        snapshot[s].xmitRate, snapshot[s].confidence,
-                        snapshot[s].owlt);
+                        snapshot[s].xmitRate, snapshot[s].confidence);
+            }
+        }
+
+        RangeRecord rangeSnapshot[IONC_MAX_RANGES];
+        int rangeSnapshotCount = ionc_get_own_ranges(config->nodeId,
+                rangeSnapshot, IONC_MAX_RANGES, config->debugMode);
+
+        if (rangeSnapshotCount < 0) {
+            dtnex_log("⚠️  Could not read the snapshot of announceable ranges");
+        } else {
+            dtnex_log("\033[36mAnnounceable ranges (fromNode == %lu): %d\033[0m",
+                    config->nodeId, rangeSnapshotCount);
+            for (int s = 0; s < rangeSnapshotCount; s++) {
+                dtnex_log("  %lu→%lu  from=%ld to=%ld  owlt=%us",
+                        rangeSnapshot[s].fromNode, rangeSnapshot[s].toNode,
+                        (long) rangeSnapshot[s].fromTime,
+                        (long) rangeSnapshot[s].toTime,
+                        rangeSnapshot[s].owlt);
             }
         }
     }
@@ -2084,8 +2102,9 @@ void addNonceToCache(unsigned char *nonce, unsigned long origin) {
 
 /**
  * Encode CBOR contact message
- * Format v3 (§5.2): [version, type, timestamp, expireTime, origin, from, nonce,
- *                     [fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt], hmac]
+ * Format (§3.3): [version, "c", timestamp, expireTime, origin, from, nonce,
+ *                  [regionNbr, fromNode, toNode, fromTime, toTime, xmitRate,
+ *                   confidence], hmac]
  */
 int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsigned char *buffer, int bufferSize) {
     unsigned char *cursor = buffer;
@@ -2101,15 +2120,15 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
     bytesWritten += writeCborEnvelope(&cursor, "c", time(NULL), contact->toTime,
             config->nodeId, config->nodeId, nonce);
 
-    // Contact data array v3 (§5.2): 7 fields, absolute times
+    // Contact payload (§3.3): 7 fields, regionNbr first, absolute times
     bytesWritten += cbor_encode_array_open(7, &cursor);
+    bytesWritten += cbor_encode_integer(contact->regionNbr, &cursor);
     bytesWritten += cbor_encode_integer(contact->fromNode, &cursor);
     bytesWritten += cbor_encode_integer(contact->toNode, &cursor);
     bytesWritten += cbor_encode_integer((uvast) contact->fromTime, &cursor);
     bytesWritten += cbor_encode_integer((uvast) contact->toTime, &cursor);
     bytesWritten += cbor_encode_integer(contact->xmitRate, &cursor);
     bytesWritten += cbor_encode_integer(contact->confidence, &cursor);
-    bytesWritten += cbor_encode_integer(contact->owlt, &cursor);
 
     bytesWritten += appendCborHmac(config, buffer, bytesWritten, &cursor);
 
@@ -2982,28 +3001,28 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
         unsigned char *extractCursor = cursor;
         unsigned int extractBytesBuffered = bytesBuffered;
 
-        unsigned long tFromNode, tToNode, tFromTime, tToTime, tXmitRate, tConfidence, tOwlt;
-        if (manualDecodeCborInteger(&tFromNode, &extractCursor, &extractBytesBuffered) &&
+        unsigned long tRegionNbr, tFromNode, tToNode, tFromTime, tToTime, tXmitRate, tConfidence;
+        if (manualDecodeCborInteger(&tRegionNbr, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tFromNode, &extractCursor, &extractBytesBuffered) &&
             manualDecodeCborInteger(&tToNode, &extractCursor, &extractBytesBuffered) &&
             manualDecodeCborInteger(&tFromTime, &extractCursor, &extractBytesBuffered) &&
             manualDecodeCborInteger(&tToTime, &extractCursor, &extractBytesBuffered) &&
             manualDecodeCborInteger(&tXmitRate, &extractCursor, &extractBytesBuffered) &&
-            manualDecodeCborInteger(&tConfidence, &extractCursor, &extractBytesBuffered) &&
-            manualDecodeCborInteger(&tOwlt, &extractCursor, &extractBytesBuffered)) {
+            manualDecodeCborInteger(&tConfidence, &extractCursor, &extractBytesBuffered)) {
 
+            extractedContact.regionNbr = (unsigned int) tRegionNbr;
             extractedContact.fromNode = tFromNode;
             extractedContact.toNode = tToNode;
             extractedContact.fromTime = (time_t) tFromTime;
             extractedContact.toTime = (time_t) tToTime;
             extractedContact.xmitRate = tXmitRate;
             extractedContact.confidence = (unsigned int) tConfidence;
-            extractedContact.owlt = (unsigned int) tOwlt;
             hasExtractedData = 1;
-            debug_log(config, "✅ Extracted contact: %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u owlt=%u",
+            debug_log(config, "✅ Extracted contact: region=%u %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u",
+                      extractedContact.regionNbr,
                       extractedContact.fromNode, extractedContact.toNode,
                       (long) extractedContact.fromTime, (long) extractedContact.toTime,
-                      extractedContact.xmitRate, extractedContact.confidence,
-                      extractedContact.owlt);
+                      extractedContact.xmitRate, extractedContact.confidence);
         } else {
             debug_log(config, "❌ Failed to extract contact elements");
         }
@@ -3442,43 +3461,9 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         return 0;
     }
 
-    /* There is no check 9 on the owlt: 0 is a legitimate OWLT (on a LAN it is
-     * the physically correct value, and ION accepts "a range ... 0"). Discarding
-     * it here contradicted origination, where findOwlt returns 0 as a valid
-     * value, and on a local testbed it made every receiver discard everything.
-     * The v3 format always carries the field, and ionc_get_own_contacts only
-     * announces contacts for which a range really exists: the check was
-     * redundant. */
-
     /* We write what we learn, but announce only what we are authoritative for
      * (§4.5): contacts with toNode == me are inserted as well. */
     outcome = ionc_apply_contact(contact, config->debugMode);
-
-    /* Transitional: as long as the "c" message carries the owlt, the range is
-     * still written here, derived from the contact. This will go away once the
-     * "r" message carries ranges on its own. */
-    /* Skipped on IONC_ERROR: that is a system error, so ION is unreachable or
-     * broken and the range write would be a second call failing the same way.
-     * On a user error we do carry on, because a local refusal of the contact
-     * must not stop ION from learning the OWLT. */
-    if (outcome != IONC_ERROR) {
-        RangeRecord derivedRange;
-        IoncApplyOutcome rangeOutcome;
-
-        derivedRange.fromNode = contact->fromNode;
-        derivedRange.toNode = contact->toNode;
-        derivedRange.fromTime = contact->fromTime;
-        derivedRange.toTime = contact->toTime;
-        derivedRange.owlt = contact->owlt;
-
-        /* IoncApplyOutcome is ordered by increasing severity: reporting the
-         * higher of the two reproduces the previous rule, when a single call
-         * wrote both. */
-        rangeOutcome = ionc_apply_range(&derivedRange, config->debugMode);
-        if (rangeOutcome > outcome) {
-            outcome = rangeOutcome;
-        }
-    }
 
     if (outcome == IONC_ERROR) {
         /* IONC_ERROR is a system error from an rfx_* call (rc < 0) or ION
@@ -3700,15 +3685,15 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         bytesWritten += writeCborEnvelope(&cursor, "c", timestamp, expireTime,
                 origin, config->nodeId, originalNonce);
 
-        // Contact data v3
+        // Contact payload (§3.3)
         bytesWritten += cbor_encode_array_open(7, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.regionNbr, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.fromNode, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.toNode, &cursor);
         bytesWritten += cbor_encode_integer((uvast) forwardContact.fromTime, &cursor);
         bytesWritten += cbor_encode_integer((uvast) forwardContact.toTime, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.xmitRate, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.confidence, &cursor);
-        bytesWritten += cbor_encode_integer(forwardContact.owlt, &cursor);
 
         bytesWritten += appendCborHmac(config, cborBuffer, bytesWritten, &cursor);
 
