@@ -707,7 +707,8 @@ IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
      * must be called with no transaction open. */
 
     /* Same structure as the contact, but rfx_revise_range does not exist
-     * (§6.3): any difference is a remove + insert. */
+     * (§6.3): any difference is a remove + insert, except over an imputed
+     * range, where rfx_insert_range performs the swap on its own. */
     if (!haveRange) {
         rc = rfx_insert_range(rec->fromTime, rec->toTime,
                 (uvast) rec->fromNode, (uvast) rec->toNode, rec->owlt,
@@ -733,49 +734,93 @@ IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
         }
     } else if (existingRange.owlt != rec->owlt
             || existingRange.toTime != rec->toTime) {
-        /* Window or owlt changed: TARGETED removal by exact fromTime, never
-         * NULL. */
-        key = rec->fromTime;
-        rc = rfx_remove_range(&key, (uvast) rec->fromNode,
-                (uvast) rec->toNode, 0);
-        if (rc < 0) {
-            dtnex_log("⚠️  Anomaly: rfx_remove_range %lu→%lu returned %d",
-                    rec->fromNode, rec->toNode, rc);
-            rangeOutcome = IONC_ERROR;
-            logApplyRangeOutcome(debugMode, rec, rangeOutcome);
-            return IONC_ERROR;
-        } else if (rc > 0) {
-            /* Without the removal, re-insertion would be refused: ION is left
-             * as it is. */
-            noteUserErrorRange(debugMode, "rfx_remove_range", rec, rc,
-                    removeUserError(rc));
-        } else {
+        if (existingRange.rangeElt == 0) {
+            /* Imputed range: ION deduced it on its own from the canonical
+             * reverse assertion (rfx.c:2478-2496), so there is no IonRange
+             * object behind it, only an index entry. rfx_insert_range replaces
+             * it by itself, in a single transaction (rfx.c:2604-2620).
+             *
+             * Removing it first would be worse than redundant. It would split
+             * the swap across two transactions, leaving the pair without a
+             * current OWLT in between, and above all it would expose the
+             * insert to the overlap scan: sm_rbt_search zeroes the successor
+             * when it finds the key (smrbt.c), so an insert over an existing
+             * key skips that scan, while an insert after a removal goes
+             * through it and can be refused with 3 or 4 — losing an entry we
+             * did not create. */
             rc = rfx_insert_range(rec->fromTime, rec->toTime,
                     (uvast) rec->fromNode, (uvast) rec->toNode, rec->owlt,
                     &rxaddr, 0);
             if (rc < 0) {
-                dtnex_log("⚠️  Anomaly: rfx_insert_range (after remove) %lu→%lu "
+                dtnex_log("⚠️  Anomaly: rfx_insert_range (over imputed) %lu→%lu "
                         "returned %d", rec->fromNode, rec->toNode, rc);
                 rangeOutcome = IONC_ERROR;
                 logApplyRangeOutcome(debugMode, rec, rangeOutcome);
                 return IONC_ERROR;
             } else if (rc == 1) {
+                /* Idempotent, as above. Codes 1 and 2 come from the asserted
+                 * branch of rfx_insert_range, which the rangeElt check has
+                 * just ruled out: reaching them means another writer asserted
+                 * this range between our lookup and this call. With code 1 the
+                 * owlt it asserted is the one we wanted anyway. */
                 rangeOutcome = IONC_NOOP;
             } else if (rc > 0) {
-                /* As for the contact: the remove succeeded, the insert did
-                 * not. The previous range is gone from ION and was not
-                 * replaced: this is always logged, not only under debug. */
-                dtnex_log("⚠️  Anomaly: rfx_insert_range (after remove) "
-                        "%lu→%lu (from %ld) refused with code %d — %s: "
-                        "the previous range was removed and not "
-                        "replaced",
-                        rec->fromNode, rec->toNode, (long) rec->fromTime, rc,
-                        insertRangeUserError(rc));
-                checkRejectAddr(debugMode, "rfx_insert_range (after remove)", rc,
-                        rxaddr, (rc == 1 || rc == 2));
-                rangeOutcome = IONC_LOST;
+                noteUserErrorRange(debugMode, "rfx_insert_range (over imputed)",
+                        rec, rc, insertRangeUserError(rc));
+                checkRejectAddr(debugMode, "rfx_insert_range (over imputed)",
+                        rc, rxaddr, (rc == 1 || rc == 2));
             } else {
+                /* Replaced, not inserted: the imputed entry is gone and an
+                 * asserted one stands in its place. */
                 rangeOutcome = IONC_REPLACED;
+            }
+        } else {
+            /* Asserted range whose window or owlt changed: TARGETED removal by
+             * exact fromTime, never NULL. */
+            key = rec->fromTime;
+            rc = rfx_remove_range(&key, (uvast) rec->fromNode,
+                    (uvast) rec->toNode, 0);
+            if (rc < 0) {
+                dtnex_log("⚠️  Anomaly: rfx_remove_range %lu→%lu returned %d",
+                        rec->fromNode, rec->toNode, rc);
+                rangeOutcome = IONC_ERROR;
+                logApplyRangeOutcome(debugMode, rec, rangeOutcome);
+                return IONC_ERROR;
+            } else if (rc > 0) {
+                /* Without the removal, re-insertion would be refused: ION is
+                 * left as it is. */
+                noteUserErrorRange(debugMode, "rfx_remove_range", rec, rc,
+                        removeUserError(rc));
+            } else {
+                rc = rfx_insert_range(rec->fromTime, rec->toTime,
+                        (uvast) rec->fromNode, (uvast) rec->toNode, rec->owlt,
+                        &rxaddr, 0);
+                if (rc < 0) {
+                    dtnex_log("⚠️  Anomaly: rfx_insert_range (after remove) "
+                            "%lu→%lu returned %d", rec->fromNode, rec->toNode,
+                            rc);
+                    rangeOutcome = IONC_ERROR;
+                    logApplyRangeOutcome(debugMode, rec, rangeOutcome);
+                    return IONC_ERROR;
+                } else if (rc == 1) {
+                    rangeOutcome = IONC_NOOP;
+                } else if (rc > 0) {
+                    /* As for the contact: the remove succeeded, the insert did
+                     * not. The previous range is gone from ION and was not
+                     * replaced: this is always logged, not only under debug. */
+                    dtnex_log("⚠️  Anomaly: rfx_insert_range (after remove) "
+                            "%lu→%lu (from %ld) refused with code %d — %s: "
+                            "the previous range was removed and not "
+                            "replaced",
+                            rec->fromNode, rec->toNode, (long) rec->fromTime,
+                            rc, insertRangeUserError(rc));
+                    checkRejectAddr(debugMode,
+                            "rfx_insert_range (after remove)", rc, rxaddr,
+                            (rc == 1 || rc == 2));
+                    rangeOutcome = IONC_LOST;
+                } else {
+                    rangeOutcome = IONC_REPLACED;
+                }
             }
         }
     }
