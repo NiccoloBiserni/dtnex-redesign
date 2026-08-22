@@ -148,6 +148,9 @@ void log_message_sent(DtnexConfig *config, unsigned long origin, unsigned long t
     if (strcmp(type, "contact") == 0) {
         printf("\033[33m[SENT] Origin:%lu, Source:%lu, Dest:%lu: Contact(%lu↔%lu)\033[0m\n", 
                origin, config->nodeId, to, nodeA, nodeB);
+    } else if (strcmp(type, "range") == 0) {
+        printf("\033[33m[SENT] Origin:%lu, Source:%lu, Dest:%lu: Range(%lu→%lu)\033[0m\n",
+               origin, config->nodeId, to, nodeA, nodeB);
     } else if (strcmp(type, "metadata") == 0) {
         printf("\033[33m[SENT] Origin:%lu, Source:%lu, Dest:%lu: Metadata(%lu:%s)\033[0m\n",
                origin, config->nodeId, to, nodeA, metadata ? metadata : "?");
@@ -163,6 +166,9 @@ void log_message_received(DtnexConfig *config, unsigned long origin, unsigned lo
     if (strcmp(type, "contact") == 0) {
         printf("\033[32m[RECV] Origin:%lu, Source:%lu, Dest:%lu: Contact(%lu↔%lu)\033[0m\n",
                origin, from, config->nodeId, nodeA, nodeB);
+    } else if (strcmp(type, "range") == 0) {
+        printf("\033[32m[RECV] Origin:%lu, Source:%lu, Dest:%lu: Range(%lu→%lu)\033[0m\n",
+               origin, from, config->nodeId, nodeA, nodeB);
     } else if (strcmp(type, "metadata") == 0) {
         printf("\033[32m[RECV] Origin:%lu, Source:%lu, Dest:%lu: Metadata(%lu:%s)\033[0m\n",
                origin, from, config->nodeId, nodeA, metadata ? metadata : "?");
@@ -177,6 +183,9 @@ void log_message_forwarded(DtnexConfig *config, unsigned long origin, unsigned l
     
     if (strcmp(type, "contact") == 0) {
         printf("\033[35m[FRWD] Origin:%lu, Source:%lu, Dest:%lu: Contact(%lu↔%lu)\033[0m\n",
+               origin, from, to, nodeA, nodeB);
+    } else if (strcmp(type, "range") == 0) {
+        printf("\033[35m[FRWD] Origin:%lu, Source:%lu, Dest:%lu: Range(%lu→%lu)\033[0m\n",
                origin, from, to, nodeA, nodeB);
     } else if (strcmp(type, "metadata") == 0) {
         printf("\033[35m[FRWD] Origin:%lu, Source:%lu, Dest:%lu: Metadata(%lu:%s)\033[0m\n",
@@ -754,6 +763,72 @@ static int refreshMyContacts(DtnexConfig *config, int *changed) {
     return myContactCount;
 }
 
+/* Snapshot of the ranges this node may announce (§4), the twin of the contact
+ * snapshot above. It deliberately reuses MY_CONTACTS_CACHE_TTL: despite the
+ * name, that constant is the wake-up step of the main loop and governs the
+ * responsiveness of trigger 3 for both snapshots alike. */
+static RangeRecord myRanges[IONC_MAX_RANGES];
+static int myRangeCount = 0;
+static time_t myRangesUpdated = 0;
+
+static int sameRangeRecord(const RangeRecord *a, const RangeRecord *b) {
+    return a->fromNode == b->fromNode
+        && a->toNode == b->toNode
+        && a->fromTime == b->fromTime
+        && a->toTime == b->toTime
+        && a->owlt == b->owlt;
+}
+
+/**
+ * Twin of refreshMyContacts, on the range index. Same TTL, same rule: writes 1
+ * into *changed if the new snapshot differs from the previous one. Returns the
+ * number of ranges in the snapshot, or -1 on an ION access error (in which
+ * case the previous snapshot stays valid).
+ *
+ * Single-threaded (§7.5): only the main loop calls this function.
+ */
+static int refreshMyRanges(DtnexConfig *config, int *changed) {
+    RangeRecord fresh[IONC_MAX_RANGES];
+    time_t now = time(NULL);
+    int freshCount;
+    int i;
+
+    *changed = 0;
+
+    if (myRangesUpdated > 0 && (now - myRangesUpdated) < MY_CONTACTS_CACHE_TTL) {
+        return myRangeCount;
+    }
+
+    freshCount = ionc_get_own_ranges(config->nodeId, fresh, IONC_MAX_RANGES,
+            config->debugMode);
+    if (freshCount < 0) {
+        debug_log(config, "⚠️ Could not re-read the announceable ranges from ION");
+        return -1;
+    }
+
+    if (freshCount != myRangeCount) {
+        *changed = 1;
+    } else {
+        for (i = 0; i < freshCount; i++) {
+            if (!sameRangeRecord(&fresh[i], &myRanges[i])) {
+                *changed = 1;
+                break;
+            }
+        }
+    }
+
+    memcpy(myRanges, fresh, sizeof(RangeRecord) * freshCount);
+    myRangeCount = freshCount;
+    myRangesUpdated = now;
+
+    if (*changed) {
+        dtnex_log("🔄 The snapshot of announceable ranges changed (%d ranges)",
+                myRangeCount);
+    }
+
+    return myRangeCount;
+}
+
 void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
     int i, j;
     time_t currentTime;
@@ -766,11 +841,15 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
     static unsigned long lastPlanList[MAX_PLANS];
     int planListChanged = 0;
     int contactsChanged = 0;
+    int rangesChanged = 0;
 
     time(&currentTime);
 
     // Trigger 3 (§7.1): refresh the snapshot and see whether it changed.
     refreshMyContacts(config, &contactsChanged);
+
+    // Trigger 3 (§7.1), range side: same mechanism as for contacts.
+    refreshMyRanges(config, &rangesChanged);
 
     // Trigger 2: the neighbour list changed
     if (planCount != lastPlanCount) {
@@ -795,13 +874,15 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
     if (!(lastExchangeTime == 0
             || (currentTime - lastExchangeTime) >= config->updateInterval
             || planListChanged
-            || contactsChanged)) {
+            || contactsChanged
+            || rangesChanged)) {
         int remainingTime = config->updateInterval - (int) (currentTime - lastExchangeTime);
         debug_log(config, "Skipping neighbor exchange (next in %d seconds)", remainingTime);
         return;
     }
 
-    dtnex_log("📤 Announcing %d contacts to %d neighbours...", myContactCount, planCount);
+    dtnex_log("📤 Announcing %d contacts and %d ranges to %d neighbours...",
+            myContactCount, myRangeCount, planCount);
 
     lastExchangeTime = currentTime;
     lastPlanCount = planCount;
@@ -838,6 +919,37 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
             sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
             log_message_sent(config, config->nodeId, neighborId, "contact",
                     contact->fromNode, contact->toNode, NULL);
+        }
+    }
+
+    // One message per announceable range, to every neighbour (§4).
+    for (i = 0; i < planCount; i++) {
+        unsigned long neighborId = plans[i].planId;
+
+        if (neighborId == config->nodeId) {
+            continue;  // local loopback plan
+        }
+
+        for (j = 0; j < myRangeCount; j++) {
+            RangeRecord *range = &myRanges[j];
+
+            messageSize = encodeCborRangeMessage(config, range, cborBuffer,
+                    MAX_CBOR_BUFFER);
+            if (messageSize <= 0) {
+                dtnex_log("❌ Failed to encode CBOR range message for %lu→%lu",
+                        range->fromNode, range->toNode);
+                continue;
+            }
+
+            snprintf(destEid, sizeof(destEid), "ipn:%lu.%s", neighborId, config->serviceNr);
+            debug_log(config, "[exchange] range %lu→%lu from=%ld to=%ld owlt=%us → %s (%d bytes)",
+                    range->fromNode, range->toNode,
+                    (long) range->fromTime, (long) range->toTime,
+                    range->owlt, destEid, messageSize);
+
+            sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
+            log_message_sent(config, config->nodeId, neighborId, "range",
+                    range->fromNode, range->toNode, NULL);
         }
     }
 
@@ -1540,6 +1652,8 @@ int initBundleReception(DtnexConfig *config, BundleReceptionState *state) {
             └── decodeCborMessage()   ← CBOR parsing + authentication
                     ├── processCborContactMessage()   ← type "c"
                     │       └── forwardCborContactMessage()
+                    ├── processCborRangeMessage()     ← type "r"
+                    │       └── forwardCborRangeMessage()
                     └── processCborMetadataMessage()  ← type "m"
                             └── forwardCborMetadataMessage()
  */
@@ -2000,6 +2114,42 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
     bytesWritten += appendCborHmac(config, buffer, bytesWritten, &cursor);
 
     debug_log(config, "[CBOR] Encoded contact message: %d bytes", bytesWritten);
+    return bytesWritten;
+}
+
+/**
+ * Encode CBOR range message
+ * Format (§3.4): [version, "r", timestamp, expireTime, origin, from, nonce,
+ *                  [fromNode, toNode, fromTime, toTime, owlt], hmac]
+ *
+ * The payload carries no regionNbr: in ION ranges are not regional entities
+ * (rfx_insert_range has no such parameter, IonRXref has no such field).
+ */
+int encodeCborRangeMessage(DtnexConfig *config, RangeRecord *range, unsigned char *buffer, int bufferSize) {
+    unsigned char *cursor = buffer;
+    unsigned char nonce[DTNEX_NONCE_SIZE];
+    int bytesWritten = 0;
+
+    (void) bufferSize;  // the payload is ~55 bytes, MAX_CBOR_BUFFER is 128
+
+    generateNonce(nonce);
+
+    // As for contacts (§7.2): the message is useful exactly as long as the
+    // range it describes is, so expireTime IS the range's toTime.
+    bytesWritten += writeCborEnvelope(&cursor, "r", time(NULL), range->toTime,
+            config->nodeId, config->nodeId, nonce);
+
+    // Range data array (§3.4): 5 fields, absolute times
+    bytesWritten += cbor_encode_array_open(5, &cursor);
+    bytesWritten += cbor_encode_integer(range->fromNode, &cursor);
+    bytesWritten += cbor_encode_integer(range->toNode, &cursor);
+    bytesWritten += cbor_encode_integer((uvast) range->fromTime, &cursor);
+    bytesWritten += cbor_encode_integer((uvast) range->toTime, &cursor);
+    bytesWritten += cbor_encode_integer(range->owlt, &cursor);
+
+    bytesWritten += appendCborHmac(config, buffer, bytesWritten, &cursor);
+
+    debug_log(config, "[CBOR] Encoded range message: %d bytes", bytesWritten);
     return bytesWritten;
 }
 
@@ -2781,6 +2931,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
 
     // Variables to store extracted contact/metadata data for later processing
     ContactRecord extractedContact = {0};
+    RangeRecord extractedRange = {0};
     StructuredMetadata extractedMetadata = {0};
     int hasExtractedData = 0;
     
@@ -2865,6 +3016,48 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
             }
         }
         debug_log(config, "✅ Successfully skipped contact elements for HMAC");
+
+    } else if (messageType[0] == 'r') {
+        // Range message (§3.4): 5 fields
+        debug_log(config, "🔍 Extracting 5 range elements manually");
+
+        if (dataArraySize != 5) {
+            debug_log(config, "❌ Range payload with %lu fields (5 expected)", dataArraySize);
+            return -1;
+        }
+
+        unsigned char *extractCursor = cursor;
+        unsigned int extractBytesBuffered = bytesBuffered;
+
+        unsigned long tFromNode, tToNode, tFromTime, tToTime, tOwlt;
+        if (manualDecodeCborInteger(&tFromNode, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tToNode, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tFromTime, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tToTime, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tOwlt, &extractCursor, &extractBytesBuffered)) {
+
+            extractedRange.fromNode = tFromNode;
+            extractedRange.toNode = tToNode;
+            extractedRange.fromTime = (time_t) tFromTime;
+            extractedRange.toTime = (time_t) tToTime;
+            extractedRange.owlt = (unsigned int) tOwlt;
+            hasExtractedData = 1;
+            debug_log(config, "✅ Extracted range: %lu→%lu from=%ld to=%ld owlt=%us",
+                      extractedRange.fromNode, extractedRange.toNode,
+                      (long) extractedRange.fromTime, (long) extractedRange.toTime,
+                      extractedRange.owlt);
+        } else {
+            debug_log(config, "❌ Failed to extract range elements");
+        }
+
+        // Now skip the elements for HMAC verification
+        for (int i = 0; i < dataArraySize && i < 5; i++) {
+            if (!skipCborElement(&cursor, &bytesBuffered)) {
+                debug_log(config, "❌ Failed to skip range element %d", i);
+                return -1;
+            }
+        }
+        debug_log(config, "✅ Successfully skipped range elements for HMAC");
 
     } else if (messageType[0] == 'm') {
         // Metadata message: extract elements and then skip them
@@ -3113,6 +3306,18 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
                   (long) extractedContact.fromTime, (long) extractedContact.toTime);
 
         return processCborContactMessage(config, nonce, timestamp, expireTime, origin, from, &extractedContact);
+    } else if (messageType[0] == 'r') {
+        // Use pre-extracted range data instead of re-decoding
+        if (!hasExtractedData) {
+            debug_log(config, "❌ No range data was extracted during parsing");
+            return -1;
+        }
+
+        debug_log(config, "🔍 Processing extracted range data: %lu→%lu (from=%ld to=%ld)",
+                  extractedRange.fromNode, extractedRange.toNode,
+                  (long) extractedRange.fromTime, (long) extractedRange.toTime);
+
+        return processCborRangeMessage(config, nonce, timestamp, expireTime, origin, from, &extractedRange);
     } else if (messageType[0] == 'm') {
         // Use pre-extracted metadata instead of re-decoding
         if (!hasExtractedData) {
@@ -3307,6 +3512,108 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
 }
 
 /**
+ * Process CBOR range message, type "r".
+ *
+ * Same structure as processCborContactMessage: checks 1-3 (version, HMAC,
+ * nonce) have already been performed in decodeCborMessage. Every failure
+ * discards the message without inserting and without forwarding, and returns
+ * 0: this is not a decoding error, it is a policy rejection, already logged
+ * here with its reason.
+ */
+int processCborRangeMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
+                            unsigned long origin, unsigned long from, RangeRecord *range) {
+    time_t currentTime = time(NULL);
+    IoncApplyOutcome outcome;
+
+    log_message_received(config, origin, from, "range",
+            range->fromNode, range->toNode, NULL);
+
+    // 4. We do not process our own messages
+    if (origin == config->nodeId) {
+        debug_log(config, "⏭️ Skipping own range message");
+        return 0;
+    }
+
+    // 5. Only the source announces its own direction (§4)
+    if (range->fromNode != origin) {
+        debug_log(config, "❌ Discarded: fromNode=%lu != origin=%lu",
+                range->fromNode, origin);
+        return 0;
+    }
+
+    // 5b. A range towards oneself is not topology
+    if (range->fromNode == range->toNode) {
+        debug_log(config, "❌ Discarded: fromNode == toNode (%lu)", range->fromNode);
+        return 0;
+    }
+
+    // 6. toTime = 0 in ION means "permanent"
+    if (range->toTime == 0) {
+        debug_log(config, "❌ Discarded: toTime = 0 (permanent-range semantics)");
+        return 0;
+    }
+
+    // 7. Window integrity
+    if (range->fromTime >= range->toTime) {
+        debug_log(config, "❌ Discarded: fromTime=%ld >= toTime=%ld",
+                (long) range->fromTime, (long) range->toTime);
+        return 0;
+    }
+
+    // 7b. fromTime <= 0 carries ION's hypothetical-entity semantics
+    if (range->fromTime <= 0) {
+        debug_log(config, "❌ Discarded: invalid fromTime (%ld)", (long) range->fromTime);
+        return 0;
+    }
+
+    // 7c. fromTime == MAX_POSIX_TIME is the registration semantics
+    if (range->fromTime >= MAX_POSIX_TIME) {
+        debug_log(config, "❌ Discarded: fromTime = MAX_POSIX_TIME");
+        return 0;
+    }
+
+    // 8. Window already expired
+    if (range->toTime <= currentTime) {
+        debug_log(config, "❌ Discarded: window entirely in the past "
+                "(toTime=%ld, now=%ld) — possible clock skew between nodes",
+                (long) range->toTime, (long) currentTime);
+        return 0;
+    }
+
+    // 8b. Window too far in the future: suspected clock skew (§7.6)
+    if (range->fromTime > currentTime + CLOCK_SKEW_FUTURE_LIMIT) {
+        debug_log(config, "❌ Discarded: window too far in the future "
+                "(fromTime=%ld, now=%ld) — possible clock skew between nodes",
+                (long) range->fromTime, (long) currentTime);
+        return 0;
+    }
+
+    /* No check on the owlt: 0 is a legitimate value. On a LAN it is the
+     * physically correct one, and ION accepts "a range ... 0". */
+
+    outcome = ionc_apply_range(range, config->debugMode);
+    if (outcome == IONC_ERROR) {
+        dtnex_log("❌ Failed to apply range %lu→%lu to ION",
+                range->fromNode, range->toNode);
+    } else if (outcome == IONC_LOST) {
+        /* Do not say WHO removed it: since 2c98253, IONC_LOST arrives both
+         * from our own remove followed by a refused insert, and from the
+         * imputed path, where it is ION that drops the entry before refusing. */
+        dtnex_log("⚠️  Range %lu→%lu lost in ION: the previous entry is gone "
+                "and the insert that should have replaced it was refused",
+                range->fromNode, range->toNode);
+    } else if (outcome != IONC_NOOP) {
+        dtnex_log("✅ Range %lu→%lu %s in ION",
+                range->fromNode, range->toNode, ionc_outcome_name(outcome));
+    }
+
+    // Forwarding does not depend on the outcome of the local write (§6.5)
+    forwardCborRangeMessage(config, nonce, timestamp, expireTime, origin, from, range);
+
+    return 0;
+}
+
+/**
  * Process CBOR metadata message
  */
 int processCborMetadataMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
@@ -3411,6 +3718,55 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
 
         log_message_forwarded(config, origin, from, neighborId, "contact",
                              contact->fromNode, contact->toNode, NULL);
+    }
+}
+
+/**
+ * Forward CBOR range message to all neighbors (except origin and sender)
+ */
+void forwardCborRangeMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp,
+                             time_t expireTime, unsigned long origin, unsigned long from, RangeRecord *range) {
+    Plan plans[MAX_PLANS];
+    int planCount = 0;
+    char destEid[MAX_EID_LENGTH];
+    unsigned char cborBuffer[MAX_CBOR_BUFFER];
+
+    getplanlist(config, plans, &planCount);
+
+    if (planCount <= 0) {
+        debug_log(config, "⏭️ No neighbors to forward range message to");
+        return;
+    }
+
+    for (int i = 0; i < planCount; i++) {
+        unsigned long neighborId = plans[i].planId;
+
+        if (neighborId == origin || neighborId == from || neighborId == config->nodeId) {
+            continue;
+        }
+
+        unsigned char *cursor = cborBuffer;
+        int bytesWritten = 0;
+
+        // Nonce, timestamp, expireTime and origin stay the original ones:
+        // only "from" changes, and becomes this node.
+        bytesWritten += writeCborEnvelope(&cursor, "r", timestamp, expireTime,
+                origin, config->nodeId, originalNonce);
+
+        bytesWritten += cbor_encode_array_open(5, &cursor);
+        bytesWritten += cbor_encode_integer(range->fromNode, &cursor);
+        bytesWritten += cbor_encode_integer(range->toNode, &cursor);
+        bytesWritten += cbor_encode_integer((uvast) range->fromTime, &cursor);
+        bytesWritten += cbor_encode_integer((uvast) range->toTime, &cursor);
+        bytesWritten += cbor_encode_integer(range->owlt, &cursor);
+
+        bytesWritten += appendCborHmac(config, cborBuffer, bytesWritten, &cursor);
+
+        snprintf(destEid, sizeof(destEid), "ipn:%lu.%s", neighborId, config->serviceNr);
+        sendCborBundle(destEid, cborBuffer, bytesWritten, config->bundleTTL);
+
+        log_message_forwarded(config, origin, from, neighborId, "range",
+                              range->fromNode, range->toNode, NULL);
     }
 }
 
