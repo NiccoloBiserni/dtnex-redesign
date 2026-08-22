@@ -3472,7 +3472,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
          * this point. The message stays valid regardless and must be forwarded
          * (§6.5), otherwise a purely local problem would partition the
          * flooding. */
-        dtnex_log("❌ Failed to apply %lu→%lu to ION",
+        dtnex_log("❌ Failed to apply contact %lu→%lu to ION",
                 contact->fromNode, contact->toNode);
     } else if (outcome == IONC_LOST) {
         /* The previous entry was removed from ION but the insert meant to

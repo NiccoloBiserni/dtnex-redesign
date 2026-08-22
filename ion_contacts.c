@@ -328,7 +328,7 @@ static const char *insertContactUserError(int rc)
     case 4: return "confidence out of range, refused by ION";
     case 5: return "zero xmitRate refused by ION";
     case 6: return "toTime earlier than fromTime";
-    case 7: return "region mismatch: dtnex is single-region (region 1)";
+    case 7: return "contact is for a foreign region: not one of this node's own regions";
     case 8: return "the corresponding hypothetical contact is already discovered";
     case 9: return "overlaps a locally configured contact; "
                    "the local one is kept";

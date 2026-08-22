@@ -61,7 +61,7 @@ typedef struct {
 /**
  * Reads from ION the contacts the local node is allowed to announce.
  *
- * Filters applied (§3.2, §3.4):
+ * Filters applied (§3.2):
  *   - fromNode == myNodeId          (authority rule, §4)
  *   - toNode != fromNode            (excludes registration contacts)
  *   - type in {CtScheduled, CtPredicted}
