@@ -323,8 +323,8 @@ int ionc_get_own_ranges(unsigned long myNodeId, RangeRecord *out,
 
         /* Authority rule (§4): we announce our own direction only. Each
          * endpoint announces the ranges it asserted, and the receiver's ION
-         * imputes the reverse by itself, so the network stays consistent
-         * with no special cases. */
+         * imputes the reverse by itself; the network stays consistent thanks
+         * to the asserted-only filter below, not in spite of it. */
         if ((unsigned long) range->fromNode != myNodeId) {
             continue;
         }
@@ -337,12 +337,13 @@ int ionc_get_own_ranges(unsigned long myNodeId, RangeRecord *out,
          * automatically creates the reverse one with rangeElt == 0, which its
          * own source comments as "imputed" (rfx.c:2490) and deleteRange uses
          * to tell the two apart (rfx.c:2765). A range we LEARNED from the
-         * network gets such a reverse, whose fromNode is the local node: with
-         * no filter we would re-announce something ION merely inferred as if
-         * we were its authoritative source. Worse, for the receiver that
+         * network gets such a reverse too, and when the learnt range ends at
+         * the local node that reverse has fromNode == the local node: with no
+         * filter we would re-announce something ION merely inferred as if we
+         * were its authoritative source. Worse, for the receiver that
          * record has fromNode > toNode, which ION reads as a non-canonical
          * assertion, i.e. an explicit override of OWLT symmetry
-         * (rfx.c:2444-2456): inserting it deletes the imputed range and
+         * (rfx.c:2449-2457): inserting it deletes the imputed range and
          * replaces it with an asserted one (rfx.c:2607), which removing the
          * canonical range later does not clean up. Same principle as
          * ionc_get_own_contacts keeping only CtScheduled/CtPredicted: we
@@ -664,27 +665,43 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode)
 }
 
 /**
+ * What the insertion is going over. It is not decoration: it decides how a
+ * refusal has to be read, that is whether ION is left as it was or short of
+ * something it used to hold.
+ *
+ * INSERT_OVER_IMPUTED is the delicate one. rfx_insert_range deletes the
+ * imputed entry and then carries on into the overlap scan (rfx.c:2655), so a
+ * refusal raised there arrives *after* the deletion.
+ */
+typedef enum {
+    INSERT_OVER_NOTHING = 0,    /* no previous entry: a refusal changes nothing */
+    INSERT_OVER_IMPUTED,        /* ION drops the imputed entry, then may still
+                                 * refuse */
+    INSERT_AFTER_REMOVE         /* we removed the previous entry ourselves */
+} InsertRangeSite;
+
+/**
  * The rfx_insert_range call and the reading of its return code, shared by the
  * three sites that perform it.
  *
  * `okOutcome` is what to report on success: inserting over nothing is an
  * insertion, inserting over an entry that was already there is a replacement.
  *
- * `afterRemove` marks the one site where the previous range has already been
- * removed, so that a refusal leaves ION with neither the old entry nor the new
- * one. There the refusal is IONC_LOST and is logged unconditionally, not only
- * under debug, because ION has lost something it used to hold. Everywhere else
- * a refusal leaves ION exactly as it was: nothing was written, so the outcome
- * is a no-op and the note belongs to the debug log.
+ * `site` says whether a refusal leaves ION short of an entry it held. Where it
+ * does, the outcome is IONC_LOST and the refusal is logged unconditionally,
+ * not only under debug, because ION has lost something. Where it does not,
+ * nothing was written, so the outcome is a no-op and the note belongs to the
+ * debug log.
  *
  * Returns the outcome reached, IONC_ERROR included: the caller records it and
  * stops, the log line having already been written here.
  */
 static IoncApplyOutcome insertRange(const RangeRecord *rec, const char *op,
-        IoncApplyOutcome okOutcome, int afterRemove, int debugMode)
+        IoncApplyOutcome okOutcome, InsertRangeSite site, int debugMode)
 {
     PsmAddress  rxaddr = 0;
     int         rc;
+    int         lost;
 
     rc = rfx_insert_range(rec->fromTime, rec->toTime, (uvast) rec->fromNode,
             (uvast) rec->toNode, rec->owlt, &rxaddr, 0);
@@ -704,7 +721,15 @@ static IoncApplyOutcome insertRange(const RangeRecord *rec, const char *op,
         return IONC_NOOP;
     }
 
-    if (afterRemove) {
+    /* Code 2 leaves ION untouched: like code 1 it is raised by the asserted
+     * branch (rfx.c:2637-2651), which returns before touching anything. From
+     * code 3 up the refusal comes from the overlap scan instead, and that is
+     * the one the imputed branch reaches only after having deleted the
+     * entry. */
+    lost = (site == INSERT_AFTER_REMOVE)
+            || (site == INSERT_OVER_IMPUTED && rc >= 3);
+
+    if (lost) {
         dtnex_log("⚠️  Anomaly: %s %lu→%lu (from %ld) refused with code %d — "
                 "%s: the previous range was removed and not replaced",
                 op, rec->fromNode, rec->toNode, (long) rec->fromTime, rc,
@@ -715,7 +740,7 @@ static IoncApplyOutcome insertRange(const RangeRecord *rec, const char *op,
 
     checkRejectAddr(debugMode, op, rc, rxaddr, (rc == 1 || rc == 2));
 
-    return afterRemove ? IONC_LOST : IONC_NOOP;
+    return lost ? IONC_LOST : IONC_NOOP;
 }
 
 IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
@@ -764,8 +789,8 @@ IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
      * (§6.3): any difference is a remove + insert, except over an imputed
      * range, where rfx_insert_range performs the swap on its own. */
     if (!haveRange) {
-        rangeOutcome = insertRange(rec, "rfx_insert_range", IONC_INSERTED, 0,
-                debugMode);
+        rangeOutcome = insertRange(rec, "rfx_insert_range", IONC_INSERTED,
+                INSERT_OVER_NOTHING, debugMode);
     } else if (existingRange.owlt != rec->owlt
             || existingRange.toTime != rec->toTime) {
         if (existingRange.rangeElt == 0) {
@@ -776,19 +801,21 @@ IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
              *
              * Removing it first would be worse than redundant. It would split
              * the swap across two transactions, leaving the pair without a
-             * current OWLT in between, and above all it would expose the
-             * insert to the overlap scan: sm_rbt_search zeroes the successor
-             * when it finds the key (smrbt.c), so an insert over an existing
-             * key skips that scan, while an insert after a removal goes
-             * through it and can be refused with 3 or 4 — losing an entry we
-             * did not create.
+             * current OWLT in between, and it would widen the exposure to the
+             * overlap scan: sm_rbt_search zeroes the successor when it finds
+             * the key (smrbt.c), so over an existing key the code-3 check is
+             * skipped, while an insert after a removal goes through it in
+             * full. Code 4 stays reachable either way — with no successor the
+             * scan falls back on sm_rbt_last over the whole index
+             * (rfx.c:2671-2674) — and ION raises it after having deleted the
+             * imputed entry, which is why this site reports IONC_LOST there.
              *
              * Codes 1 and 2 come from the asserted branch of rfx_insert_range,
              * which the rangeElt check has just ruled out: seeing them here
              * means another writer asserted this range between our lookup and
              * the call. */
             rangeOutcome = insertRange(rec, "rfx_insert_range (over imputed)",
-                    IONC_REPLACED, 0, debugMode);
+                    IONC_REPLACED, INSERT_OVER_IMPUTED, debugMode);
         } else {
             /* Asserted range whose window or owlt changed: TARGETED removal by
              * exact fromTime, never NULL. */
@@ -806,8 +833,8 @@ IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
                         removeUserError(rc));
             } else {
                 rangeOutcome = insertRange(rec,
-                        "rfx_insert_range (after remove)", IONC_REPLACED, 1,
-                        debugMode);
+                        "rfx_insert_range (after remove)", IONC_REPLACED,
+                        INSERT_AFTER_REMOVE, debugMode);
             }
         }
     }

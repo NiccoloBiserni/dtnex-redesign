@@ -227,10 +227,17 @@ them, so a change means targeted removal followed by insertion — with one exce
 ION holds two kinds of range: *asserted* ones, which somebody declared and which are
 backed by a stored assertion object, and *imputed* ones, which ION derived by itself
 from the canonical assertion in the opposite direction and which exist only as an index
-entry. Over an imputed range there is nothing to remove, and the insertion performs the
-substitution on its own within a single transaction; removing it first would split that
-substitution in two, leaving the pair without a current OWLT in between, and would
-expose the insertion to an overlap check that ION skips when the key is already present.
+entry. Over an imputed range there is no assertion object to remove, and the insertion
+performs the substitution on its own within a single transaction; removing it first would
+split that substitution in two, leaving the pair without a current OWLT in between, and
+would widen the exposure to the overlap check — over a key that is already present ION
+skips the part of that check which looks at the successor, but not the whole of it.
+
+That residue matters: over an imputed range ION deletes the index entry *before* it
+reaches the overlap check, so a refusal there leaves the pair with neither the derived
+entry nor the new one. That outcome is reported as a loss and logged unconditionally,
+not as a no-op.
+
 An imputed range that a message merely confirms is left untouched: what ION deduced by
 itself is not promoted into an assertion of ours.
 

@@ -83,7 +83,8 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
  *   - fromNode == myNodeId          (authority rule, §4)
  *   - toNode != fromNode
  *   - rangeElt != 0                 (asserted ranges only, never the reverse
- *                                    ones ION imputes: see ionc_get_own_ranges)
+ *                                    ones ION imputes; the why is in the
+ *                                    comment on that filter in the .c)
  *   - toTime > now                  (expired ranges are not announced)
  *
  * Returns the number of records written to out, or -1 if ION is not
@@ -104,10 +105,11 @@ typedef enum {
     IONC_REVISED,       /* xmitRate/confidence updated in place */
     IONC_INSERTED,      /* the entry was new: it was inserted */
     IONC_REPLACED,      /* window changed: targeted remove + insert */
-    IONC_LOST,          /* the remove succeeded but the following insert was
-                          * rejected by ION: the old entry is gone and was not
-                          * replaced, so the topology held by ION is worse than
-                          * it was before the call */
+    IONC_LOST,          /* the previous entry is gone and was not replaced,
+                          * so the topology held by ION is worse than it was
+                          * before the call. Either the remove succeeded and
+                          * the insert that followed was rejected, or ION
+                          * itself dropped the entry before refusing */
     IONC_ERROR          /* an rfx_* call failed: unexpected ION state */
 } IoncApplyOutcome;
 
@@ -129,7 +131,10 @@ IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode);
  * Applies the received range to ION, keyed by (fromNode, toNode, fromTime).
  *
  * Idempotent like ionc_apply_contact. rfx_revise_range does not exist, so any
- * difference in owlt or in the window means remove + insert.
+ * difference in owlt or in the window means remove + insert — except over a
+ * range ION imputed by itself (rangeElt == 0), where rfx_insert_range performs
+ * the substitution on its own and removing first is harmful, not merely
+ * redundant. Do not turn that exception back into a remove + insert.
  *
  * Removals ALWAYS pass a pointer to the exact fromTime, never NULL: with
  * NULL, ION applies the '*' scope and deletes every range between the pair,
