@@ -679,6 +679,146 @@ static IoncApplyOutcome insertRange(const RangeRecord *rec, const char *op,
     return lost ? IONC_LOST : IONC_NOOP;
 }
 
+/* Maximum number of entries per class that a single pruning pass records.
+ * A pair holds one imputed entry per canonical range asserted on the other
+ * side: a handful overlapping at once is already an anomaly, and stopping
+ * here costs at most a redundant entry left behind. */
+#define IONC_MAX_PRUNE_SCAN 16
+
+typedef struct {
+    time_t  fromTime;
+    time_t  toTime;
+} RangeWindow;
+
+/**
+ * Removes the imputed ranges of the pair (fromNode, toNode) that an asserted
+ * range of the same pair overlaps.
+ *
+ * ION creates the reverse of every canonical assertion (fromNode < toNode) as
+ * an imputed entry, and that creation does not go through the overlap scan
+ * that refuses an explicit insertion with code 3 or 4. So an imputed entry
+ * settles next to an asserted one already covering the same window: two
+ * entries for the same pair valid at the same instant, and were their owlt
+ * ever to disagree, which one prevails would be decided by ION's timeline
+ * events rather than by us.
+ *
+ * The invariant restored here: no imputed range survives where an asserted
+ * range of the same pair overlaps it. An imputed entry that no assertion
+ * covers is the only source of OWLT for its direction, and is left alone.
+ *
+ * Two consequences, accepted knowingly:
+ *   - the head and the tail of the window that only the imputed entry covered
+ *     are given up; they are bounded by the offset between the two assertions;
+ *   - should the operator later remove the asserted range, the pair is left
+ *     with no reverse at all: ION does not impute again after the fact.
+ */
+static void pruneRedundantImputed(unsigned long fromNode, unsigned long toNode,
+        int debugMode)
+{
+    Sdr           sdr;
+    IonVdb       *ionvdb;
+    PsmPartition  ionwm;
+    PsmAddress    elt;
+    PsmAddress    addr;
+    IonRXref     *range;
+    RangeWindow   asserted[IONC_MAX_PRUNE_SCAN];
+    RangeWindow   imputed[IONC_MAX_PRUNE_SCAN];
+    int           nAsserted = 0;
+    int           nImputed = 0;
+    int           i;
+    int           j;
+    time_t        key;
+    int           rc;
+
+    sdr = getIonsdr();
+    if (sdr == NULL) {
+        return;
+    }
+
+    /* Phase 1: reading, inside a transaction. */
+    /* sdr_begin_xn returns 1 on success and 0 on failure: a comparison
+     * against < 0 would never fire. */
+    if (sdr_begin_xn(sdr) != 1) {
+        return;
+    }
+
+    ionvdb = getIonVdb();
+    ionwm = getIonwm();
+    if (ionvdb == NULL || ionwm == NULL || ionvdb->rangeIndex == 0) {
+        sdr_exit_xn(sdr);
+        return;
+    }
+
+    for (elt = sm_rbt_first(ionwm, ionvdb->rangeIndex); elt;
+            elt = sm_rbt_next(ionwm, elt)) {
+        addr = sm_rbt_data(ionwm, elt);
+        if (addr == 0) {
+            continue;
+        }
+
+        range = (IonRXref *) psp(ionwm, addr);
+        if (range == NULL) {
+            continue;
+        }
+
+        if ((unsigned long) range->fromNode != fromNode
+                || (unsigned long) range->toNode != toNode) {
+            continue;
+        }
+
+        if (range->rangeElt != 0) {
+            if (nAsserted < IONC_MAX_PRUNE_SCAN) {
+                asserted[nAsserted].fromTime = range->fromTime;
+                asserted[nAsserted].toTime = range->toTime;
+                nAsserted++;
+            }
+        } else {
+            if (nImputed < IONC_MAX_PRUNE_SCAN) {
+                imputed[nImputed].fromTime = range->fromTime;
+                imputed[nImputed].toTime = range->toTime;
+                nImputed++;
+            }
+        }
+    }
+
+    sdr_exit_xn(sdr);
+
+    /* Phase 2: removals. The rfx_* calls open their own transaction, so they
+     * must be called with no transaction open. */
+    for (i = 0; i < nImputed; i++) {
+        for (j = 0; j < nAsserted; j++) {
+            /* Two windows overlap when neither starts after the other ends. */
+            if (asserted[j].fromTime > imputed[i].toTime
+                    || imputed[i].fromTime > asserted[j].toTime) {
+                continue;
+            }
+
+            /* TARGETED removal by exact fromTime, never NULL: NULL is the '*'
+             * scope of ionadmin and would take the whole pair with it, the
+             * entries configured by the operator included. */
+            key = imputed[i].fromTime;
+            rc = rfx_remove_range(&key, (uvast) fromNode, (uvast) toNode, 0);
+            if (rc < 0) {
+                dtnex_log("⚠️  Anomaly: rfx_remove_range %lu→%lu returned %d",
+                        fromNode, toNode, rc);
+            } else if (rc > 0) {
+                if (debugMode) {
+                    dtnex_log("[ion] rfx_remove_range %lu→%lu (from %ld): ION "
+                            "refused with code %d — %s", fromNode, toNode,
+                            (long) imputed[i].fromTime, rc,
+                            removeUserError(rc));
+                }
+            } else {
+                dtnex_log("🧹 Imputed range %lu→%lu (from %ld) removed: an "
+                        "asserted range of the same pair already covers it",
+                        fromNode, toNode, (long) imputed[i].fromTime);
+            }
+
+            break;
+        }
+    }
+}
+
 IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
 {
     Sdr              sdr;
@@ -773,6 +913,16 @@ IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode)
                         INSERT_AFTER_REMOVE, debugMode);
             }
         }
+    }
+
+    /* Phase 3: an insertion of ours may have left ION with an imputed range
+     * next to an asserted one covering the same window. Both directions are
+     * examined: a canonical insertion creates the imputed entry on the
+     * reverse pair, while the entry just asserted may in turn make redundant
+     * an imputed entry that a previous insertion had left on this pair. */
+    if (rangeOutcome == IONC_INSERTED || rangeOutcome == IONC_REPLACED) {
+        pruneRedundantImputed(rec->fromNode, rec->toNode, debugMode);
+        pruneRedundantImputed(rec->toNode, rec->fromNode, debugMode);
     }
 
     logApplyRangeOutcome(debugMode, rec, rangeOutcome);
