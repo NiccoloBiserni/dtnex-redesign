@@ -370,6 +370,61 @@ not as a no-op.
 An imputed range that a message merely confirms is left untouched: what ION deduced by
 itself is not promoted into an assertion of ours.
 
+#### Pruning the redundant imputed entries
+
+ION creates the reverse of every canonical assertion (*fromNode < toNode*) as an imputed
+entry, and that creation does not go through the overlap check that would refuse an
+explicit insertion with code 3 or 4. The asymmetry runs one way only: an imputed
+entry escapes the check when ION creates it, but is perfectly visible to the check that
+validates a later explicit insertion. Observed on the testbed: a `2→1` announced by node
+2 was refused with code 4 against the `2→1` ION had imputed moments earlier from node 1's
+`1→2`. An imputed entry can therefore settle next to an
+asserted one that already covers the same window — two entries for the same pair valid at
+the same instant. As long as the two OWLTs agree nothing is visibly wrong; were they to
+diverge, which one prevails would be decided by ION's timeline events rather than by us.
+
+The situation arises whenever a node holds a one-directional local assertion. A node that
+declares `3 2` in its `ionrc` asserts the non-canonical direction, for which ION imputes
+nothing, so it depends on the network for the opposite direction; applying the `2 3`
+announced by the peer makes ION impute a second `3→2` alongside the operator's own.
+Dropping that insertion is no answer: it is the only source of the inbound OWLT.
+
+So after every successful insertion `ionc_apply_range` restores an invariant:
+
+> no imputed range survives where an asserted range of the same pair overlaps it.
+
+Same pair means the same *fromNode* **and** the same *toNode*: `3→2` and `2→3` are
+distinct pairs, never compared against each other. Both are examined after an insertion,
+because a canonical insertion creates the imputed entry on the reverse pair while the
+entry just asserted may make redundant an imputed entry a previous insertion had left on
+the direct one — checking both makes the result independent of the order in which
+messages arrive. An imputed entry that no assertion covers is the only source of OWLT for
+its direction and is left alone.
+
+Removing an imputed entry leaves the canonical range that generated it intact, and that
+range can still be removed afterwards with no reverse entry left to accompany it.
+
+That same asymmetry means the invariant is reached by two different routes depending on
+the order in which messages arrive, and the pruning only handles one of them. If the
+canonical assertion arrives first, ION imputes the reverse and then refuses the peer's
+own assertion of that reverse as an overlap: one entry, the imputed one, and no pruning
+is needed. If the assertion arrives first, it is stored and the imputed entry lands
+beside it unchecked: one entry again, the asserted one, but only because the pruning
+removes the other. Either way the pair ends up with a single entry carrying the same
+OWLT; which of the two survives depends on the order, and nothing downstream depends on
+that.
+
+The first route leaves the pair covered by a derived entry alone, which lives and dies
+with the canonical range behind it. Should that range go, the peer's next periodic
+re-announcement finds nothing overlapping and is finally accepted, so the coverage
+returns on its own.
+
+Two costs are accepted knowingly. The head and the tail of the window that only the
+imputed entry covered are given up — bounded by the offset between the two assertions,
+which is the difference between the two nodes' start times. And should the operator later
+remove the asserted range, the pair is left with no reverse at all, because ION does not
+impute again after the fact.
+
 **The removal is always issued with the exact start time of the entry being replaced.**
 This one detail is what closes problem 1.3: with a null timestamp ION applies the `*`
 scope and deletes every contact between the pair, operator-configured entries included;
