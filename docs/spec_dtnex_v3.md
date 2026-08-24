@@ -156,15 +156,11 @@ symmetry does **not** hold, so the reverse must not be derived from it. Applying
 record therefore does not add a duplicate: ION deletes the imputed entry it had derived
 and replaces it with an asserted one.
 
-The receiver does not always get that far, and the difference matters. If the imputed
-entry it already holds carries the same OWLT and the same end time as the announcement —
-which is the case when both copies descend from the same canonical assertion — nothing is
-written at all and the message is an idempotent no-op (§5.3). But any divergence is
-enough for the insertion to happen for real: the reverse arriving before the canonical
-assertion it derives from, so that the receiver has nothing to compare against; an OWLT
-the receiver's own operator configured for that pair; or the first revision of the
-window, when the reverse announcement precedes the updated canonical one. From that
-moment the record is asserted, and stays so.
+The receiver does not always get to make this substitution, and the difference matters.
+The comparison is always the same: if the imputed entry it already holds carries the same OWLT and
+the same end time as the incoming announcement, as happens when both copies derive from the same canonical assertion, 
+nothing is written: it's an idempotent no-op (§5.3). If instead the values diverge, for whatever reason, the 
+write happens for real and the record moves from imputed to asserted — and stays that way from that point on.
 
 **Why the damage does not heal.** When a canonical range is removed, ION cleans up the
 reverse it had derived from it — but it calls `deleteRange(rxaddr, 1)`, that is
@@ -238,15 +234,6 @@ Five fields:
 | `toTime` | integer | absolute epoch |
 | `owlt` | integer | one-way light time, in seconds |
 
-**The range carries no region, and that is not an oversight.** In ION ranges are not
-regional entities: `rfx_insert_range()` and `rfx_remove_range()` have no region
-parameter, and `IonRXref` has no such field. Adding a region to the `"r"` message would
-invent a scope ION does not have and that no call could use. The asymmetry between the
-two payloads is ION's, not ours.
-
-The identity key follows from the same fact: a contact is keyed by
-*(region, fromNode, toNode, fromTime)*, a range by *(fromNode, toNode, fromTime)*.
-
 ### 4.4 Encoding decisions
 
 **Absolute times rather than durations.** This is the decision that structurally solves
@@ -271,17 +258,13 @@ The decision about a region is ION's, not DTNEX's — which is what makes this
 pass-through, not multi-region support (§7).
 
 **The range travels in its own message**, not inside the contact. Contact and range are
-distinct entities in ION, with distinct keys, distinct API calls and — as above —
-different notions of scope, and carrying the OWLT inside the contact forced every range
-to borrow the contact's window and to be written as a side effect of applying that
-contact.
+distinct entities in ION and carrying the OWLT inside the contact forced every range
+to use the contact's window, even if not the same of the true range, and to be written as 
+a side effect of applying that contact.
 
 The price is that the two can now arrive halved: a contact whose range has not arrived
 yet, which CGR will not use until it does, or a range with no contact. Both are
-transient, and both are repaired by the next announcement. In exchange, one rule from the
-first version 3 disappears: a contact for which no range existed locally used to be
-skipped and never announced at all. It is now announced regardless, and the range arrives
-— or does not — on its own path.
+transient, and both are repaired by the next announcement.
 
 ### 4.5 Size
 
@@ -311,14 +294,13 @@ Every received message is validated before ION is touched at all, and any failur
 the message is discarded without being inserted and without being forwarded. The checks
 cover, in order: protocol version, HMAC, nonce, the origin not being the local node,
 the announced direction genuinely belonging to the announcing node, a `fromNode`
-different from the `toNode` — a contact from a node to itself is a registration, not
-topology — and a window whose start precedes its end.
+different from the `toNode` since that is a registration contact not topology, 
+and a window whose start precedes its end.
 
 The remaining checks reject windows that ION would interpret as something other than a
-scheduled contact — a zero end time means a discovered, effectively permanent contact; a
-zero start time means a hypothetical one; a start time at the maximum representable
-value has yet another meaning — as well as values ION would refuse outright, such as a
-zero transmission rate or a confidence above 100.
+scheduled contact: a zero end time means a discovered contact; a zero start time means
+a hypothetical one; as well as values ION would refuse outright, such as a zero transmission
+rate or a confidence above 100.
 
 Two temporal checks close the set: an already-expired window is pointless to insert and
 flood, and a window starting more than thirty days in the future is treated as
@@ -331,12 +313,10 @@ mean something for a range. There are nine: the origin is not the local node; `f
 equals the origin, which is the authority rule; `fromNode` and `toNode` differ; the end
 time is not zero; the window is ordered; the start time is greater than zero; the start
 time is below the maximum representable value; the window has not already expired; and
-the start time is no more than thirty days in the future. The checks on transmission rate
-and confidence have no counterpart here — a range carries neither.
+the start time is no more than thirty days in the future.
 
 An OWLT of zero is **not** rejected. It is the physically correct value on a LAN and ION
-accepts `a range ... 0`; a check rejecting it had already caused every receiver on a
-local testbed to discard everything it was sent.
+accepts `a range ... 0`.
 
 ### 5.3 Idempotent writing
 
@@ -351,37 +331,34 @@ validated message, the write follows from comparing it against what ION already 
 | it exists, the end time differs | targeted removal, then insert |
 | it does not exist but the window overlaps a local contact | ION refuses, the local entry is kept, logged at debug level — this is not a failure |
 
-Ranges are applied by a call of their own, on their own key
-*(fromNode, toNode, fromTime)*, and follow the same structure — except that ION exposes
-no in-place revision for them, so any change means targeted removal followed by
-insertion, with one exception. The exception concerns the *imputed* ranges of §3.3, the
-ones ION derived by itself from the canonical assertion in the opposite direction: over
-an imputed range there is no assertion object to remove, and the insertion
-performs the substitution on its own within a single transaction; removing it first would
-split that substitution in two, leaving the pair without a current OWLT in between, and
-would widen the exposure to the overlap check — over a key that is already present ION
-skips the part of that check which looks at the successor, but not the whole of it.
+Ranges apply on the key *(fromNode, toNode, fromTime)*. On receiving a range, the cases
+are:
 
-That residue matters: over an imputed range ION deletes the index entry *before* it
-reaches the overlap check, so a refusal there leaves the pair with neither the derived
-entry nor the new one. That outcome is reported as a loss and logged unconditionally,
-not as a no-op.
+- **New key** → normal insertion.
+- **Key already present, as asserted** → ION offers no in-place revision: targeted
+  removal followed by insertion.
+- **Key already present, as imputed, identical values** (same OWLT, same toTime) →
+  no-op: stays imputed, not promoted.
+- **Key already present, as imputed, different values** → a single insertion
+  substitutes the imputed entry and promotes it to asserted, atomically. There is no
+  separate removal first: that would split the operation into two steps, leaving the
+  pair with no valid OWLT in between, and would force ION to run the full overlap
+  check. On a key that's already present, ION instead runs only the
+  predecessor-facing part of that check (it skips the successor-facing part).
 
-An imputed range that a message merely confirms is left untouched: what ION deduced by
-itself is not promoted into an assertion of ours.
+**Risk in this last case:** ION deletes the imputed entry from the index *before*
+running that remaining check. If the check then rejects the insertion, the pair is
+left with no entry at all — neither the old one nor the new one. That's a genuine
+loss, not a no-op, and it must always be reported and logged.
 
 #### Pruning the redundant imputed entries
 
 ION creates the reverse of every canonical assertion (*fromNode < toNode*) as an imputed
 entry, and that creation does not go through the overlap check that would refuse an
-explicit insertion with code 3 or 4. The asymmetry runs one way only: an imputed
-entry escapes the check when ION creates it, but is perfectly visible to the check that
-validates a later explicit insertion. Observed on the testbed: a `2→1` announced by node
-2 was refused with code 4 against the `2→1` ION had imputed moments earlier from node 1's
-`1→2`. An imputed entry can therefore settle next to an
-asserted one that already covers the same window — two entries for the same pair valid at
-the same instant. As long as the two OWLTs agree nothing is visibly wrong; were they to
-diverge, which one prevails would be decided by ION's timeline events rather than by us.
+explicit insertion. An imputed entry can therefore settle next to an asserted one that
+already covers the same window — two entries for the same pair valid at the same instant.
+As long as the two OWLTs agree nothing is visibly wrong; were they to diverge, which one
+prevails would be decided by ION's timeline events rather than by us.
 
 The situation arises whenever a node holds a one-directional local assertion. A node that
 declares `3 2` in its `ionrc` asserts the non-canonical direction, for which ION imputes
@@ -394,36 +371,12 @@ So after every successful insertion `ionc_apply_range` restores an invariant:
 > no imputed range survives where an asserted range of the same pair overlaps it.
 
 Same pair means the same *fromNode* **and** the same *toNode*: `3→2` and `2→3` are
-distinct pairs, never compared against each other. Both are examined after an insertion,
-because a canonical insertion creates the imputed entry on the reverse pair while the
-entry just asserted may make redundant an imputed entry a previous insertion had left on
-the direct one — checking both makes the result independent of the order in which
-messages arrive. An imputed entry that no assertion covers is the only source of OWLT for
-its direction and is left alone.
-
-Removing an imputed entry leaves the canonical range that generated it intact, and that
-range can still be removed afterwards with no reverse entry left to accompany it.
-
-That same asymmetry means the invariant is reached by two different routes depending on
-the order in which messages arrive, and the pruning only handles one of them. If the
-canonical assertion arrives first, ION imputes the reverse and then refuses the peer's
-own assertion of that reverse as an overlap: one entry, the imputed one, and no pruning
-is needed. If the assertion arrives first, it is stored and the imputed entry lands
-beside it unchecked: one entry again, the asserted one, but only because the pruning
-removes the other. Either way the pair ends up with a single entry carrying the same
-OWLT; which of the two survives depends on the order, and nothing downstream depends on
-that.
-
-The first route leaves the pair covered by a derived entry alone, which lives and dies
-with the canonical range behind it. Should that range go, the peer's next periodic
-re-announcement finds nothing overlapping and is finally accepted, so the coverage
-returns on its own.
-
-Two costs are accepted knowingly. The head and the tail of the window that only the
-imputed entry covered are given up — bounded by the offset between the two assertions,
-which is the difference between the two nodes' start times. And should the operator later
-remove the asserted range, the pair is left with no reverse at all, because ION does not
-impute again after the fact.
+distinct pairs, never compared against each other. Both directions are examined after an
+insertion, because a canonical insertion creates the imputed entry on the reverse pair
+while the entry just asserted may make redundant an imputed entry a previous insertion
+had left on the direct one — checking both makes the result independent of the order in
+which messages arrive. An imputed entry that no assertion covers is the only source of
+OWLT for its direction and is left alone.
 
 **The removal is always issued with the exact start time of the entry being replaced.**
 This one detail is what closes problem 1.3: with a null timestamp ION applies the `*`
@@ -520,15 +473,6 @@ logged explicitly as suspected clock skew, so that a silent isolation becomes a
 diagnosable one.
 
 **Half-link coverage when a peer's DTNEX is not running**, as discussed in §3.2.
-
-**A confirmed imputed range stays imputed.** When a received range matches one ION
-derived by itself from the reverse assertion (§3.3), nothing is written, so ION keeps
-only the derived entry. That entry lives and dies with the operator's canonical one: if the
-operator deletes it, ION drops the derived entry along with it and our knowledge of that
-direction disappears without a log, until the next received message restores it — at
-most one `updateInterval` later. Promoting it into an assertion of ours would fix the
-lifetime at the cost of silently overriding the symmetry the operator configured, which
-is the worse trade.
 
 ---
 
