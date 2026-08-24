@@ -40,6 +40,7 @@ DTNEX builds network topology through a distributed information exchange process
 DTNEX uses CBOR (Compact Binary Object Representation) for efficient message encoding:
 
 - **Contact Messages**: Inform nodes about connectivity between node pairs
+- **Range Messages**: Propagate the one-way light time between node pairs
 - **Metadata Messages**: Share node descriptions, GPS coordinates, and operator information
 - **Authentication**: HMAC-SHA256 with configurable pre-shared network keys
 - **Replay Protection**: Nonce-based duplicate detection and caching
@@ -238,11 +239,11 @@ sudo systemctl start dtnex
 
 ## CBOR Message Format Specification
 
-DTNEX uses CBOR (Compact Binary Object Representation) for efficient, authenticated message exchange between DTN nodes. The protocol supports two primary message types and can be extended for custom applications.
+DTNEX uses CBOR (Compact Binary Object Representation) for efficient, authenticated message exchange between DTN nodes. The protocol supports three message types — contacts, ranges and node metadata — and can be extended for custom applications.
 
 ### Protocol Overview
 
-- **Protocol Version**: 3
+- **Protocol Version**: 3 — the payload layouts changed within version 3 (the region number replaced the OWLT in the contact message, and ranges got a message of their own) without a further version bump, so every node of a network must be upgraded at the same time
 - **Message Format**: CBOR arrays with HMAC authentication
 - **Authentication**: HMAC-SHA256 (truncated to 64 bits for efficiency)
 - **Replay Protection**: 3-byte nonce with origin node tracking
@@ -261,7 +262,7 @@ All DTNEX messages follow this general CBOR array format:
 | Field | Type | Description | Size |
 |-------|------|-------------|------|
 | `version` | Integer | Protocol version (currently 3) | 1 byte |
-| `type` | Text String | Message type ("c"=contact, "m"=metadata) | 2 bytes (1 header + 1 content) |
+| `type` | Text String | Message type ("c"=contact, "r"=range, "m"=metadata) | 2 bytes (1 header + 1 content) |
 | `timestamp` | Integer | Unix timestamp when message was created | 4 bytes |
 | `expireTime` | Integer | Unix timestamp when message expires | 4 bytes |
 | `origin` | Integer | Node ID that originally created the message | 4-8 bytes |
@@ -274,27 +275,31 @@ All DTNEX messages follow this general CBOR array format:
 
 Contact messages distribute network connectivity information between DTN nodes.
 
-Messages are directional: a node only announces contacts where it is the `fromNode` (see §4 of [the design spec](docs/spec_dtnex_v3.md)).
+Messages are directional: a node only announces contacts and ranges where it is the `fromNode`, and rejects any it receives whose `fromNode` is not the origin of the message (the authority rule, §3.2 of [the design spec](docs/spec_dtnex_v3.md)). Ranges have one further restriction: a node announces only the ranges it asserted itself, never the reverse ones ION derives for it (§3.3).
 
 #### CBOR Structure
 ```
-[3, "c", timestamp, expireTime, origin, from, nonce, [fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt], hmac]
+[3, "c", timestamp, expireTime, origin, from, nonce, [regionNbr, fromNode, toNode, fromTime, toTime, xmitRate, confidence], hmac]
 ```
 
 #### Message Data Array
 ```cbor
-[fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt]
+[regionNbr, fromNode, toNode, fromTime, toTime, xmitRate, confidence]
 ```
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
+| `regionNbr` | Integer | ION region the contact belongs to; first, because it scopes every field that follows | 1 |
 | `fromNode` | Integer | Node ID that owns/announces this contact; must equal the message `origin` | 268484800 |
 | `toNode` | Integer | Node ID at the other end of the contact | 268484801 |
 | `fromTime` | Integer | Absolute Unix epoch when the contact window opens | 1694885400 |
 | `toTime` | Integer | Absolute Unix epoch when the contact window closes | 1694887200 |
 | `xmitRate` | Integer | Data rate in **bytes** per second (ION's own unit) | 100000 |
 | `confidence` | Integer | Reliability, percentage 0-100 | 100 |
-| `owlt` | Integer | One-way light time in seconds, from the paired ION range | 1 |
+
+The receiver hands `regionNbr` straight to ION. If it names a region the receiver does
+not belong to, ION refuses the contact with user error 7 and the message is forwarded
+anyway: DTNEX has no region logic of its own.
 
 #### Example Contact Message
 ```json
@@ -307,15 +312,64 @@ Messages are directional: a node only announces contacts where it is the `fromNo
   268484800,           // From node ID (same as origin if not forwarded)
   h'A1B2C3',           // 3-byte nonce
   [                    // Contact data
+    1,                 // regionNbr (ION region)
     268484800,         // fromNode (must equal origin)
     268484801,         // toNode
     1694885400,        // fromTime (absolute epoch)
     1694887200,        // toTime (absolute epoch)
     100000,            // xmitRate (100000 bytes/s)
-    100,               // confidence (100%)
-    1                  // owlt (1 second)
+    100                // confidence (100%)
   ],
   h'1234567890ABCDEF'  // 8-byte HMAC
+]
+```
+
+### Range Messages (type `"r"`)
+
+Range messages distribute the one-way light time between two nodes. A range is an entity
+of its own in ION, with its own key and its own API, so it travels in its own message
+rather than inside the contact.
+
+#### CBOR Structure
+```
+[3, "r", timestamp, expireTime, origin, from, nonce, [fromNode, toNode, fromTime, toTime, owlt], hmac]
+```
+
+#### Message Data Array
+```cbor
+[fromNode, toNode, fromTime, toTime, owlt]
+```
+
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| `fromNode` | Integer | Node ID that announces this range; must equal the message `origin` | 268484800 |
+| `toNode` | Integer | Node ID at the other end of the range | 268484801 |
+| `fromTime` | Integer | Absolute Unix epoch when the range starts being valid | 1694885400 |
+| `toTime` | Integer | Absolute Unix epoch when it stops | 1694887200 |
+| `owlt` | Integer | One-way light time in seconds; 0 is legitimate and is not rejected | 1 |
+
+The range payload carries **no** `regionNbr`: in ION ranges are not regional entities —
+`rfx_insert_range()` and `rfx_remove_range()` take no region and `IonRXref` has no such
+field — so a region here would name a scope no ION call could use.
+
+#### Example Range Message
+```json
+[
+  3,                    // Protocol version
+  "r",                  // Range message type
+  1694885400,          // Timestamp (Unix epoch)
+  1694887200,          // Expire time (equals the range's toTime)
+  268484800,           // Origin node ID
+  268484800,           // From node ID (same as origin if not forwarded)
+  h'B2C3D4',           // 3-byte nonce
+  [                    // Range data
+    268484800,         // fromNode (must equal origin)
+    268484801,         // toNode
+    1694885400,        // fromTime (absolute epoch)
+    1694887200,        // toTime (absolute epoch)
+    1                  // owlt (1 second)
+  ],
+  h'ABCDEF0123456789'  // 8-byte HMAC
 ]
 ```
 
@@ -395,7 +449,7 @@ All messages include HMAC-SHA256 authentication using a pre-shared network key.
 DTNEX implements epidemic-style message forwarding:
 
 1. **Reception**: Node receives and validates message
-2. **Processing**: Extracts and stores contact/metadata information
+2. **Processing**: Extracts and stores contact, range or metadata information
 3. **Forwarding**: Forwards message to all neighbors except origin and sender
 4. **Flood Control**: Nonce-based duplicate detection prevents loops
 
@@ -436,7 +490,8 @@ The CBOR protocol can be extended for custom applications:
 
 ### Performance Characteristics
 
-- **Contact Message Size**: ~60-67 bytes (envelope ~33-37 + 7-field payload ~26-30)
+- **Contact Message Size**: 48-50 bytes observed on a testbed with single-digit node numbers; about 90 bytes in the worst case (64-bit node numbers, 32-bit region and transmission rate)
+- **Range Message Size**: shorter than a contact message — it drops three fields (`regionNbr`, `xmitRate`, `confidence`) and adds one (`owlt`); about 80 bytes in the same worst case
 - **Metadata Message Size**: ~55-85 bytes (without GPS), ~65-95 bytes (with GPS)
 - **Maximum Message Size**: 128 bytes (configurable via `MAX_CBOR_BUFFER`)
 - **Authentication Overhead**: 8 bytes HMAC + 3 bytes nonce = 11 bytes
@@ -446,7 +501,7 @@ The CBOR protocol can be extended for custom applications:
 
 - **Pre-shared Keys**: Use strong, randomly generated network keys
 - **Key Distribution**: Secure key distribution required for network access
-- **Message Expiry**: Contact messages expire at the contact's own `toTime`; metadata messages expire after `contactLifetime` — both bound how long a captured message stays replayable
+- **Message Expiry**: Contact and range messages expire at the `toTime` of the entry they describe; metadata messages expire after `contactLifetime` — both bound how long a captured message stays replayable
 - **Nonce Entropy**: Ensure good randomness for nonce generation
 - **Replay Window**: Balance cache size with replay protection needs
 

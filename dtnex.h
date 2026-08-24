@@ -23,7 +23,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <signal.h>
-#include <openssl/sha.h>
+#include <openssl/hmac.h>
 
 // CBOR support using ION's implementation
 #include "include/ion/cbor.h"
@@ -182,11 +182,14 @@ void log_contact_update(DtnexConfig *config, int contactCount);
 
 // CBOR message functions (using ION's CBOR implementation)
 int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsigned char *buffer, int bufferSize);
+int encodeCborRangeMessage(DtnexConfig *config, RangeRecord *range, unsigned char *buffer, int bufferSize);
 int encodeCborMetadataMessage(DtnexConfig *config, StructuredMetadata *metadata, unsigned char *buffer, int bufferSize);
 void processCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize);
 int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize);
 int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
                              unsigned long origin, unsigned long from, ContactRecord *contact);
+int processCborRangeMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
+                            unsigned long origin, unsigned long from, RangeRecord *range);
 int processCborMetadataMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
                               unsigned long origin, unsigned long from, StructuredMetadata *metadata);
 
@@ -204,6 +207,8 @@ int manualDecodeCborString(char *buffer, int maxLen, unsigned char **cursor, uns
 // CBOR message forwarding functions
 void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp,
                                time_t expireTime, unsigned long origin, unsigned long from, ContactRecord *contact);
+void forwardCborRangeMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp,
+                             time_t expireTime, unsigned long origin, unsigned long from, RangeRecord *range);
 void forwardCborMetadataMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp,
                                 time_t expireTime, unsigned long origin, unsigned long from, StructuredMetadata *metadata);
 

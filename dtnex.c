@@ -148,6 +148,9 @@ void log_message_sent(DtnexConfig *config, unsigned long origin, unsigned long t
     if (strcmp(type, "contact") == 0) {
         printf("\033[33m[SENT] Origin:%lu, Source:%lu, Dest:%lu: Contact(%lu↔%lu)\033[0m\n", 
                origin, config->nodeId, to, nodeA, nodeB);
+    } else if (strcmp(type, "range") == 0) {
+        printf("\033[33m[SENT] Origin:%lu, Source:%lu, Dest:%lu: Range(%lu→%lu)\033[0m\n",
+               origin, config->nodeId, to, nodeA, nodeB);
     } else if (strcmp(type, "metadata") == 0) {
         printf("\033[33m[SENT] Origin:%lu, Source:%lu, Dest:%lu: Metadata(%lu:%s)\033[0m\n",
                origin, config->nodeId, to, nodeA, metadata ? metadata : "?");
@@ -163,6 +166,9 @@ void log_message_received(DtnexConfig *config, unsigned long origin, unsigned lo
     if (strcmp(type, "contact") == 0) {
         printf("\033[32m[RECV] Origin:%lu, Source:%lu, Dest:%lu: Contact(%lu↔%lu)\033[0m\n",
                origin, from, config->nodeId, nodeA, nodeB);
+    } else if (strcmp(type, "range") == 0) {
+        printf("\033[32m[RECV] Origin:%lu, Source:%lu, Dest:%lu: Range(%lu→%lu)\033[0m\n",
+               origin, from, config->nodeId, nodeA, nodeB);
     } else if (strcmp(type, "metadata") == 0) {
         printf("\033[32m[RECV] Origin:%lu, Source:%lu, Dest:%lu: Metadata(%lu:%s)\033[0m\n",
                origin, from, config->nodeId, nodeA, metadata ? metadata : "?");
@@ -177,6 +183,9 @@ void log_message_forwarded(DtnexConfig *config, unsigned long origin, unsigned l
     
     if (strcmp(type, "contact") == 0) {
         printf("\033[35m[FRWD] Origin:%lu, Source:%lu, Dest:%lu: Contact(%lu↔%lu)\033[0m\n",
+               origin, from, to, nodeA, nodeB);
+    } else if (strcmp(type, "range") == 0) {
+        printf("\033[35m[FRWD] Origin:%lu, Source:%lu, Dest:%lu: Range(%lu→%lu)\033[0m\n",
                origin, from, to, nodeA, nodeB);
     } else if (strcmp(type, "metadata") == 0) {
         printf("\033[35m[FRWD] Origin:%lu, Source:%lu, Dest:%lu: Metadata(%lu:%s)\033[0m\n",
@@ -376,7 +385,7 @@ int tryConnectToIon(DtnexConfig *config) {
     /* Only ownNodeNbr is ever taken from the IonDB: the struct offsets in the
      * bundled headers (include/ion/ion.h) do not match those of the installed
      * ION library, so a value read at any other offset would not be the field
-     * it is named after (risk §12.3 of the design spec). */
+     * it is named after. */
 
     if (config->nodeId == 0) {
         bp_detach();
@@ -500,7 +509,7 @@ int init(DtnexConfig *config) {
 
 /* getplanlist is called both from the main loop and from the reception thread
  * (via forwardCborContactMessage) and writes into its own static cache:
- * access must be serialised (§7.5). */
+ * access must be serialised. */
 static pthread_mutex_t planListMutex = PTHREAD_MUTEX_INITIALIZER;
 
 void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
@@ -671,22 +680,24 @@ void getplanlist(DtnexConfig *config, Plan *plans, int *planCount) {
 /**
  * Decides whether, what and to whom information is sent, then delegates the
  * construction and transmission of the bundle to the CBOR functions. It has
- * three phases: the time gate, the contact send loop and the metadata send loop.
+ * four phases: the time gate, the contact send loop, the range send loop and
+ * the metadata send loop.
  */
 
 /**
- * Snapshot of the announceable contacts (§3.2).
+ * Snapshot of the announceable contacts.
  *
- * CACHE CORRECTNESS INVARIANT (§7.4): this cache is TTL-only, with no
- * invalidation on write, and that is correct ONLY because the snapshot holds
- * exclusively contacts whose fromNode is the local node (authority rule, §4).
- * No write dtnex performs on ION can therefore fall inside this set. If anyone
- * relaxes that filter, this cache silently becomes wrong.
+ * CACHE CORRECTNESS INVARIANT: this cache is TTL-only, with no invalidation on
+ * write, and that is correct ONLY because the snapshot holds exclusively
+ * contacts whose fromNode is the local node (the authority rule). No write
+ * dtnex performs on ION can therefore fall inside this set. If anyone relaxes
+ * that filter, this cache silently becomes wrong.
  *
- * The TTL governs the responsiveness of trigger 3 in §7.1: it is the maximum
- * delay between a change to ionrc and its discovery by the network. 60 seconds
- * is the chosen compromise: it matches the longest wake-up period of the main
- * loop, so it adds no ION accesses beyond the pace of the loop itself.
+ * The TTL also governs how promptly the announcement trigger that watches this
+ * snapshot can fire: it is the maximum delay between a change to ionrc and its
+ * discovery by the network. 60 seconds is the chosen compromise: it matches the
+ * longest wake-up period of the main loop, so it adds no ION accesses beyond
+ * the pace of the loop itself.
  */
 #define MY_CONTACTS_CACHE_TTL 60
 
@@ -695,13 +706,13 @@ static int myContactCount = 0;
 static time_t myContactsUpdated = 0;
 
 static int sameContactRecord(const ContactRecord *a, const ContactRecord *b) {
-    return a->fromNode == b->fromNode
+    return a->regionNbr == b->regionNbr
+        && a->fromNode == b->fromNode
         && a->toNode == b->toNode
         && a->fromTime == b->fromTime
         && a->toTime == b->toTime
         && a->xmitRate == b->xmitRate
-        && a->confidence == b->confidence
-        && a->owlt == b->owlt;
+        && a->confidence == b->confidence;
 }
 
 /**
@@ -710,7 +721,7 @@ static int sameContactRecord(const ContactRecord *a, const ContactRecord *b) {
  * refreshed). Returns the number of contacts in the snapshot, or -1 on an ION
  * access error (in which case the previous snapshot stays valid).
  *
- * Single-threaded (§7.5): only the main loop calls this function.
+ * Single-threaded: only the main loop calls this function.
  */
 static int refreshMyContacts(DtnexConfig *config, int *changed) {
     ContactRecord fresh[IONC_MAX_CONTACTS];
@@ -754,6 +765,72 @@ static int refreshMyContacts(DtnexConfig *config, int *changed) {
     return myContactCount;
 }
 
+/* Snapshot of the ranges this node may announce, the twin of the contact
+ * snapshot above. It deliberately reuses MY_CONTACTS_CACHE_TTL: despite the
+ * name, that constant is the wake-up step of the main loop and governs how
+ * promptly either snapshot can trigger an announcement. */
+static RangeRecord myRanges[IONC_MAX_RANGES];
+static int myRangeCount = 0;
+static time_t myRangesUpdated = 0;
+
+static int sameRangeRecord(const RangeRecord *a, const RangeRecord *b) {
+    return a->fromNode == b->fromNode
+        && a->toNode == b->toNode
+        && a->fromTime == b->fromTime
+        && a->toTime == b->toTime
+        && a->owlt == b->owlt;
+}
+
+/**
+ * Twin of refreshMyContacts, on the range index. Same TTL, same rule: writes 1
+ * into *changed if the new snapshot differs from the previous one. Returns the
+ * number of ranges in the snapshot, or -1 on an ION access error (in which
+ * case the previous snapshot stays valid).
+ *
+ * Single-threaded: only the main loop calls this function.
+ */
+static int refreshMyRanges(DtnexConfig *config, int *changed) {
+    RangeRecord fresh[IONC_MAX_RANGES];
+    time_t now = time(NULL);
+    int freshCount;
+    int i;
+
+    *changed = 0;
+
+    if (myRangesUpdated > 0 && (now - myRangesUpdated) < MY_CONTACTS_CACHE_TTL) {
+        return myRangeCount;
+    }
+
+    freshCount = ionc_get_own_ranges(config->nodeId, fresh, IONC_MAX_RANGES,
+            config->debugMode);
+    if (freshCount < 0) {
+        debug_log(config, "⚠️ Could not re-read the announceable ranges from ION");
+        return -1;
+    }
+
+    if (freshCount != myRangeCount) {
+        *changed = 1;
+    } else {
+        for (i = 0; i < freshCount; i++) {
+            if (!sameRangeRecord(&fresh[i], &myRanges[i])) {
+                *changed = 1;
+                break;
+            }
+        }
+    }
+
+    memcpy(myRanges, fresh, sizeof(RangeRecord) * freshCount);
+    myRangeCount = freshCount;
+    myRangesUpdated = now;
+
+    if (*changed) {
+        dtnex_log("🔄 The snapshot of announceable ranges changed (%d ranges)",
+                myRangeCount);
+    }
+
+    return myRangeCount;
+}
+
 void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
     int i, j;
     time_t currentTime;
@@ -766,11 +843,15 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
     static unsigned long lastPlanList[MAX_PLANS];
     int planListChanged = 0;
     int contactsChanged = 0;
+    int rangesChanged = 0;
 
     time(&currentTime);
 
-    // Trigger 3 (§7.1): refresh the snapshot and see whether it changed.
+    // Trigger 3: refresh the contact snapshot and see whether it changed.
     refreshMyContacts(config, &contactsChanged);
+
+    // Trigger 4: same mechanism, on the range snapshot.
+    refreshMyRanges(config, &rangesChanged);
 
     // Trigger 2: the neighbour list changed
     if (planCount != lastPlanCount) {
@@ -795,13 +876,15 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
     if (!(lastExchangeTime == 0
             || (currentTime - lastExchangeTime) >= config->updateInterval
             || planListChanged
-            || contactsChanged)) {
+            || contactsChanged
+            || rangesChanged)) {
         int remainingTime = config->updateInterval - (int) (currentTime - lastExchangeTime);
         debug_log(config, "Skipping neighbor exchange (next in %d seconds)", remainingTime);
         return;
     }
 
-    dtnex_log("📤 Announcing %d contacts to %d neighbours...", myContactCount, planCount);
+    dtnex_log("📤 Announcing %d contacts and %d ranges to %d neighbours...",
+            myContactCount, myRangeCount, planCount);
 
     lastExchangeTime = currentTime;
     lastPlanCount = planCount;
@@ -809,7 +892,7 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
         lastPlanList[i] = plans[i].planId;
     }
 
-    // One message per announceable contact, to every neighbour (§5.4).
+    // One message per announceable contact, to every neighbour.
     for (i = 0; i < planCount; i++) {
         unsigned long neighborId = plans[i].planId;
 
@@ -829,15 +912,46 @@ void exchangeWithNeighbors(DtnexConfig *config, Plan *plans, int planCount) {
             }
 
             snprintf(destEid, sizeof(destEid), "ipn:%lu.%s", neighborId, config->serviceNr);
-            debug_log(config, "[exchange] %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u owlt=%u → %s (%d byte)",
-                    contact->fromNode, contact->toNode,
+            debug_log(config, "[exchange] contact region=%u %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u → %s (%d bytes)",
+                    contact->regionNbr, contact->fromNode, contact->toNode,
                     (long) contact->fromTime, (long) contact->toTime,
-                    contact->xmitRate, contact->confidence, contact->owlt,
+                    contact->xmitRate, contact->confidence,
                     destEid, messageSize);
 
             sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
             log_message_sent(config, config->nodeId, neighborId, "contact",
                     contact->fromNode, contact->toNode, NULL);
+        }
+    }
+
+    // One message per announceable range, to every neighbour.
+    for (i = 0; i < planCount; i++) {
+        unsigned long neighborId = plans[i].planId;
+
+        if (neighborId == config->nodeId) {
+            continue;  // local loopback plan
+        }
+
+        for (j = 0; j < myRangeCount; j++) {
+            RangeRecord *range = &myRanges[j];
+
+            messageSize = encodeCborRangeMessage(config, range, cborBuffer,
+                    MAX_CBOR_BUFFER);
+            if (messageSize <= 0) {
+                dtnex_log("❌ Failed to encode CBOR range message for %lu→%lu",
+                        range->fromNode, range->toNode);
+                continue;
+            }
+
+            snprintf(destEid, sizeof(destEid), "ipn:%lu.%s", neighborId, config->serviceNr);
+            debug_log(config, "[exchange] range %lu→%lu from=%ld to=%ld owlt=%us → %s (%d bytes)",
+                    range->fromNode, range->toNode,
+                    (long) range->fromTime, (long) range->toTime,
+                    range->owlt, destEid, messageSize);
+
+            sendCborBundle(destEid, cborBuffer, messageSize, config->bundleTTL);
+            log_message_sent(config, config->nodeId, neighborId, "range",
+                    range->fromNode, range->toNode, NULL);
         }
     }
 
@@ -1048,7 +1162,7 @@ static void *signalWaitThread(void *arg)
 
 /**
  * A thin wrapper around the ion_contacts module: prints the diagnostic table,
- * explicitly checks that ION is alive and consistent (§6.6), then produces the
+ * explicitly checks that ION is alive and consistent, then produces the
  * snapshot of announceable contacts and the graph.
  */
 void getContacts(DtnexConfig *config) {
@@ -1070,7 +1184,7 @@ void getContacts(DtnexConfig *config) {
         return;
     }
 
-    // Explicit restart detection (§6.6): "zero contacts" is NOT a hint of a
+    // Explicit restart detection: "zero contacts" is NOT a hint of a
     // restart, a freshly started node legitimately has zero.
     alive = ionc_check_alive(config->nodeId);
     if (alive != 1) {
@@ -1102,11 +1216,29 @@ void getContacts(DtnexConfig *config) {
             dtnex_log("\033[36mAnnounceable contacts (fromNode == %lu): %d\033[0m",
                     config->nodeId, snapshotCount);
             for (int s = 0; s < snapshotCount; s++) {
-                dtnex_log("  %lu→%lu  from=%ld to=%ld  xmitRate=%lu B/s  conf=%u%%  owlt=%us",
+                dtnex_log("  region=%u  %lu→%lu  from=%ld to=%ld  xmitRate=%lu B/s  conf=%u%%",
+                        snapshot[s].regionNbr,
                         snapshot[s].fromNode, snapshot[s].toNode,
                         (long) snapshot[s].fromTime, (long) snapshot[s].toTime,
-                        snapshot[s].xmitRate, snapshot[s].confidence,
-                        snapshot[s].owlt);
+                        snapshot[s].xmitRate, snapshot[s].confidence);
+            }
+        }
+
+        RangeRecord rangeSnapshot[IONC_MAX_RANGES];
+        int rangeSnapshotCount = ionc_get_own_ranges(config->nodeId,
+                rangeSnapshot, IONC_MAX_RANGES, config->debugMode);
+
+        if (rangeSnapshotCount < 0) {
+            dtnex_log("⚠️  Could not read the snapshot of announceable ranges");
+        } else {
+            dtnex_log("\033[36mAnnounceable ranges (fromNode == %lu): %d\033[0m",
+                    config->nodeId, rangeSnapshotCount);
+            for (int s = 0; s < rangeSnapshotCount; s++) {
+                dtnex_log("  %lu→%lu  from=%ld to=%ld  owlt=%us",
+                        rangeSnapshot[s].fromNode, rangeSnapshot[s].toNode,
+                        (long) rangeSnapshot[s].fromTime,
+                        (long) rangeSnapshot[s].toTime,
+                        rangeSnapshot[s].owlt);
             }
         }
     }
@@ -1540,6 +1672,8 @@ int initBundleReception(DtnexConfig *config, BundleReceptionState *state) {
             └── decodeCborMessage()   ← CBOR parsing + authentication
                     ├── processCborContactMessage()   ← type "c"
                     │       └── forwardCborContactMessage()
+                    ├── processCborRangeMessage()     ← type "r"
+                    │       └── forwardCborRangeMessage()
                     └── processCborMetadataMessage()  ← type "m"
                             └── forwardCborMetadataMessage()
  */
@@ -1821,46 +1955,82 @@ void generateNonce(unsigned char *nonce) {
 }
 
 /**
- * Calculate HMAC-SHA256 (truncated to DTNEX_HMAC_SIZE for size efficiency)
+ * Computes the HMAC-SHA256 of the message, truncated to DTNEX_HMAC_SIZE bytes.
+ *
+ * Until v3.00, the RFC 2104 construction was hand-written using OpenSSL's
+ * SHA256_Init/Update/Final APIs, deprecated since 3.0. HMAC() is not
+ * deprecated and produces the exact same bytes: the wire format does not
+ * change (verified with dev/hmac_check.c).
+ *
+ * On error, clears the buffer and returns 0: verifyHmac compares byte by
+ * byte, so a failure causes the message to be discarded instead of accepted.
  */
 int calculateHmac(const unsigned char *message, int msgLen, const char *key, unsigned char *hmac) {
     unsigned char fullHmac[SHA256_DIGEST_SIZE];
-    
-    // Simple HMAC implementation (not OpenSSL's HMAC for minimal dependencies)
-    unsigned char keyPad[64]; // Block size for SHA-256
-    memset(keyPad, 0, sizeof(keyPad));
-    
-    int keyLen = strlen(key);
-    if (keyLen > 64) {
-        // Hash key if longer than block size
-        SHA256((unsigned char*)key, keyLen, keyPad);
-    } else {
-        memcpy(keyPad, key, keyLen);
+    unsigned int  fullLen = 0;
+
+    if (HMAC(EVP_sha256(), key, (int) strlen(key), message, (size_t) msgLen,
+            fullHmac, &fullLen) == NULL
+            || fullLen != SHA256_DIGEST_SIZE) {
+        dtnex_log("❌ HMAC-SHA256 computation failed");
+        memset(hmac, 0, DTNEX_HMAC_SIZE);
+        return 0;
     }
-    
-    // Create inner and outer padding
-    unsigned char ipad[64], opad[64];
-    for (int i = 0; i < 64; i++) {
-        ipad[i] = keyPad[i] ^ 0x36;
-        opad[i] = keyPad[i] ^ 0x5c;
-    }
-    
-    // Inner hash: SHA256(key XOR ipad || message)
-    SHA256_CTX ctx;
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, ipad, 64);
-    SHA256_Update(&ctx, message, msgLen);
-    SHA256_Final(fullHmac, &ctx);
-    
-    // Outer hash: SHA256(key XOR opad || inner_hash)
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, opad, 64);
-    SHA256_Update(&ctx, fullHmac, SHA256_DIGEST_SIZE);
-    SHA256_Final(fullHmac, &ctx);
-    
-    // Use only first DTNEX_HMAC_SIZE bytes for size optimization
+
     memcpy(hmac, fullHmac, DTNEX_HMAC_SIZE);
     return DTNEX_HMAC_SIZE;
+}
+
+/**
+ * Writes the envelope common to all DTNEX messages: the 9-element outer
+ * array and the first 7 fields.
+ *
+ *   [version, type, timestamp, expireTime, origin, from, nonce, ...]
+ *
+ * The originator of a message passes fresh timestamp, expireTime and nonce,
+ * with origin == from == the local node; a forwarder passes the original
+ * ones and only replaces "from". The structure is identical in both cases —
+ * that's exactly why a single helper is correct.
+ *
+ * Returns the number of bytes written and advances *cursor.
+ */
+static int writeCborEnvelope(unsigned char **cursor, const char *type,
+        time_t timestamp, time_t expireTime, unsigned long origin,
+        unsigned long from, const unsigned char *nonce) {
+    int bytesWritten = 0;
+
+    bytesWritten += cbor_encode_array_open(9, cursor);
+    bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, cursor);
+    bytesWritten += cbor_encode_text_string((char *) type, 1, cursor);
+    bytesWritten += cbor_encode_integer((uvast) timestamp, cursor);
+    bytesWritten += cbor_encode_integer((uvast) expireTime, cursor);
+    bytesWritten += cbor_encode_integer(origin, cursor);
+    bytesWritten += cbor_encode_integer(from, cursor);
+    bytesWritten += cbor_encode_byte_string((unsigned char *) nonce,
+            DTNEX_NONCE_SIZE, cursor);
+
+    return bytesWritten;
+}
+
+/**
+ * Computes the HMAC over the first bytesWritten bytes of the message — i.e.
+ * everything except the HMAC itself — and appends it as the ninth element.
+ *
+ * If calculateHmac fails, the zeroed buffer it produces is appended anyway
+ * and the failure is logged: a null HMAC gets discarded by every receiver,
+ * so the system stays fail-closed without the encoder having to propagate
+ * the error.
+ *
+ * Returns the number of bytes written and advances *cursor.
+ */
+static int appendCborHmac(DtnexConfig *config, unsigned char *buffer,
+        int bytesWritten, unsigned char **cursor) {
+    unsigned char hmac[DTNEX_HMAC_SIZE];
+
+    if (calculateHmac(buffer, bytesWritten, config->presSharedNetworkKey, hmac) != DTNEX_HMAC_SIZE) {
+        debug_log(config, "❌ HMAC calculation failed during encoding: appending a null HMAC");
+    }
+    return cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, cursor);
 }
 
 /**
@@ -1868,8 +2038,14 @@ int calculateHmac(const unsigned char *message, int msgLen, const char *key, uns
  */
 int verifyHmac(DtnexConfig *config, const unsigned char *message, int msgLen, const unsigned char *receivedHmac, const char *key) {
     unsigned char calculatedHmac[DTNEX_HMAC_SIZE];
-    calculateHmac(message, msgLen, key, calculatedHmac);
-    
+
+    // If HMAC computation fails, the message must be discarded, not accepted:
+    // we cannot compare a buffer that was not actually computed.
+    if (calculateHmac(message, msgLen, key, calculatedHmac) != DTNEX_HMAC_SIZE) {
+        debug_log(config, "❌ HMAC computation failed during verification: message discarded");
+        return 0;
+    }
+
     // Debug logging for HMAC comparison
     debug_log(config, "🔍 HMAC verification details:");
     debug_log(config, "Message length: %d bytes", msgLen);
@@ -1928,8 +2104,9 @@ void addNonceToCache(unsigned char *nonce, unsigned long origin) {
 
 /**
  * Encode CBOR contact message
- * Format v3 (§5.2): [version, type, timestamp, expireTime, origin, from, nonce,
- *                     [fromNode, toNode, fromTime, toTime, xmitRate, confidence, owlt], hmac]
+ * Format: [version, "c", timestamp, expireTime, origin, from, nonce,
+ *                  [regionNbr, fromNode, toNode, fromTime, toTime, xmitRate,
+ *                   confidence], hmac]
  */
 int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsigned char *buffer, int bufferSize) {
     unsigned char *cursor = buffer;
@@ -1938,55 +2115,62 @@ int encodeCborContactMessage(DtnexConfig *config, ContactRecord *contact, unsign
 
     (void) bufferSize;  // the v3 payload is ~67 bytes, MAX_CBOR_BUFFER is 128
 
-    // Generate nonce
     generateNonce(nonce);
 
-    time_t currentTime = time(NULL);
+    // The message is useful exactly as long as the contact it describes is
+    // valid, so expireTime IS the contact's toTime.
+    bytesWritten += writeCborEnvelope(&cursor, "c", time(NULL), contact->toTime,
+            config->nodeId, config->nodeId, nonce);
 
-    // §7.2: the message is useful exactly as long as the contact it describes
-    // is valid, so expireTime IS the contact's toTime.
-    time_t expireTime = contact->toTime;
-
-    // Encode main array with 9 elements [version, type, ts, exp, orig, from, nonce, data, hmac]
-    bytesWritten += cbor_encode_array_open(9, &cursor);
-
-    // 1. Version
-    bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-
-    // 2. Message type "c"
-    bytesWritten += cbor_encode_text_string("c", 1, &cursor);
-
-    // 3. Timestamp (instant of sending; it no longer affects the window)
-    bytesWritten += cbor_encode_integer(currentTime, &cursor);
-
-    // 4. Expire time
-    bytesWritten += cbor_encode_integer(expireTime, &cursor);
-
-    // 5. Origin node
-    bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-
-    // 6. From node (same as origin for originating messages)
-    bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-
-    // 7. Nonce
-    bytesWritten += cbor_encode_byte_string(nonce, DTNEX_NONCE_SIZE, &cursor);
-
-    // 8. Contact data array v3 (§5.2): 7 fields, absolute times
+    // Contact payload: 7 fields, regionNbr first, absolute times
     bytesWritten += cbor_encode_array_open(7, &cursor);
+    bytesWritten += cbor_encode_integer(contact->regionNbr, &cursor);
     bytesWritten += cbor_encode_integer(contact->fromNode, &cursor);
     bytesWritten += cbor_encode_integer(contact->toNode, &cursor);
     bytesWritten += cbor_encode_integer((uvast) contact->fromTime, &cursor);
     bytesWritten += cbor_encode_integer((uvast) contact->toTime, &cursor);
     bytesWritten += cbor_encode_integer(contact->xmitRate, &cursor);
     bytesWritten += cbor_encode_integer(contact->confidence, &cursor);
-    bytesWritten += cbor_encode_integer(contact->owlt, &cursor);
 
-    // 9. Calculate HMAC over everything except the HMAC field itself
-    unsigned char hmac[DTNEX_HMAC_SIZE];
-    calculateHmac(buffer, bytesWritten, config->presSharedNetworkKey, hmac);
-    bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
+    bytesWritten += appendCborHmac(config, buffer, bytesWritten, &cursor);
 
     debug_log(config, "[CBOR] Encoded contact message: %d bytes", bytesWritten);
+    return bytesWritten;
+}
+
+/**
+ * Encode CBOR range message
+ * Format: [version, "r", timestamp, expireTime, origin, from, nonce,
+ *                  [fromNode, toNode, fromTime, toTime, owlt], hmac]
+ *
+ * The payload carries no regionNbr: in ION ranges are not regional entities
+ * (rfx_insert_range has no such parameter, IonRXref has no such field).
+ */
+int encodeCborRangeMessage(DtnexConfig *config, RangeRecord *range, unsigned char *buffer, int bufferSize) {
+    unsigned char *cursor = buffer;
+    unsigned char nonce[DTNEX_NONCE_SIZE];
+    int bytesWritten = 0;
+
+    (void) bufferSize;  // the payload is ~55 bytes, MAX_CBOR_BUFFER is 128
+
+    generateNonce(nonce);
+
+    // As for contacts: the message is useful exactly as long as the range it
+    // describes is, so expireTime IS the range's toTime.
+    bytesWritten += writeCborEnvelope(&cursor, "r", time(NULL), range->toTime,
+            config->nodeId, config->nodeId, nonce);
+
+    // Range data array: 5 fields, absolute times
+    bytesWritten += cbor_encode_array_open(5, &cursor);
+    bytesWritten += cbor_encode_integer(range->fromNode, &cursor);
+    bytesWritten += cbor_encode_integer(range->toNode, &cursor);
+    bytesWritten += cbor_encode_integer((uvast) range->fromTime, &cursor);
+    bytesWritten += cbor_encode_integer((uvast) range->toTime, &cursor);
+    bytesWritten += cbor_encode_integer(range->owlt, &cursor);
+
+    bytesWritten += appendCborHmac(config, buffer, bytesWritten, &cursor);
+
+    debug_log(config, "[CBOR] Encoded range message: %d bytes", bytesWritten);
     return bytesWritten;
 }
 
@@ -2004,31 +2188,10 @@ int encodeCborMetadataMessage(DtnexConfig *config, StructuredMetadata *metadata,
     
     time_t currentTime = time(NULL);
     time_t expireTime = currentTime + config->contactLifetime;
-    
-    // Encode main array with 9 elements
-    bytesWritten += cbor_encode_array_open(9, &cursor);
-    
-    // 1. Version
-    bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-    
-    // 2. Message type "m"
-    bytesWritten += cbor_encode_text_string("m", 1, &cursor);
-    
-    // 3. Timestamp
-    bytesWritten += cbor_encode_integer(currentTime, &cursor);
-    
-    // 4. Expire time
-    bytesWritten += cbor_encode_integer(expireTime, &cursor);
-    
-    // 5. Origin node
-    bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-    
-    // 6. From node
-    bytesWritten += cbor_encode_integer(config->nodeId, &cursor);
-    
-    // 7. Nonce
-    bytesWritten += cbor_encode_byte_string(nonce, DTNEX_NONCE_SIZE, &cursor);
-    
+
+    bytesWritten += writeCborEnvelope(&cursor, "m", currentTime, expireTime,
+            config->nodeId, config->nodeId, nonce);
+
     // 8. Metadata array - format: [nodeId, name, contact, location?, lat?, lon?]
     int metadataElements = 3; // nodeId, name, contact (base)
     int hasLocation = strlen(metadata->location) > 0;
@@ -2062,11 +2225,8 @@ int encodeCborMetadataMessage(DtnexConfig *config, StructuredMetadata *metadata,
         bytesWritten += cbor_encode_text_string(metadata->location, strlen(metadata->location), &cursor);
     }
     
-    // 9. Calculate HMAC
-    unsigned char hmac[DTNEX_HMAC_SIZE];
-    calculateHmac(buffer, bytesWritten, config->presSharedNetworkKey, hmac);
-    bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
-    
+    bytesWritten += appendCborHmac(config, buffer, bytesWritten, &cursor);
+
     debug_log(config, "[CBOR] Encoded metadata message: %d bytes", bytesWritten);
     return bytesWritten;
 }
@@ -2179,7 +2339,10 @@ int sendCborBundle(const char *destEid, unsigned char *cborData, int dataSize, i
     }
     
     // Send the bundle using direct ION API - no source EID for CBOR messages
-    sendResult = bp_send(NULL, destEid, NULL, ttl, BP_STD_PRIORITY,
+    /* ION's API is not const-correct: bp_send declares char* even though it
+     * doesn't modify the EID. The cast is preferable to removing the const from
+     * our signature, which correctly describes how we use the pointer. */
+    sendResult = bp_send(NULL, (char *) destEid, NULL, ttl, BP_STD_PRIORITY,
                         NoCustodyRequested, 0, 0, NULL, bundleZco, &newBundle);
     
     if (sendResult <= 0) {
@@ -2334,9 +2497,9 @@ void eventDrivenLoop(DtnexConfig *config) {
         // Bundle reception is now handled by the dedicated thread
         if (!running) break;
         
-        // On every wake-up (<= 60s): re-evaluate the announcement triggers
-        // (§7.1). exchangeWithNeighbors decides on its own whether there is
-        // anything to do.
+        // On every wake-up (<= 60s): re-evaluate the announcement triggers.
+        // exchangeWithNeighbors decides on its own whether there is anything
+        // to do.
         if (ionConnected) {
             getplanlist(config, plans, &planCount);
             exchangeWithNeighbors(config, plans, planCount);
@@ -2786,11 +2949,10 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
     
     // We'll set hmacPosition right before HMAC decoding
     unsigned char *hmacPosition;
-    // Store the data array position for later processing
-    unsigned char *dataArrayPosition = cursor;
-    
+
     // Variables to store extracted contact/metadata data for later processing
     ContactRecord extractedContact = {0};
+    RangeRecord extractedRange = {0};
     StructuredMetadata extractedMetadata = {0};
     int hasExtractedData = 0;
     
@@ -2830,7 +2992,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
     
     // Extract data elements based on message type and then skip them for HMAC verification
     if (messageType[0] == 'c') {
-        // Contact message v3 (§5.2): 7 fields
+        // Contact message v3: 7 fields
         debug_log(config, "🔍 Extracting 7 contact elements manually");
 
         if (dataArraySize != 7) {
@@ -2841,28 +3003,28 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
         unsigned char *extractCursor = cursor;
         unsigned int extractBytesBuffered = bytesBuffered;
 
-        unsigned long tFromNode, tToNode, tFromTime, tToTime, tXmitRate, tConfidence, tOwlt;
-        if (manualDecodeCborInteger(&tFromNode, &extractCursor, &extractBytesBuffered) &&
+        unsigned long tRegionNbr, tFromNode, tToNode, tFromTime, tToTime, tXmitRate, tConfidence;
+        if (manualDecodeCborInteger(&tRegionNbr, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tFromNode, &extractCursor, &extractBytesBuffered) &&
             manualDecodeCborInteger(&tToNode, &extractCursor, &extractBytesBuffered) &&
             manualDecodeCborInteger(&tFromTime, &extractCursor, &extractBytesBuffered) &&
             manualDecodeCborInteger(&tToTime, &extractCursor, &extractBytesBuffered) &&
             manualDecodeCborInteger(&tXmitRate, &extractCursor, &extractBytesBuffered) &&
-            manualDecodeCborInteger(&tConfidence, &extractCursor, &extractBytesBuffered) &&
-            manualDecodeCborInteger(&tOwlt, &extractCursor, &extractBytesBuffered)) {
+            manualDecodeCborInteger(&tConfidence, &extractCursor, &extractBytesBuffered)) {
 
+            extractedContact.regionNbr = (unsigned int) tRegionNbr;
             extractedContact.fromNode = tFromNode;
             extractedContact.toNode = tToNode;
             extractedContact.fromTime = (time_t) tFromTime;
             extractedContact.toTime = (time_t) tToTime;
             extractedContact.xmitRate = tXmitRate;
             extractedContact.confidence = (unsigned int) tConfidence;
-            extractedContact.owlt = (unsigned int) tOwlt;
             hasExtractedData = 1;
-            debug_log(config, "✅ Extracted contact: %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u owlt=%u",
+            debug_log(config, "✅ Extracted contact: region=%u %lu→%lu from=%ld to=%ld xmitRate=%lu conf=%u",
+                      extractedContact.regionNbr,
                       extractedContact.fromNode, extractedContact.toNode,
                       (long) extractedContact.fromTime, (long) extractedContact.toTime,
-                      extractedContact.xmitRate, extractedContact.confidence,
-                      extractedContact.owlt);
+                      extractedContact.xmitRate, extractedContact.confidence);
         } else {
             debug_log(config, "❌ Failed to extract contact elements");
         }
@@ -2875,6 +3037,48 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
             }
         }
         debug_log(config, "✅ Successfully skipped contact elements for HMAC");
+
+    } else if (messageType[0] == 'r') {
+        // Range message: 5 fields
+        debug_log(config, "🔍 Extracting 5 range elements manually");
+
+        if (dataArraySize != 5) {
+            debug_log(config, "❌ Range payload with %lu fields (5 expected)", dataArraySize);
+            return -1;
+        }
+
+        unsigned char *extractCursor = cursor;
+        unsigned int extractBytesBuffered = bytesBuffered;
+
+        unsigned long tFromNode, tToNode, tFromTime, tToTime, tOwlt;
+        if (manualDecodeCborInteger(&tFromNode, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tToNode, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tFromTime, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tToTime, &extractCursor, &extractBytesBuffered) &&
+            manualDecodeCborInteger(&tOwlt, &extractCursor, &extractBytesBuffered)) {
+
+            extractedRange.fromNode = tFromNode;
+            extractedRange.toNode = tToNode;
+            extractedRange.fromTime = (time_t) tFromTime;
+            extractedRange.toTime = (time_t) tToTime;
+            extractedRange.owlt = (unsigned int) tOwlt;
+            hasExtractedData = 1;
+            debug_log(config, "✅ Extracted range: %lu→%lu from=%ld to=%ld owlt=%us",
+                      extractedRange.fromNode, extractedRange.toNode,
+                      (long) extractedRange.fromTime, (long) extractedRange.toTime,
+                      extractedRange.owlt);
+        } else {
+            debug_log(config, "❌ Failed to extract range elements");
+        }
+
+        // Now skip the elements for HMAC verification
+        for (int i = 0; i < dataArraySize && i < 5; i++) {
+            if (!skipCborElement(&cursor, &bytesBuffered)) {
+                debug_log(config, "❌ Failed to skip range element %d", i);
+                return -1;
+            }
+        }
+        debug_log(config, "✅ Successfully skipped range elements for HMAC");
 
     } else if (messageType[0] == 'm') {
         // Metadata message: extract elements and then skip them
@@ -3123,6 +3327,18 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
                   (long) extractedContact.fromTime, (long) extractedContact.toTime);
 
         return processCborContactMessage(config, nonce, timestamp, expireTime, origin, from, &extractedContact);
+    } else if (messageType[0] == 'r') {
+        // Use pre-extracted range data instead of re-decoding
+        if (!hasExtractedData) {
+            debug_log(config, "❌ No range data was extracted during parsing");
+            return -1;
+        }
+
+        debug_log(config, "🔍 Processing extracted range data: %lu→%lu (from=%ld to=%ld)",
+                  extractedRange.fromNode, extractedRange.toNode,
+                  (long) extractedRange.fromTime, (long) extractedRange.toTime);
+
+        return processCborRangeMessage(config, nonce, timestamp, expireTime, origin, from, &extractedRange);
     } else if (messageType[0] == 'm') {
         // Use pre-extracted metadata instead of re-decoding
         if (!hasExtractedData) {
@@ -3145,7 +3361,7 @@ int decodeCborMessage(DtnexConfig *config, unsigned char *buffer, int bufferSize
  */
 
 /* Beyond this distance into the future, a window looks like clock skew rather
- * than a legitimate one: it is discarded, and said so (§7.6). */
+ * than a legitimate one: it is discarded, and said so. */
 #define CLOCK_SKEW_FUTURE_LIMIT (30 * 24 * 3600)
 
 int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
@@ -3156,7 +3372,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
     log_message_received(config, origin, from, "contact",
             contact->fromNode, contact->toNode, NULL);
 
-    /* Validation pipeline (§6.1). Checks 1-3 (version, HMAC, nonce) have
+    /* Validation pipeline. Checks 1-3 (version, HMAC, nonce) have
      * already been performed in decodeCborMessage. Every failure discards the
      * message without inserting and without forwarding, and returns 0: this is
      * not a decoding error (the message decoded perfectly), it is a policy
@@ -3170,7 +3386,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         return 0;
     }
 
-    // 5. Only the source announces its own direction (§4)
+    // 5. Only the source announces its own direction
     if (contact->fromNode != origin) {
         debug_log(config, "❌ Discarded: fromNode=%lu != origin=%lu",
                 contact->fromNode, origin);
@@ -3239,7 +3455,7 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         return 0;
     }
 
-    // 8b. Window too far in the future: suspected clock skew (§7.6)
+    // 8b. Window too far in the future: suspected clock skew
     if (contact->fromTime > currentTime + CLOCK_SKEW_FUTURE_LIMIT) {
         debug_log(config, "❌ Discarded: window too far in the future "
                 "(fromTime=%ld, now=%ld) — possible clock skew between nodes",
@@ -3247,25 +3463,18 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
         return 0;
     }
 
-    /* There is no check 9 on the owlt: 0 is a legitimate OWLT (on a LAN it is
-     * the physically correct value, and ION accepts "a range ... 0"). Discarding
-     * it here contradicted origination, where findOwlt returns 0 as a valid
-     * value, and on a local testbed it made every receiver discard everything.
-     * The v3 format always carries the field, and ionc_get_own_contacts only
-     * announces contacts for which a range really exists: the check was
-     * redundant. */
-
-    /* We write what we learn, but announce only what we are authoritative for
-     * (§4.5): contacts with toNode == me are inserted as well. */
+    /* We write what we learn, but announce only what we are authoritative
+     * for: contacts with toNode == me are inserted as well. */
     outcome = ionc_apply_contact(contact, config->debugMode);
+
     if (outcome == IONC_ERROR) {
         /* IONC_ERROR is a system error from an rfx_* call (rc < 0) or ION
          * being unreachable: after the earlier fix, an overlap with a manually
          * configured contact is an expected user error and no longer reaches
-         * this point. The message stays valid regardless and must be forwarded
-         * (§6.5), otherwise a purely local problem would partition the
-         * flooding. */
-        dtnex_log("❌ Failed to apply %lu→%lu to ION",
+         * this point. The message stays valid regardless and must be
+         * forwarded anyway, otherwise a purely local problem would partition
+         * the flooding. */
+        dtnex_log("❌ Failed to apply contact %lu→%lu to ION",
                 contact->fromNode, contact->toNode);
     } else if (outcome == IONC_LOST) {
         /* The previous entry was removed from ION but the insert meant to
@@ -3282,9 +3491,111 @@ int processCborContactMessage(DtnexConfig *config, unsigned char *nonce, time_t 
                 contact->fromNode, contact->toNode, ionc_outcome_name(outcome));
     }
 
-    // Forwarding is unchanged (§6.5): a message that passes validation is
-    // always forwarded, regardless of the outcome of the local ION write.
+    // Forwarding is unchanged: a message that passes validation is always
+    // forwarded, regardless of the outcome of the local ION write.
     forwardCborContactMessage(config, nonce, timestamp, expireTime, origin, from, contact);
+
+    return 0;
+}
+
+/**
+ * Process CBOR range message, type "r".
+ *
+ * Same structure as processCborContactMessage: checks 1-3 (version, HMAC,
+ * nonce) have already been performed in decodeCborMessage. Every failure
+ * discards the message without inserting and without forwarding, and returns
+ * 0: this is not a decoding error, it is a policy rejection, already logged
+ * here with its reason.
+ */
+int processCborRangeMessage(DtnexConfig *config, unsigned char *nonce, time_t timestamp, time_t expireTime,
+                            unsigned long origin, unsigned long from, RangeRecord *range) {
+    time_t currentTime = time(NULL);
+    IoncApplyOutcome outcome;
+
+    log_message_received(config, origin, from, "range",
+            range->fromNode, range->toNode, NULL);
+
+    // 4. We do not process our own messages
+    if (origin == config->nodeId) {
+        debug_log(config, "⏭️ Skipping own range message");
+        return 0;
+    }
+
+    // 5. Only the source announces its own direction
+    if (range->fromNode != origin) {
+        debug_log(config, "❌ Discarded: fromNode=%lu != origin=%lu",
+                range->fromNode, origin);
+        return 0;
+    }
+
+    // 5b. A range towards oneself is not topology
+    if (range->fromNode == range->toNode) {
+        debug_log(config, "❌ Discarded: fromNode == toNode (%lu)", range->fromNode);
+        return 0;
+    }
+
+    // 6. toTime = 0 in ION means "permanent"
+    if (range->toTime == 0) {
+        debug_log(config, "❌ Discarded: toTime = 0 (permanent-range semantics)");
+        return 0;
+    }
+
+    // 7. Window integrity
+    if (range->fromTime >= range->toTime) {
+        debug_log(config, "❌ Discarded: fromTime=%ld >= toTime=%ld",
+                (long) range->fromTime, (long) range->toTime);
+        return 0;
+    }
+
+    // 7b. fromTime <= 0 carries ION's hypothetical-entity semantics
+    if (range->fromTime <= 0) {
+        debug_log(config, "❌ Discarded: invalid fromTime (%ld)", (long) range->fromTime);
+        return 0;
+    }
+
+    // 7c. fromTime == MAX_POSIX_TIME is the registration semantics
+    if (range->fromTime >= MAX_POSIX_TIME) {
+        debug_log(config, "❌ Discarded: fromTime = MAX_POSIX_TIME");
+        return 0;
+    }
+
+    // 8. Window already expired
+    if (range->toTime <= currentTime) {
+        debug_log(config, "❌ Discarded: window entirely in the past "
+                "(toTime=%ld, now=%ld) — possible clock skew between nodes",
+                (long) range->toTime, (long) currentTime);
+        return 0;
+    }
+
+    // 8b. Window too far in the future: suspected clock skew
+    if (range->fromTime > currentTime + CLOCK_SKEW_FUTURE_LIMIT) {
+        debug_log(config, "❌ Discarded: window too far in the future "
+                "(fromTime=%ld, now=%ld) — possible clock skew between nodes",
+                (long) range->fromTime, (long) currentTime);
+        return 0;
+    }
+
+    /* No check on the owlt: 0 is a legitimate value. On a LAN it is the
+     * physically correct one, and ION accepts "a range ... 0". */
+
+    outcome = ionc_apply_range(range, config->debugMode);
+    if (outcome == IONC_ERROR) {
+        dtnex_log("❌ Failed to apply range %lu→%lu to ION",
+                range->fromNode, range->toNode);
+    } else if (outcome == IONC_LOST) {
+        /* Do not say WHO removed it: since 2c98253, IONC_LOST arrives both
+         * from our own remove followed by a refused insert, and from the
+         * imputed path, where it is ION that drops the entry before refusing. */
+        dtnex_log("⚠️  Range %lu→%lu lost in ION: the previous entry is gone "
+                "and the insert that should have replaced it was refused",
+                range->fromNode, range->toNode);
+    } else if (outcome != IONC_NOOP) {
+        dtnex_log("✅ Range %lu→%lu %s in ION",
+                range->fromNode, range->toNode, ionc_outcome_name(outcome));
+    }
+
+    // Forwarding does not depend on the outcome of the local write
+    forwardCborRangeMessage(config, nonce, timestamp, expireTime, origin, from, range);
 
     return 0;
 }
@@ -3343,8 +3654,7 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
     int planCount = 0;
     char destEid[MAX_EID_LENGTH];
     unsigned char cborBuffer[MAX_CBOR_BUFFER];
-    int messageSize;
-    
+
     // Forwarding contact message - individual forwards logged in the loop
     
     // Get current neighbor list
@@ -3371,30 +3681,23 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
         unsigned char *cursor = cborBuffer;
         int bytesWritten = 0;
 
-        // Encode forwarded CBOR message
-        bytesWritten += cbor_encode_array_open(9, &cursor);
-        bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-        bytesWritten += cbor_encode_text_string("c", 1, &cursor);
-        bytesWritten += cbor_encode_integer(timestamp, &cursor);
-        bytesWritten += cbor_encode_integer(expireTime, &cursor);
-        bytesWritten += cbor_encode_integer(origin, &cursor);  // Keep original origin
-        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node: ONLY the "from" field is replaced with this node's ID
-        bytesWritten += cbor_encode_byte_string(originalNonce, DTNEX_NONCE_SIZE, &cursor);
+        // Encode forwarded CBOR message: only the "from" field changes, to
+        // this node; origin, timestamp, expireTime and nonce stay the
+        // original ones.
+        bytesWritten += writeCborEnvelope(&cursor, "c", timestamp, expireTime,
+                origin, config->nodeId, originalNonce);
 
-        // Contact data v3
+        // Contact payload
         bytesWritten += cbor_encode_array_open(7, &cursor);
+        bytesWritten += cbor_encode_integer(forwardContact.regionNbr, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.fromNode, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.toNode, &cursor);
         bytesWritten += cbor_encode_integer((uvast) forwardContact.fromTime, &cursor);
         bytesWritten += cbor_encode_integer((uvast) forwardContact.toTime, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.xmitRate, &cursor);
         bytesWritten += cbor_encode_integer(forwardContact.confidence, &cursor);
-        bytesWritten += cbor_encode_integer(forwardContact.owlt, &cursor);
 
-        // Calculate HMAC over everything except HMAC itself
-        unsigned char hmac[DTNEX_HMAC_SIZE];
-        calculateHmac(cborBuffer, bytesWritten, config->presSharedNetworkKey, hmac);
-        bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
+        bytesWritten += appendCborHmac(config, cborBuffer, bytesWritten, &cursor);
 
         // Send forwarded CBOR bundle
         sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
@@ -3402,6 +3705,55 @@ void forwardCborContactMessage(DtnexConfig *config, unsigned char *originalNonce
 
         log_message_forwarded(config, origin, from, neighborId, "contact",
                              contact->fromNode, contact->toNode, NULL);
+    }
+}
+
+/**
+ * Forward CBOR range message to all neighbors (except origin and sender)
+ */
+void forwardCborRangeMessage(DtnexConfig *config, unsigned char *originalNonce, time_t timestamp,
+                             time_t expireTime, unsigned long origin, unsigned long from, RangeRecord *range) {
+    Plan plans[MAX_PLANS];
+    int planCount = 0;
+    char destEid[MAX_EID_LENGTH];
+    unsigned char cborBuffer[MAX_CBOR_BUFFER];
+
+    getplanlist(config, plans, &planCount);
+
+    if (planCount <= 0) {
+        debug_log(config, "⏭️ No neighbors to forward range message to");
+        return;
+    }
+
+    for (int i = 0; i < planCount; i++) {
+        unsigned long neighborId = plans[i].planId;
+
+        if (neighborId == origin || neighborId == from || neighborId == config->nodeId) {
+            continue;
+        }
+
+        unsigned char *cursor = cborBuffer;
+        int bytesWritten = 0;
+
+        // Nonce, timestamp, expireTime and origin stay the original ones:
+        // only "from" changes, and becomes this node.
+        bytesWritten += writeCborEnvelope(&cursor, "r", timestamp, expireTime,
+                origin, config->nodeId, originalNonce);
+
+        bytesWritten += cbor_encode_array_open(5, &cursor);
+        bytesWritten += cbor_encode_integer(range->fromNode, &cursor);
+        bytesWritten += cbor_encode_integer(range->toNode, &cursor);
+        bytesWritten += cbor_encode_integer((uvast) range->fromTime, &cursor);
+        bytesWritten += cbor_encode_integer((uvast) range->toTime, &cursor);
+        bytesWritten += cbor_encode_integer(range->owlt, &cursor);
+
+        bytesWritten += appendCborHmac(config, cborBuffer, bytesWritten, &cursor);
+
+        snprintf(destEid, sizeof(destEid), "ipn:%lu.%s", neighborId, config->serviceNr);
+        sendCborBundle(destEid, cborBuffer, bytesWritten, config->bundleTTL);
+
+        log_message_forwarded(config, origin, from, neighborId, "range",
+                              range->fromNode, range->toNode, NULL);
     }
 }
 
@@ -3414,8 +3766,7 @@ void forwardCborMetadataMessage(DtnexConfig *config, unsigned char *originalNonc
     int planCount = 0;
     char destEid[MAX_EID_LENGTH];
     unsigned char cborBuffer[MAX_CBOR_BUFFER];
-    int messageSize;
-    
+
     // Forwarding metadata message - individual forwards logged in the loop
     
     // Get current neighbor list
@@ -3439,16 +3790,12 @@ void forwardCborMetadataMessage(DtnexConfig *config, unsigned char *originalNonc
         unsigned char *cursor = cborBuffer;
         int bytesWritten = 0;
         
-        // Encode forwarded CBOR message
-        bytesWritten += cbor_encode_array_open(9, &cursor);
-        bytesWritten += cbor_encode_integer(DTNEX_PROTOCOL_VERSION, &cursor);
-        bytesWritten += cbor_encode_text_string("m", 1, &cursor);
-        bytesWritten += cbor_encode_integer(timestamp, &cursor);
-        bytesWritten += cbor_encode_integer(expireTime, &cursor);
-        bytesWritten += cbor_encode_integer(origin, &cursor);  // Keep original origin
-        bytesWritten += cbor_encode_integer(config->nodeId, &cursor);  // Update "from" to our node
-        bytesWritten += cbor_encode_byte_string(originalNonce, DTNEX_NONCE_SIZE, &cursor);
-        
+        // Encode forwarded CBOR message: only the "from" field changes, to
+        // this node; origin, timestamp, expireTime and nonce stay the
+        // original ones.
+        bytesWritten += writeCborEnvelope(&cursor, "m", timestamp, expireTime,
+                origin, config->nodeId, originalNonce);
+
         // Metadata data
         int metadataElements = 3; // nodeId, name, contact (base)
         int hasLocation = strlen(metadata->location) > 0;
@@ -3482,16 +3829,13 @@ void forwardCborMetadataMessage(DtnexConfig *config, unsigned char *originalNonc
             bytesWritten += cbor_encode_text_string(metadata->location, strlen(metadata->location), &cursor);
         }
         
-        // Calculate HMAC over everything except HMAC itself
-        unsigned char hmac[DTNEX_HMAC_SIZE];
-        calculateHmac(cborBuffer, bytesWritten, config->presSharedNetworkKey, hmac);
-        bytesWritten += cbor_encode_byte_string(hmac, DTNEX_HMAC_SIZE, &cursor);
-        
+        bytesWritten += appendCborHmac(config, cborBuffer, bytesWritten, &cursor);
+
         // Send forwarded CBOR bundle
         sprintf(destEid, "ipn:%lu.%s", neighborId, config->serviceNr);
         sendCborBundle(destEid, cborBuffer, bytesWritten, config->bundleTTL);
-        
-        log_message_forwarded(config, origin, from, neighborId, "metadata", 
+
+        log_message_forwarded(config, origin, from, neighborId, "metadata",
                              metadata->nodeId, 0, metadata->name);
     }
 }

@@ -2,7 +2,7 @@
  * ion_contacts.h
  * DTNEX - access to ION for contacts and ranges.
  *
- * Module boundary (design §8.1): this module talks ONLY to ION. It knows
+ * Module boundary: this module talks ONLY to ION. It knows
  * nothing about CBOR, bundles, HMAC, neighbours or flooding. If encoding
  * ever leaks in here, the module stops being verifiable on its own and the
  * only reason it exists is lost.
@@ -13,41 +13,59 @@
 
 #include <time.h>
 
-/* Region into which contacts received from the network are inserted.
- * dtnex is single-region by design (§5.3): regionNbr never travels on the
- * wire, so the receiver always uses its own default region. */
-#define IONC_DEFAULT_REGION 1
-
 /* Maximum size of a snapshot of announceable contacts. */
 #define IONC_MAX_CONTACTS 200
 
 /**
- * A contact together with its range, in ION's own units:
+ * A contact, in ION's own units:
+ *   regionNbr       : ION region number (IonCXref.regionNbr)
  *   fromTime/toTime : absolute UNIX epoch
  *   xmitRate        : bytes per second
  *   confidence      : percentage 0-100 (ION uses a 0.0-1.0 float;
- *                     cbor.h cannot encode floats, §5.3)
- *   owlt            : seconds
+ *                     cbor.h cannot encode floats)
+ *
+ * The owlt no longer lives here: the range is an entity of its own, with its
+ * own RangeRecord and its own message type "r".
  */
 typedef struct {
+    unsigned int  regionNbr;
     unsigned long fromNode;
     unsigned long toNode;
     time_t        fromTime;
     time_t        toTime;
     unsigned long xmitRate;
     unsigned int  confidence;
-    unsigned int  owlt;
 } ContactRecord;
+
+/* Maximum size of a snapshot of announceable ranges. */
+#define IONC_MAX_RANGES 200
+
+/**
+ * A range, in ION's own units:
+ *   fromTime/toTime : absolute UNIX epoch
+ *   owlt            : seconds
+ *
+ * The range carries no region, and that is not an oversight:
+ * rfx_insert_range() and rfx_remove_range() have no region parameter
+ * (rfx.h:130 and :165) and IonRXref has no such field (ion.h:418-426). In
+ * ION ranges are global; only contacts are regional.
+ */
+typedef struct {
+    unsigned long fromNode;
+    unsigned long toNode;
+    time_t        fromTime;
+    time_t        toTime;
+    unsigned int  owlt;
+} RangeRecord;
 
 /**
  * Reads from ION the contacts the local node is allowed to announce.
  *
- * Filters applied (§3.2, §3.4):
- *   - fromNode == myNodeId          (authority rule, §4)
+ * Filters applied:
+ *   - fromNode == myNodeId          (authority rule)
  *   - toNode != fromNode            (excludes registration contacts)
  *   - type in {CtScheduled, CtPredicted}
  *   - toTime > now                  (expired contacts are not announced)
- *   - a matching range exists, to derive the owlt from
  *
  * Returns the number of records written to out, or -1 if ION is not
  * reachable (SDR, vdb or working memory unavailable).
@@ -56,25 +74,48 @@ int ionc_get_own_contacts(unsigned long myNodeId, ContactRecord *out,
         int maxRecords, int debugMode);
 
 /**
- * Outcome of applying a received contact. Listed in increasing order of
- * severity: if the contact and the range yield different outcomes, the
- * higher one is reported.
+ * Reads from ION the ranges the local node is allowed to announce.
+ *
+ * Filters applied, the same as for contacts as far as they make sense:
+ *   - fromNode == myNodeId          (authority rule)
+ *   - toNode != fromNode
+ *   - rangeElt != 0                 (asserted ranges only, never the reverse
+ *                                    ones ION imputes; the why is in the
+ *                                    comment on that filter in the .c)
+ *   - toTime > now                  (expired ranges are not announced)
+ *
+ * Returns the number of records written to out, or -1 if ION is not
+ * reachable.
+ */
+int ionc_get_own_ranges(unsigned long myNodeId, RangeRecord *out,
+        int maxRecords, int debugMode);
+
+/**
+ * Outcome of applying a received contact or range. Each of ionc_apply_contact
+ * and ionc_apply_range reports its own outcome; the values are listed in
+ * increasing order of severity, so a caller that applies both and wants a
+ * single answer keeps the higher of the two. That merge is the caller's
+ * business, not this module's.
  */
 typedef enum {
     IONC_NOOP = 0,      /* ION was already in sync: nothing was written */
     IONC_REVISED,       /* xmitRate/confidence updated in place */
-    IONC_INSERTED,      /* contact and/or range are new */
+    IONC_INSERTED,      /* the entry was new: it was inserted */
     IONC_REPLACED,      /* window changed: targeted remove + insert */
-    IONC_LOST,          /* the remove succeeded but the following insert was
-                          * rejected by ION: the old entry is gone and was not
-                          * replaced, so the topology held by ION is worse than
-                          * it was before the call */
+    IONC_LOST,          /* the previous entry is gone and was not replaced,
+                          * so the topology held by ION is worse than it was
+                          * before the call. Either the remove succeeded and
+                          * the insert that followed was rejected, or ION
+                          * itself dropped the entry before refusing */
     IONC_ERROR          /* an rfx_* call failed: unexpected ION state */
 } IoncApplyOutcome;
 
 /**
- * Applies the received contact and its range to ION, keyed by identity
- * (local region, fromNode, toNode, fromTime) (§6.2-6.3).
+ * Applies the received contact to ION, keyed by identity
+ * (regionNbr, fromNode, toNode, fromTime).
+ *
+ * The contact only: the range that goes with it is written by
+ * ionc_apply_range, which the caller invokes separately.
  *
  * Idempotent: if ION already holds exactly this contact, nothing is
  * written. Removals ALWAYS pass a pointer to the exact fromTime, never
@@ -82,6 +123,21 @@ typedef enum {
  * between the pair, including those configured by the operator.
  */
 IoncApplyOutcome ionc_apply_contact(const ContactRecord *rec, int debugMode);
+
+/**
+ * Applies the received range to ION, keyed by (fromNode, toNode, fromTime).
+ *
+ * Idempotent like ionc_apply_contact. rfx_revise_range does not exist, so any
+ * difference in owlt or in the window means remove + insert — except over a
+ * range ION imputed by itself (rangeElt == 0), where rfx_insert_range performs
+ * the substitution on its own and removing first is harmful, not merely
+ * redundant. Do not turn that exception back into a remove + insert.
+ *
+ * Removals ALWAYS pass a pointer to the exact fromTime, never NULL: with
+ * NULL, ION applies the '*' scope and deletes every range between the pair,
+ * including those configured by the operator.
+ */
+IoncApplyOutcome ionc_apply_range(const RangeRecord *rec, int debugMode);
 
 /* Human-readable name of the outcome, for logging. */
 const char *ionc_outcome_name(IoncApplyOutcome outcome);
@@ -98,8 +154,7 @@ int ionc_print_contact_table(int debugMode);
  * ownNodeNbr from the IonDB and compares it against the expected value.
  *
  * Returns 1 if ION is alive and consistent, 0 if it restarted or was
- * reconfigured with a different node number, -1 if it is not reachable
- * (§6.6).
+ * reconfigured with a different node number, -1 if it is not reachable.
  *
  * Do NOT use "zero contacts" as a hint of a restart: a freshly started or
  * edge node legitimately has zero contacts.
