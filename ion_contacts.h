@@ -1,7 +1,30 @@
-/**
- * ion_contacts.h
- * DTNEX - access to ION for contacts and ranges.
+/** \file ion_contacts.h
+ * 
+ *  \brief DTNEX - This module provides access to ION for contacts and ranges.
  *
+ ** \copyright da inserire
+
+ ** \par License
+ **
+ **    da inserire
+ *
+ *  \author Niccolò Biserni, niccolo.biserni@studio.unibo.it
+ *
+ *  \par Supervisor
+ *          Carlo Caini, carlo.caini@unibo.it
+ * 
+ *  \par Co-Supervisor
+ *          Samo Grasic, samo@grasic.net 
+ *
+ *
+ *  \par Revision History:
+ *
+ *  DD/MM/YYYY |  AUTHOR         |   DESCRIPTION
+ *  ---------- | --------------- | -----------------------------------------------
+ *  28/08/2026 | N. Biserni      |  Initial implementation and documentation.
+ */
+
+/**
  * Module boundary: this module talks ONLY to ION. It knows
  * nothing about CBOR, bundles, HMAC, neighbours or flooding. If encoding
  * ever leaks in here, the module stops being verifiable on its own and the

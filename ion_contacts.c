@@ -1,6 +1,26 @@
-/**
- * ion_contacts.c
- * DTNEX - access to ION for contacts and ranges.
+/** \file ion_contacts.c
+ *
+ *  \brief  Implementation of ion_contacts.h
+ *
+ ** \copyright da definire
+ **
+ ** \par License
+ **
+ **    da definire
+ *
+ *  \author Niccolò Biserni, niccolo.biserni@studio.unibo.it
+ *
+ *  \par Supervisor
+ *          Carlo Caini, carlo.caini@unibo.it
+ * 
+ * \par Co-Supervisor
+ *          Samo Grasic, samo@grasic.net 
+ *
+ *  \par Revision History:
+ *
+ *  DD/MM/YYYY |  AUTHOR         |   DESCRIPTION
+ *  ---------- | --------------- | -----------------------------------------------
+ *  28/08/2026 | N. Biserni      |  Initial implementation and documentation.
  */
 
 #include "include/ion/ion.h"
