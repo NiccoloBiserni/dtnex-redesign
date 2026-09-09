@@ -213,7 +213,7 @@ void log_contact_update(DtnexConfig *config, int contactCount) {
 void loadConfig(DtnexConfig *config) {
     // Set defaults
     config->updateInterval = DEFAULT_UPDATE_INTERVAL; // 600, i.e. 10 minutes between updates
-    config->contactLifetime = DEFAULT_CONTACT_LIFETIME; // 3600, i.e. 1 hour of contact validity
+    config->metadataLifetime = DEFAULT_METADATA_LIFETIME; // 3600, i.e. 1 hour of metadata validity
     config->bundleTTL = DEFAULT_BUNDLE_TTL; // 1800, i.e. 30 minutes of bundle TTL (3x update interval)
     strcpy(config->presSharedNetworkKey, DEFAULT_PRESHARED_KEY);
     sprintf(config->serviceNr, "%d", DEFAULT_SERVICE_NR);
@@ -273,8 +273,14 @@ void loadConfig(DtnexConfig *config) {
                 // Assign values based on key
                 if (strcmp(key, "updateInterval") == 0) {
                     config->updateInterval = atoi(value);
+                } else if (strcmp(key, "metadataLifetime") == 0) {
+                    config->metadataLifetime = atoi(value);
                 } else if (strcmp(key, "contactLifetime") == 0) {
-                    config->contactLifetime = atoi(value);
+                    // Nome storico dello stesso parametro: accettato per non
+                    // rompere le configurazioni esistenti
+                    config->metadataLifetime = atoi(value);
+                    fprintf(stderr, "Warning: 'contactLifetime' is deprecated, "
+                            "rename it to 'metadataLifetime' in dtnex.conf\n");
                 } else if (strcmp(key, "bundleTTL") == 0) {
                     config->bundleTTL = atoi(value);
                 } else if (strcmp(key, "presSharedNetworkKey") == 0) {
@@ -2187,7 +2193,7 @@ int encodeCborMetadataMessage(DtnexConfig *config, StructuredMetadata *metadata,
     generateNonce(nonce);
     
     time_t currentTime = time(NULL);
-    time_t expireTime = currentTime + config->contactLifetime;
+    time_t expireTime = currentTime + config->metadataLifetime;
 
     bytesWritten += writeCborEnvelope(&cursor, "m", currentTime, expireTime,
             config->nodeId, config->nodeId, nonce);

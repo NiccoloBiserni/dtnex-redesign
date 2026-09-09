@@ -139,10 +139,10 @@ updateInterval=1800
 # Bundle time-to-live should be longer than update interval for reliability
 bundleTTL=1800      # 30 minutes
 
-# Contact lifetime - since v3.00 this applies ONLY to metadata messages.
+# Metadata lifetime - validity of the metadata messages only.
 # The lifetime of the announced contacts is read from ION's contact plan
-# (ionrc), no longer from this parameter.
-contactLifetime=1800  # 30 minutes
+# (ionrc), never from this parameter.
+metadataLifetime=1800  # 30 minutes
 
 # Pre-shared network key for message authentication.
 # "open" is the default and provides no protection: every node that knows it
@@ -178,7 +178,7 @@ noMetadataExchange=false
 |-----------|-------------|---------|---------|
 | `updateInterval` | Message exchange frequency (seconds) | 600 | 1800 |
 | `bundleTTL` | Bundle time-to-live (seconds) | 1800 | 3600 |
-| `contactLifetime` | Metadata message validity (seconds); since v3.00 no longer governs announced contact duration, which is read from ION's contact plan | 3600 | 1800 |
+| `metadataLifetime` | Metadata message validity (seconds); does not govern announced contact duration, which is read from ION's contact plan. Named `contactLifetime` until v3.00; the old name is still accepted, with a deprecation warning | 3600 | 1800 |
 | `contactTimeTolerance` | Removed in this version. If present in an existing configuration file, the key is silently ignored | - | - |
 | `presSharedNetworkKey` | HMAC authentication key | "open" | "mynetwork123" |
 | `nodemetadata` | Node description string | "" | "Node1,admin@site.com,Location" |
@@ -501,7 +501,7 @@ The CBOR protocol can be extended for custom applications:
 
 - **Pre-shared Keys**: Use strong, randomly generated network keys
 - **Key Distribution**: Secure key distribution required for network access
-- **Message Expiry**: Contact and range messages expire at the `toTime` of the entry they describe; metadata messages expire after `contactLifetime` — both bound how long a captured message stays replayable
+- **Message Expiry**: Contact and range messages expire at the `toTime` of the entry they describe; metadata messages expire after `metadataLifetime` — both bound how long a captured message stays replayable
 - **Nonce Entropy**: Ensure good randomness for nonce generation
 - **Replay Window**: Balance cache size with replay protection needs
 

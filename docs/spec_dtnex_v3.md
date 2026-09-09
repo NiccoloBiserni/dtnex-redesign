@@ -18,8 +18,8 @@ and *how* it applies what it receives.
 DTNEX exists to propagate ION's contact plan, but version 2 never read it. What it
 announced was built synthetically from the **plans** — the convergence-layer
 adjacencies, i.e. "I have an outduct towards X" — using the local node as one endpoint,
-a neighbour as the other, and a duration taken from `contactLifetime` in the
-configuration file.
+a neighbour as the other, and a duration taken from the configuration file's
+`contactLifetime` (the parameter now named `metadataLifetime`).
 
 The function that genuinely walked ION's contact database was purely diagnostic: it
 printed a table and counted entries, and its output fed nothing. The two worlds never
@@ -424,13 +424,15 @@ thirty minutes. Their responsiveness is governed by the TTL the two snapshots sh
 which is therefore a deliberate trade-off between reacting quickly to configuration
 changes and accessing ION frequently.
 
-### 6.2 `contactLifetime` no longer governs contacts
+### 6.2 `contactLifetime` no longer governs contacts, and is now `metadataLifetime`
 
 In version 2 this configuration parameter determined the lifetime of the announced
 contact. It no longer does: the lifetime now comes from ION. The message's own
 expiry becomes the end time of the contact it describes, so a message stays useful
-exactly as long as the contact is valid. `contactLifetime` remains in use for metadata
-messages only.
+exactly as long as the contact is valid. The parameter remains in use for metadata
+messages only, and its name says so: it is now `metadataLifetime`. The old key is
+still parsed, so an existing `dtnex.conf` keeps working, but it logs a deprecation
+warning.
 
 This is a behavioural change visible to anyone upgrading an existing installation: the
 lifetime of announced contacts stops depending on `dtnex.conf` and starts depending on

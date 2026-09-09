@@ -7,7 +7,7 @@
 USERNAME="pi"
 
 # DTNEX Configuration Parameters
-CONTACT_LIFETIME="7200"  # Contact lifetime in seconds (default: 7200 = 2 hours)
+METADATA_LIFETIME="7200"  # Metadata message lifetime in seconds (default: 7200 = 2 hours)
 UPDATE_INTERVAL="300"    # Update interval in seconds (default: 300 = 5 minutes)
 
 # Node configuration: "hostname:port" (port 22 is default)
@@ -62,7 +62,7 @@ deploy_to_node() {
     
     # Execute deployment commands on remote node
     ssh -p "${port}" "${USERNAME}@${hostname}" "
-        export CONTACT_LIFETIME='${CONTACT_LIFETIME}'
+        export METADATA_LIFETIME='${METADATA_LIFETIME}'
         export UPDATE_INTERVAL='${UPDATE_INTERVAL}'
         bash -s
     " << 'ENDSSH'
@@ -116,17 +116,17 @@ deploy_to_node() {
             # Backup original config
             cp /home/pi/dtn/dtnex.conf /home/pi/dtn/dtnex.conf.backup.$(date +%Y%m%d_%H%M%S)
             
-            # Update contactLifetime
-            sed -i "s/^contactLifetime=.*/contactLifetime=${CONTACT_LIFETIME}/" /home/pi/dtn/dtnex.conf
+            # Update metadataLifetime (rewrites the old contactLifetime key too)
+            sed -i -E "s/^(contactLifetime|metadataLifetime)=.*/metadataLifetime=${METADATA_LIFETIME}/" /home/pi/dtn/dtnex.conf
             
             # Update updateInterval  
             sed -i "s/^updateInterval=.*/updateInterval=${UPDATE_INTERVAL}/" /home/pi/dtn/dtnex.conf
             
-            echo "✅ Configuration updated: contactLifetime=${CONTACT_LIFETIME}, updateInterval=${UPDATE_INTERVAL}"
+            echo "✅ Configuration updated: metadataLifetime=${METADATA_LIFETIME}, updateInterval=${UPDATE_INTERVAL}"
             
             # Show updated values
             echo "Current configuration:"
-            grep -E "^(contactLifetime|updateInterval)=" /home/pi/dtn/dtnex.conf
+            grep -E "^(metadataLifetime|updateInterval)=" /home/pi/dtn/dtnex.conf
         else
             echo "⚠️ Configuration file /home/pi/dtn/dtnex.conf not found - skipping config update"
         fi
@@ -233,7 +233,7 @@ usage() {
     echo "  -n, --dry-run  Show what would be done without executing"
     echo
     echo "Configuration:"
-    echo "  - Contact Lifetime: ${CONTACT_LIFETIME} seconds"
+    echo "  - Metadata Lifetime: ${METADATA_LIFETIME} seconds"
     echo "  - Update Interval: ${UPDATE_INTERVAL} seconds" 
     echo
     echo "This script deploys DTNEX to the following nodes:"
@@ -266,7 +266,7 @@ while [[ $# -gt 0 ]]; do
             log "DRY RUN MODE - showing what would be executed:"
             echo
             echo "Configuration parameters:"
-            echo "  - contactLifetime: ${CONTACT_LIFETIME} seconds"
+            echo "  - metadataLifetime: ${METADATA_LIFETIME} seconds"
             echo "  - updateInterval: ${UPDATE_INTERVAL} seconds"
             echo
             for node in "${NODES[@]}"; do
@@ -278,7 +278,7 @@ while [[ $# -gt 0 ]]; do
             echo "  git pull"
             echo "  make clean && make"
             echo "  # Update /home/pi/dtn/dtnex.conf:"
-            echo "    contactLifetime=${CONTACT_LIFETIME}"
+            echo "    metadataLifetime=${METADATA_LIFETIME}"
             echo "    updateInterval=${UPDATE_INTERVAL}"
             echo "  sudo make install" 
             echo "  sudo reboot"
